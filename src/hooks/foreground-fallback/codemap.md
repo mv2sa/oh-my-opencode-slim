@@ -9,6 +9,10 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
 - Operates reactively through the event system (cannot wrap `prompt()` directly for interactive sessions)
 - Defers terminal job-board bookkeeping for inline 401/410 errors while recovery is still possible (cooperates with task-session-manager's `willAttemptFallback`)
 
+### Supporting modules
+- `classify-failure.ts` classifies provider errors and assigns cooldown durations (quota, rate-limit, transient, request-fatal, unknown), with a 5h re-probe ceiling and a 7d monthly exemption.
+- `cooldown-registry.ts` persists cross-process model cooldowns in a lock-protected, atomically-replaced JSON file with schema validation/repair.
+
 ## Design
 
 ### Core Abstraction
@@ -27,6 +31,7 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
   2. Current model (fallback) → search all chains for containing model
   3. Merged list (last resort) → preserve insertion order across all agents
 - **No cross-agent bleed**: When agent is identified, only that agent's chain is used (prevents re-prompting with wrong agent's models)
+- **Cooldown eligibility**: Chain resolution preserves raw configured order and cardinality for upstream exhaustion semantics. Candidate selection skips cooling models; when every model is cooling, one bounded replay uses the soonest-reset model before normal exhaustion stops intervention.
 
 ### Retryable Error Detection
 - **Pattern matching**: Comprehensive regex patterns for rate-limit error messages (429, "rate limit", "too many requests", "quota exceeded", etc.) plus `isFailoverError` / `isInlineFailoverError` classification for persistent 401/410 provider-model errors

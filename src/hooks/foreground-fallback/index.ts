@@ -27,6 +27,11 @@ import {
 } from '../../utils/session';
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isReplayableUserMessage, partsFromReplayMessage } from '../types';
+import { classifyFailure } from './classify-failure';
+import {
+  type CooldownRegistry,
+  getCooldownRegistry,
+} from './cooldown-registry';
 
 // ---------------------------------------------------------------------------
 // Retryable error detection
@@ -77,6 +82,7 @@ const TRANSPORT_CODES = new Set([
   'ENOTFOUND',
   'ETIMEDOUT',
   'EAI_AGAIN',
+  'EPIPE',
 ]);
 const TRANSPORT_MESSAGE_PATTERNS = [
   /^fetch failed$/i,
@@ -85,6 +91,7 @@ const TRANSPORT_MESSAGE_PATTERNS = [
   /^request timeout$/i,
   /^connect ECONNREFUSED\b/i,
   /^getaddrinfo ENOTFOUND\b/i,
+  /authentication unavailable/i,
   // Provider SDKs also report connection failures with natural-language
   // messages (e.g. "stream error: Cannot connect to API") that carry no
   // transport code. Match the narrow phrase only.
@@ -353,6 +360,37 @@ export class ForegroundFallbackManager {
     this.sessionAgent.set(sessionID, normalizedAgentName);
   }
 
+  /**
+   * Select the model for a new request in the current process. This is the
+   * runtime counterpart of config-hook filtering: without it, every new Task
+   * child would redial a cooled primary until OpenCode reloaded its config.
+   */
+  selectInitialModel(agentName: string, configuredModel: string): string {
+    const chain = this.chains[agentName];
+    if (!chain?.length || !this.cooldownRegistry.isDead(configuredModel)) {
+      return configuredModel;
+    }
+    const live = chain.find((model) => !this.cooldownRegistry.isDead(model));
+    if (live) {
+      log('[cooldown] runtime initial model skipped', {
+        agent: agentName,
+        model: configuredModel,
+        selected: live,
+      });
+      return live;
+    }
+    const snapshot = this.cooldownRegistry.list();
+    const soonest = [...chain].sort(
+      (a, b) => (snapshot[a]?.deadUntil ?? 0) - (snapshot[b]?.deadUntil ?? 0),
+    )[0];
+    log('[cooldown] runtime all models cooling, using soonest-reset', {
+      agent: agentName,
+      model: configuredModel,
+      selected: soonest,
+    });
+    return soonest;
+  }
+
   constructor(
     /**
      * Ordered fallback chains per agent.
@@ -365,6 +403,11 @@ export class ForegroundFallbackManager {
     /** Consecutive 429s tolerated on the same model before swap/abort. */
     private readonly maxRetries: number = 3,
     coordinator?: SessionLifecycle,
+    private readonly cooldownRegistry: CooldownRegistry = getCooldownRegistry(),
+    private readonly modelVariants: Record<
+      string,
+      Record<string, string | undefined>
+    > = {},
   ) {
     if (coordinator) {
       coordinator.onSessionDeleted((id) => {
@@ -426,6 +469,7 @@ export class ForegroundFallbackManager {
           typeof messageTime.completed === 'number';
         // Failover-worthy error on an individual message
         if (info.error && isFailoverError(info.error)) {
+          this.markCooldown(info.error, sessionID);
           if (this.shouldTriggerFallback(sessionID)) {
             await this.tryFallback(sessionID, info.error);
           }
@@ -449,6 +493,7 @@ export class ForegroundFallbackManager {
           isFailoverError(props.error) &&
           this.shouldTriggerFallback(sessionID)
         ) {
+          this.markCooldown(props.error, sessionID);
           await this.tryFallback(sessionID, props.error);
         }
         break;
@@ -501,10 +546,11 @@ export class ForegroundFallbackManager {
             // 'AI_APICallError: Gone') with no separate error property;
             // forward that message so 401/410 inline errors suppress the
             // toast on this path too, matching session.error behavior.
-            await this.tryFallbackWithAbort(
-              sessionID,
-              props.error ?? { message: props.status?.message ?? '' },
-            );
+            const failoverError = props.error ?? {
+              message: props.status?.message ?? '',
+            };
+            this.markCooldown(failoverError, sessionID);
+            await this.tryFallbackWithAbort(sessionID, failoverError);
           }
           break;
         }
@@ -574,6 +620,42 @@ export class ForegroundFallbackManager {
     const tried = this.sessionRetries.get(sessionID) ?? 0;
     if (tried === 0) return true;
     return this.consumeRetryBudget(sessionID);
+  }
+
+  /** Resolve the model currently serving a session, falling back to the raw
+   *  chain primary when no model has been observed yet (early subagent errors
+   *  fire before message.updated populates sessionModel). */
+  private resolveCurrentModel(sessionID: string): string | undefined {
+    const observed = this.sessionModel.get(sessionID);
+    if (observed) return observed;
+    const agentName = this.sessionAgent.get(sessionID);
+    if (!agentName) return undefined;
+    return this.chains[agentName]?.[0];
+  }
+
+  /** Classify a failover error and persist a cooldown for the offending model. */
+  private markCooldown(error: unknown, sessionID: string): void {
+    const model = this.resolveCurrentModel(sessionID);
+    if (!model) {
+      log('[cooldown] cannot attribute failure', {
+        sessionID,
+        agentName: this.sessionAgent.get(sessionID),
+      });
+      return;
+    }
+    const verdict = classifyFailure(error);
+    if (verdict.cooldownMs > 0) {
+      const outcome = this.cooldownRegistry.markFailure(model, verdict);
+      const persisted = this.cooldownRegistry.list()[model];
+      log('[cooldown] persistence result', {
+        model,
+        class: verdict.class,
+        reason: verdict.reason,
+        deadUntil: persisted?.deadUntil,
+        hits: persisted?.hits,
+        outcome,
+      });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -665,11 +747,10 @@ export class ForegroundFallbackManager {
 
       // When the agent is known but no model was captured (common for
       // subagent error events that fire before message.updated), infer
-      // the current model as the chain's first entry. Without this, the
-      // fallback would incorrectly re-select the primary model as the
-      // "next" fallback target.
-      if (!currentModel && agentName && chain.length > 0) {
-        currentModel = chain[0];
+      // the current model as the RAW chain's first entry (not the cooldown-
+      // filtered chain) so the failure is attributed to the primary model.
+      if (!currentModel && agentName) {
+        currentModel = this.chains[agentName]?.[0];
       }
 
       if (!this.sessionTried.has(sessionID)) {
@@ -679,44 +760,86 @@ export class ForegroundFallbackManager {
       let tried = this.sessionTried.get(sessionID)!;
       if (currentModel) tried.add(currentModel);
 
-      let nextModel = chain.find((m) => !tried.has(m));
+      let nextModel = chain.find(
+        (m) => !tried.has(m) && !this.cooldownRegistry.isDead(m),
+      );
       if (!nextModel) {
         if (chain.length > 1) {
-          // Chain exhausted but we have fallbacks: on the first exhaustion
-          // reset the tried set and stick to the deepest fallback model so
-          // we stop re-trying the dead primary model on every subsequent
-          // message. If the sticky fallback itself fails afterwards (second
-          // exhaustion), abort once and stop intervening — otherwise the
-          // reset re-prompt would loop forever on a fully dead chain.
-          const primary = chain[0];
-          const stickyFallback = chain[chain.length - 1];
-          if ((this.chainExhaustion.get(sessionID) ?? 0) >= 1) {
-            this.chainExhaustion.set(sessionID, 2);
-            log(
-              '[foreground-fallback] chain exhausted after re-fallback, aborting',
-              {
-                sessionID,
-                agentName,
-                currentModel,
-                tried: [...tried],
-              },
-            );
-            await abortSessionWithTimeout(getClient(this.input), sessionID);
-            return;
+          // All models in the resolved chain are cooling: re-select the soonest
+          // resetting model (resolveChain already sorts the all-cooling chain by
+          // soonest reset) instead of the sticky-fallback path below, which
+          // would stick to the deepest fallback — the slowest reset.
+          const allCooling = chain.every((m) =>
+            this.cooldownRegistry.isDead(m),
+          );
+          if (allCooling) {
+            if ((this.chainExhaustion.get(sessionID) ?? 0) >= 1) {
+              this.chainExhaustion.set(sessionID, 2);
+              log(
+                '[foreground-fallback] all-cooling chain exhausted after bounded re-fallback, aborting',
+                { sessionID, agentName, currentModel, tried: [...tried] },
+              );
+              await abortSessionWithTimeout(getClient(this.input), sessionID);
+              return;
+            }
+            this.chainExhaustion.set(sessionID, 1);
+            const snapshot = this.cooldownRegistry.list();
+            const soonest = [...chain].sort(
+              (a, b) =>
+                (snapshot[a]?.deadUntil ?? 0) - (snapshot[b]?.deadUntil ?? 0),
+            )[0];
+            const primary = chain[0];
+            log('[cooldown] all models cooling, using soonest-reset', {
+              sessionID,
+              agentName,
+              currentModel,
+              prevTried: [...tried],
+              nextModel: soonest,
+            });
+            tried = new Set(primary ? [primary] : []);
+            if (currentModel && currentModel !== soonest) {
+              tried.add(currentModel);
+            }
+            this.sessionTried.set(sessionID, tried);
+            nextModel = soonest;
+          } else {
+            // Chain exhausted but we have fallbacks: on the first exhaustion
+            // reset the tried set and stick to the deepest fallback model so
+            // we stop re-trying the dead primary model on every subsequent
+            // message. If the sticky fallback itself fails afterwards (second
+            // exhaustion), abort once and stop intervening — otherwise the
+            // reset re-prompt would loop forever on a fully dead chain.
+            const primary = chain[0];
+            const stickyFallback = chain[chain.length - 1];
+            if ((this.chainExhaustion.get(sessionID) ?? 0) >= 1) {
+              this.chainExhaustion.set(sessionID, 2);
+              log(
+                '[foreground-fallback] chain exhausted after re-fallback, aborting',
+                {
+                  sessionID,
+                  agentName,
+                  currentModel,
+                  tried: [...tried],
+                },
+              );
+              await abortSessionWithTimeout(getClient(this.input), sessionID);
+              return;
+            }
+            this.chainExhaustion.set(sessionID, 1);
+            log('[foreground-fallback] resetting tried set for re-fallback', {
+              sessionID,
+              agentName,
+              currentModel,
+              prevTried: [...tried],
+              nextModel: stickyFallback,
+            });
+            tried = new Set();
+            if (primary) tried.add(primary);
+            if (currentModel && currentModel !== primary)
+              tried.add(currentModel);
+            this.sessionTried.set(sessionID, tried);
+            nextModel = stickyFallback;
           }
-          this.chainExhaustion.set(sessionID, 1);
-          log('[foreground-fallback] resetting tried set for re-fallback', {
-            sessionID,
-            agentName,
-            currentModel,
-            prevTried: [...tried],
-            nextModel: stickyFallback,
-          });
-          tried = new Set();
-          if (primary) tried.add(primary);
-          if (currentModel && currentModel !== primary) tried.add(currentModel);
-          this.sessionTried.set(sessionID, tried);
-          nextModel = stickyFallback;
         } else {
           this.chainExhaustion.set(sessionID, 2);
           log('[foreground-fallback] fallback chain exhausted, aborting', {
@@ -783,6 +906,9 @@ export class ForegroundFallbackManager {
             ),
           ],
           model: ref,
+          ...(agentName && this.modelVariants[agentName]?.[nextModel]
+            ? { variant: this.modelVariants[agentName][nextModel] }
+            : {}),
           ...(agentName ? { agent: agentName } : {}),
         },
       };
@@ -858,13 +984,16 @@ export class ForegroundFallbackManager {
    * Determine the fallback chain to use for a session.
    *
    * Priority:
-   * 1. Agent name known AND has a configured chain → return it directly
+   * 1. Agent name known AND has a configured chain → return the raw chain
    * 2. Agent name known but NO chain → return [] (no fallback; never
    *    bleed into other agents' chains)
    * 3. Agent name unknown, current model known → search all chains for
    *    the model to infer which chain to use
    * 4. Nothing matches → flatten all chains as a last resort (only
    *    reached when both agent name and current model are unavailable)
+   *
+   * Cooldowns affect candidate eligibility in execFallback, not raw-chain
+   * cardinality or upstream exhaustion state.
    */
   private resolveChain(
     agentName: string | undefined,

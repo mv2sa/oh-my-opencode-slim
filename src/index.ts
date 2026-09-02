@@ -31,6 +31,7 @@ import {
   ForegroundFallbackManager,
   SessionLifecycle,
 } from './hooks';
+import { getCooldownRegistry } from './hooks/foreground-fallback/cooldown-registry';
 import { processImageAttachments } from './hooks/image-hook';
 import { createRevivedRunTracker } from './hooks/task-session-manager/revived-run-tracker';
 import type { ToolLoopGuardHook } from './hooks/tool-loop-guard/hook';
@@ -357,6 +358,21 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       ctx,
       runtime.fallback.maxRetries,
       sessionLifecycle,
+      getCooldownRegistry(),
+      Object.fromEntries(
+        Object.entries(runtime.modelArrays).map(([agentName, models]) => [
+          agentName,
+          Object.fromEntries(
+            models.map((entry) => [
+              entry.id,
+              entry.variant ??
+                (typeof runtime.agents()[agentName]?.variant === 'string'
+                  ? runtime.agents()[agentName]?.variant
+                  : undefined),
+            ]),
+          ),
+        ]),
+      ),
     );
 
     deepworkCommandHook = createDeepworkCommandHook();
@@ -685,8 +701,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           // Only marks the agent if the model differs from the chain primary.
           // Once marked, stays disabled even if user switches back to chain[0].
           if (existing && typeof existing.model === 'string') {
-            const primary = runtime.modelArrays[name]?.[0]?.id;
-            if (primary && existing.model !== primary) {
+            const chain = runtime.modelArrays[name]?.map((model) => model.id);
+            if (chain?.length && !chain.includes(existing.model)) {
               runtime.everModelSwitched(name);
             }
             if (runtime.hasModelSwitched(name)) {
@@ -709,23 +725,49 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       const configAgent = opencodeConfig.agent as Record<string, unknown>;
 
       // Model resolution for foreground agents: use _modelArray entries
-      // to pick the first model for startup-time selection.
+      // to pick the first model for startup-time selection. Cooled models
+      // (persistent cross-process cooldown) are skipped in favour of the next
+      // live entry, or the soonest-reset entry when the whole chain is cooling.
       //
       // Runtime failover on API errors (e.g. rate limits
       // mid-conversation) is handled separately by
       // ForegroundFallbackManager via the event hook.
       if (Object.keys(runtime.modelArrays).length > 0) {
+        const cooldownRegistry = getCooldownRegistry();
         for (const [agentName, models] of Object.entries(runtime.modelArrays)) {
           if (models.length === 0) continue;
 
-          // Use the first model in the model array. Not all providers
+          // Use the first LIVE model in the model array. Not all providers
           // require entries in opencodeConfig.provider - some are loaded
           // automatically by opencode (e.g. github-copilot, openrouter).
           // We cannot distinguish these from truly unconfigured providers
           // at config-hook time, so we cannot gate on the provider config
           // keys. Runtime failover is handled separately by
           // ForegroundFallbackManager.
-          const chosen = models[0];
+          const live = models.find((candidate) => {
+            const dead = cooldownRegistry.isDead(candidate.id);
+            if (dead) {
+              log('[cooldown] initial model skipped', {
+                agent: agentName,
+                model: candidate.id,
+                deadUntil: cooldownRegistry.list()[candidate.id]?.deadUntil,
+              });
+            }
+            return !dead;
+          });
+          const snapshot = cooldownRegistry.list();
+          const chosen =
+            live ??
+            [...models].sort(
+              (a, b) =>
+                (snapshot[a.id]?.deadUntil ?? 0) -
+                (snapshot[b.id]?.deadUntil ?? 0),
+            )[0];
+          const chosenVariant =
+            chosen.variant ??
+            (typeof runtime.agents()[agentName]?.variant === 'string'
+              ? runtime.agents()[agentName]?.variant
+              : undefined);
           const entry = configAgent[agentName] as
             | Record<string, unknown>
             | undefined;
@@ -734,24 +776,29 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             // exists. A user-selected model (via /model command) takes
             // precedence over the config's fallback chain to preserve
             // runtime selections and avoid breaking provider cache.
-            if (entry.model === undefined) {
+            const hostModel = runtime.hostAgent(agentName)?.model;
+            if (hostModel === undefined) {
               entry.model = chosen.id;
-              if (chosen.variant) {
-                entry.variant = chosen.variant;
-              }
+              if (chosenVariant) entry.variant = chosenVariant;
+              else delete entry.variant;
+              log('[cooldown] initial model selected', {
+                agent: agentName,
+                model: chosen.id,
+                allCooling: live === undefined,
+              });
             }
           } else {
             // Agent exists in slim but not in opencodeConfig.agent -
             // create entry
             (configAgent as Record<string, unknown>)[agentName] = {
               model: chosen.id,
-              ...(chosen.variant ? { variant: chosen.variant } : {}),
+              ...(chosenVariant ? { variant: chosenVariant } : {}),
             };
           }
           log('[plugin] resolved model from array', {
             agent: agentName,
             model: chosen.id,
-            variant: chosen.variant,
+            variant: chosenVariant,
           });
         }
       }
@@ -778,11 +825,26 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             Array.isArray(override.model) &&
             override.model.length > 0
           ) {
-            const first = override.model[0];
-            entry.model = typeof first === 'string' ? first : first.id;
+            const candidates = override.model.map((model) =>
+              typeof model === 'string' ? { id: model } : model,
+            );
+            const first =
+              candidates.find(
+                (candidate) => !getCooldownRegistry().isDead(candidate.id),
+              ) ??
+              [...candidates].sort((a, b) => {
+                const snapshot = getCooldownRegistry().list();
+                return (
+                  (snapshot[a.id]?.deadUntil ?? 0) -
+                  (snapshot[b.id]?.deadUntil ?? 0)
+                );
+              })[0];
+            entry.model = first.id;
             // Extract inline variant from array-form model entry
-            if (typeof first !== 'string' && first.variant) {
+            if (first.variant) {
               entry.variant = first.variant;
+            } else if (override.variant === undefined) {
+              delete entry.variant;
             }
           }
           // Explicitly set or clear scalar fields so switching from
@@ -1210,6 +1272,36 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         typeof output.message.agent === 'string'
       ) {
         output.message.agent = agent;
+        // Request-time model selection: if the agent's configured model is
+        // cooling (persistent cross-process cooldown), switch to the next live
+        // model in the chain before the request is sent. Mirrors the config
+        // hook's startup-time selection for delegated/child initial requests.
+        const configuredMessageModel = output.message.model;
+        if (configuredMessageModel) {
+          const configuredModel = `${configuredMessageModel.providerID}/${configuredMessageModel.modelID}`;
+          const selectedModel = foregroundFallback.selectInitialModel(
+            agent,
+            configuredModel,
+          );
+          if (selectedModel !== configuredModel) {
+            const separator = selectedModel.indexOf('/');
+            if (separator > 0) {
+              output.message.model = {
+                providerID: selectedModel.slice(0, separator),
+                modelID: selectedModel.slice(separator + 1),
+              };
+              // Carry (or clear) the selected model's variant so a stale
+              // variant from the cooled primary never leaks onto the
+              // replacement model.
+              const selectedVariant = resolveTuiVariantForModel(
+                agent,
+                selectedModel,
+              );
+              if (selectedVariant) input.variant = selectedVariant;
+              else delete input.variant;
+            }
+          }
+        }
       }
 
       if (agent) {

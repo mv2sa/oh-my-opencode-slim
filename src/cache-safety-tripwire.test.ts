@@ -55,6 +55,14 @@ const ALLOWLIST = new Map<string, string>([
     'Date.now() gates retry/dedup windows for model failover; no prompt content is derived from it.',
   ],
   [
+    'hooks/foreground-fallback/classify-failure.ts',
+    'Date.now() is only the reference clock for provider Retry-After classification and never reaches prompt content.',
+  ],
+  [
+    'hooks/foreground-fallback/cooldown-registry.ts',
+    'Date.now() manages local cooldown expiry/locking and randomUUID() names atomic state temp files; neither is serialized into prompts.',
+  ],
+  [
     'hooks/apply-patch/prepared-changes.ts',
     'randomUUID() names temp files during atomic writes; never serialized into messages.',
   ],

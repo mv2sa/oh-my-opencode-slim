@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { RuntimeConfig } from './config/runtime';
+import { CooldownRegistry } from './hooks/foreground-fallback/cooldown-registry';
 import { OhMyOpenCodeLite as plugin } from './index';
 
 function createPluginClient(
@@ -279,5 +281,193 @@ describe('plugin tool registration', () => {
       Date.now = originalNow;
       await rm(configDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('persistent cooldown plugin hooks', () => {
+  let originalEnv: typeof process.env;
+  let configDir: string;
+  let cooldownFile: string;
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    configDir = await mkdtemp('/tmp/omos-cooldown-plugin-');
+    cooldownFile = `${configDir}/cooldowns.json`;
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_CONFIG_HOME: configDir,
+      XDG_DATA_HOME: `${configDir}/data`,
+      XDG_CACHE_HOME: `${configDir}/cache`,
+      OPENCODE_LOG_DIR: `${configDir}/logs`,
+      OMOS_COOLDOWN_FILE: cooldownFile,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await writeFile(
+      `${configDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        autoUpdate: false,
+        preset: 'quality',
+        presets: {
+          quality: {
+            fixer: {
+              model: [
+                { id: 'a/primary', variant: 'low' },
+                { id: 'b/fallback', variant: 'high' },
+              ],
+              variant: 'medium',
+              skills: [],
+              mcps: [],
+            },
+          },
+          runtime: {
+            fixer: {
+              model: [
+                { id: 'a/primary', variant: 'low' },
+                { id: 'b/fallback', variant: 'high' },
+              ],
+              variant: 'medium',
+              skills: [],
+              mcps: [],
+            },
+          },
+        },
+      }),
+    );
+    new CooldownRegistry(cooldownFile).markFailure('a/primary', {
+      class: 'quota',
+      cooldownMs: 60_000,
+      reason: 'test',
+    });
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(configDir, { recursive: true, force: true });
+  });
+
+  async function createHooks() {
+    const noop = async () => ({});
+    return plugin({
+      client: createPluginClient(noop),
+      directory: configDir,
+      worktree: configDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+  }
+
+  test('config hook selects cooled fallback with its variant on repeated initialization', async () => {
+    for (let generation = 0; generation < 2; generation++) {
+      const hooks = await createHooks();
+      const host: Record<string, unknown> = { agent: {} };
+      await hooks.config?.(host);
+      expect((host.agent as Record<string, any>).fixer).toEqual(
+        expect.objectContaining({ model: 'b/fallback', variant: 'high' }),
+      );
+      await hooks.dispose?.();
+    }
+  });
+
+  test('config hook preserves an explicit user model override', async () => {
+    const hooks = await createHooks();
+    const host: Record<string, unknown> = {
+      agent: { fixer: { model: 'user/model', variant: 'custom' } },
+    };
+    await hooks.config?.(host);
+    expect((host.agent as Record<string, any>).fixer).toEqual(
+      expect.objectContaining({ model: 'user/model', variant: 'custom' }),
+    );
+    await hooks.dispose?.();
+  });
+
+  test('config hook preserves an existing chain-member model without disabling fallback', async () => {
+    const hooks = await createHooks();
+    const host: Record<string, unknown> = {
+      agent: { fixer: { model: 'b/fallback', variant: 'high' } },
+    };
+    await hooks.config?.(host);
+    expect((host.agent as Record<string, any>).fixer).toEqual(
+      expect.objectContaining({ model: 'b/fallback', variant: 'high' }),
+    );
+    await hooks.dispose?.();
+  });
+
+  test('active runtime preset selects the soonest-reset model when all are cooling', async () => {
+    const registry = new CooldownRegistry(cooldownFile);
+    registry.markFailure('b/fallback', {
+      class: 'quota',
+      cooldownMs: 20_000,
+      reason: 'test',
+    });
+    const hooks = await createHooks();
+    RuntimeConfig.get(configDir).setRuntimePreset('runtime');
+    const host: Record<string, unknown> = { agent: {} };
+    await hooks.config?.(host);
+    expect((host.agent as Record<string, any>).fixer).toEqual(
+      expect.objectContaining({ model: 'b/fallback', variant: 'medium' }),
+    );
+    await hooks.dispose?.();
+  });
+
+  test('chat.message selects fallback model and variant for a delegated child', async () => {
+    const hooks = await createHooks();
+    const input = {
+      sessionID: 'child',
+      agent: 'fixer',
+      variant: 'low',
+    };
+    const output = {
+      message: {
+        agent: 'fixer',
+        model: { providerID: 'a', modelID: 'primary' },
+      },
+      parts: [],
+    };
+    await hooks['chat.message']?.(input as never, output as never);
+    expect(output.message.model).toEqual({
+      providerID: 'b',
+      modelID: 'fallback',
+    });
+    expect(input.variant).toBe('high');
+    await hooks.dispose?.();
+  });
+
+  test('chat.message clears a stale variant when fallback has none', async () => {
+    await writeFile(
+      `${configDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        autoUpdate: false,
+        preset: 'quality',
+        presets: {
+          quality: {
+            fixer: {
+              model: [{ id: 'a/primary', variant: 'low' }, 'b/fallback'],
+              skills: [],
+              mcps: [],
+            },
+          },
+        },
+      }),
+    );
+    const hooks = await createHooks();
+    const input: { sessionID: string; agent: string; variant?: string } = {
+      sessionID: 'child-no-variant',
+      agent: 'fixer',
+      variant: 'low',
+    };
+    const output = {
+      message: {
+        agent: 'fixer',
+        model: { providerID: 'a', modelID: 'primary' },
+      },
+      parts: [],
+    };
+    await hooks['chat.message']?.(input as never, output as never);
+    expect(output.message.model).toEqual({
+      providerID: 'b',
+      modelID: 'fallback',
+    });
+    expect(input.variant).toBeUndefined();
+    await hooks.dispose?.();
   });
 });

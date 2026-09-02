@@ -1,18 +1,43 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { isInternalInitiatorPart } from '../../utils';
 import { SessionLifecycle } from '../session-lifecycle';
+import type { FailureVerdict } from './classify-failure';
+import { CooldownRegistry } from './cooldown-registry';
 import {
   ForegroundFallbackManager,
   isFailoverError,
   isRetryableError,
 } from './index';
 
-// ACCEPTANCE GAP: config() hook behaviour is not covered by CI — verify live.
-
 // Shared session reference so our mock.module for getClient returns the
 // current test's mock session without relying on this.input (which is
 // undefined in tests — always set in production).
 let currentMockSession: Record<string, unknown> | null = null;
+
+// Isolate the persistent cooldown registry so tests never touch the real
+// ~/.config/opencode/model-cooldowns.json and start from a clean file.
+let cooldownTempDir: string;
+beforeEach(() => {
+  cooldownTempDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'omos-foreground-fallback-'),
+  );
+  process.env.OMOS_COOLDOWN_FILE = path.join(cooldownTempDir, 'cooldowns.json');
+  delete process.env.OMOS_COOLDOWN_DISABLED;
+  const globalInProgress = globalThis as typeof globalThis & {
+    [key: symbol]: Set<string> | undefined;
+  };
+  globalInProgress[
+    Symbol.for('oh-my-opencode-slim.foreground-fallback.in-progress')
+  ]?.clear();
+});
+afterEach(() => {
+  delete process.env.OMOS_COOLDOWN_FILE;
+  delete process.env.OMOS_COOLDOWN_DISABLED;
+  fs.rmSync(cooldownTempDir, { recursive: true, force: true });
+});
 
 // Override manager.test.ts's global mock.module for getClient. Called
 // at module load AND from createMockClient so it takes effect regardless of
@@ -88,6 +113,12 @@ function makeChains(
     ...overrides,
   };
 }
+
+const quotaVerdict: FailureVerdict = {
+  class: 'quota',
+  cooldownMs: 60_000,
+  reason: 'test quota',
+};
 
 // ---------------------------------------------------------------------------
 // isFailoverError
@@ -2497,5 +2528,284 @@ describe('ForegroundFallbackManager disableChain', () => {
     // current = gpt-4o-mini is tried → next = claude-haiku
     expect(call[0].body.model.providerID).toBe('anthropic');
     expect(call[0].body.model.modelID).toBe('claude-haiku');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ForegroundFallbackManager - persistent cooldown
+// ---------------------------------------------------------------------------
+
+describe('ForegroundFallbackManager persistent cooldown', () => {
+  test('attributes an early subagent quota error to raw chain primary', async () => {
+    createMockClient();
+    const registry = new CooldownRegistry();
+    const mgr = new ForegroundFallbackManager(
+      { fixer: ['google/sonnet', 'openai/luna'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    mgr.registerSessionAgent('early-child', 'fixer');
+
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'early-child',
+        error: {
+          message:
+            'All 1 account(s) rate-limited for claude. Quota resets in 1h 50m.',
+        },
+      },
+    });
+
+    expect(registry.isDead('google/sonnet')).toBe(true);
+    expect(registry.isDead('openai/luna')).toBe(false);
+  });
+
+  test('runtime initial selection skips cooled primary and preserves chain', () => {
+    createMockClient();
+    const registry = new CooldownRegistry();
+    registry.markFailure('google/sonnet', quotaVerdict, Date.now());
+    const chain = ['google/sonnet', 'opencode-go/kimi', 'copilot/luna'];
+    const mgr = new ForegroundFallbackManager(
+      { fixer: chain },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    expect(mgr.selectInitialModel('fixer', 'google/sonnet')).toBe(
+      'opencode-go/kimi',
+    );
+    expect(chain).toEqual([
+      'google/sonnet',
+      'opencode-go/kimi',
+      'copilot/luna',
+    ]);
+  });
+
+  test('runtime initial selection picks soonest-reset when all cooling', () => {
+    createMockClient();
+    const registry = new CooldownRegistry();
+    const now = Date.now();
+    registry.markFailure('a/one', { ...quotaVerdict, cooldownMs: 60_000 }, now);
+    registry.markFailure('b/two', { ...quotaVerdict, cooldownMs: 20_000 }, now);
+    registry.markFailure(
+      'c/three',
+      { ...quotaVerdict, cooldownMs: 40_000 },
+      now,
+    );
+    const mgr = new ForegroundFallbackManager(
+      { fixer: ['a/one', 'b/two', 'c/three'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    expect(mgr.selectInitialModel('fixer', 'a/one')).toBe('b/two');
+  });
+
+  test('runtime initial selection returns the configured model when not cooling', () => {
+    createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { fixer: ['a/one', 'b/two'] },
+      true,
+      { directory: '/test' } as any,
+    );
+    expect(mgr.selectInitialModel('fixer', 'a/one')).toBe('a/one');
+  });
+});
+
+describe('ForegroundFallbackManager cooldown chain resolution', () => {
+  function resolveWith(registry: CooldownRegistry, now: number) {
+    createMockClient();
+    const manager = new ForegroundFallbackManager(
+      { agent: ['one/model', 'two/model', 'three/model'] },
+      true,
+      { directory: '/test' } as any,
+      3,
+      undefined,
+      registry,
+    );
+    const originalNow = Date.now;
+    Date.now = () => now;
+    try {
+      return (
+        manager as unknown as {
+          resolveChain(agent: string, model?: string): string[];
+        }
+      ).resolveChain('agent');
+    } finally {
+      Date.now = originalNow;
+    }
+  }
+
+  test('preserves raw chain cardinality when models are cooling', () => {
+    const registry = new CooldownRegistry();
+    registry.markFailure('one/model', quotaVerdict, 1000);
+    expect(resolveWith(registry, 2000)).toEqual([
+      'one/model',
+      'two/model',
+      'three/model',
+    ]);
+  });
+
+  test('never returns empty when every model is cooling', () => {
+    const registry = new CooldownRegistry();
+    for (const model of ['one/model', 'two/model', 'three/model']) {
+      registry.markFailure(model, quotaVerdict, 1000);
+    }
+    expect(resolveWith(registry, 2000)).toHaveLength(3);
+  });
+
+  test('preserves raw all-cooling chain order for exhaustion semantics', () => {
+    const registry = new CooldownRegistry();
+    registry.markFailure(
+      'one/model',
+      { ...quotaVerdict, cooldownMs: 60_000 },
+      1000,
+    );
+    registry.markFailure(
+      'two/model',
+      { ...quotaVerdict, cooldownMs: 20_000 },
+      1000,
+    );
+    registry.markFailure(
+      'three/model',
+      { ...quotaVerdict, cooldownMs: 40_000 },
+      1000,
+    );
+    expect(resolveWith(registry, 2000)).toEqual([
+      'one/model',
+      'two/model',
+      'three/model',
+    ]);
+  });
+
+  test('an all-cooling two-model chain allows one replay then aborts', async () => {
+    const { mocks } = createMockClient();
+    const registry = new CooldownRegistry();
+    registry.markFailure('a/primary', quotaVerdict, Date.now());
+    const mgr = new ForegroundFallbackManager(
+      { fixer: ['a/primary', 'b/current'] },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'mixed-exhaustion',
+          agent: 'fixer',
+          providerID: 'b',
+          modelID: 'current',
+          error: { message: 'rate limit exceeded' },
+        },
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'a',
+      modelID: 'primary',
+    });
+
+    const originalNow = Date.now;
+    Date.now = () => originalNow() + 10_000;
+    try {
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: 'mixed-exhaustion',
+            agent: 'fixer',
+            providerID: 'b',
+            modelID: 'current',
+            error: { message: 'rate limit exceeded' },
+          },
+        },
+      });
+    } finally {
+      Date.now = originalNow;
+    }
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+  });
+
+  test('skips a cooled primary on fallback and picks the next live model', async () => {
+    const { mocks } = createMockClient();
+    const registry = new CooldownRegistry();
+    registry.markFailure('anthropic/claude-opus-4-5', quotaVerdict, Date.now());
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'cooled-primary',
+          agent: 'orchestrator',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          error: { message: 'quota exceeded' },
+        },
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    const call = mocks.promptAsync.mock.calls[0] as [
+      { model: { providerID: string; modelID: string } },
+    ];
+    // claude-opus-4-5 is cooling → next live model is gpt-4o
+    expect(call[0].body.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-4o',
+    });
+  });
+
+  test('replay applies the selected fallback variant', async () => {
+    const { mocks } = createMockClient();
+    const registry = new CooldownRegistry();
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+      { orchestrator: { 'openai/gpt-4o': 'high' } },
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'variant-replay',
+          agent: 'orchestrator',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          error: { message: 'quota exceeded' },
+        },
+      },
+    });
+
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.variant).toBe('high');
   });
 });
