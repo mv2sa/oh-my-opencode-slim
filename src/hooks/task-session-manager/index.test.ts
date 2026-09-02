@@ -1,4 +1,16 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  test,
+} from 'bun:test';
+import { randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from '../../config/constants';
 import { SessionLifecycle } from '../../hooks/session-lifecycle';
 import {
@@ -25,6 +37,34 @@ import {
 } from './index';
 import { createRevivedRunTracker } from './revived-run-tracker';
 import { resetUserWaitGateForTests } from './user-wait-gate';
+
+let cooldownTempDir: string | undefined;
+
+function createTestCooldownRegistry(): CooldownRegistry {
+  cooldownTempDir ??= fs.mkdtempSync(
+    path.join(os.tmpdir(), 'omos-cooldown-index-test-'),
+  );
+  return new CooldownRegistry(
+    path.join(cooldownTempDir, `${randomUUID()}.json`),
+  );
+}
+
+afterEach(() => {
+  if (!cooldownTempDir) return;
+  for (const entry of fs.readdirSync(cooldownTempDir)) {
+    fs.rmSync(path.join(cooldownTempDir, entry), {
+      recursive: true,
+      force: true,
+    });
+  }
+});
+
+afterAll(() => {
+  if (cooldownTempDir) {
+    fs.rmSync(cooldownTempDir, { recursive: true, force: true });
+    cooldownTempDir = undefined;
+  }
+});
 
 // Route getClient back to _ctx.client so existing _ctx.client.session
 // mocks continue to work through the new v2 lookup path.
@@ -7697,7 +7737,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('synchronous task false completion rewrites to running placeholder and launches continuation', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const promptAsync = mock(async () => ({}));
     const messagesMock = mock(async () => ({
       data: [
@@ -7818,7 +7858,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('synchronous task with exhausted chain rewrites to error status', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const promptAsync = mock(async () => ({}));
     const messagesMock = mock(async () => ({
       data: [
@@ -7895,7 +7935,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('background task injected completion rewrites part to running placeholder and launches continuation', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const promptAsync = mock(async () => ({}));
     const messagesMock = mock(async () => ({
       data: [
@@ -8009,7 +8049,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('background task injected completion with Template 2 launches continuation', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const promptAsync = mock(async () => ({}));
     const messagesMock = mock(async () => ({
       data: [
@@ -8104,7 +8144,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('duplicate incident ownership: later injected completion adopts launched continuation without advancing ladder twice', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const promptAsync = mock(async () => ({}));
     const messagesMock = mock(async () => ({
       data: [
@@ -8240,7 +8280,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('transactional launch failure on SDK error response rolls back and updates board to error', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const promptAsync = mock(async () => ({
       error: { message: 'Transport stream rejected by host' },
     }));
@@ -8361,7 +8401,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('permanently unresolved prompt returns within caller bound, and at hard quarantine deadline releases message lease, marks running+statusUncertain with diagnostic, leaves model uncommitted, and dedupes subsequent observations', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     let promptStarted = (): void => {};
     const started = new Promise<void>((resolve) => {
       promptStarted = resolve;
@@ -8535,7 +8575,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('Regression A: quarantine generation 1, release lease, relaunch generation 2, then resolve generation-1 transport: abort not called, generation 2 unchanged/running, no model commit or tracker registration', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     let resolveGen1: () => void = () => {};
     const gen1Deferred = new Promise<void>((resolve) => {
       resolveGen1 = resolve;
@@ -8670,7 +8710,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('Regression B: task A and B pending; clear A; task A late settle cannot mutate or abort while task B settles normally and commits once', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     let resolveTaskA: () => void = () => {};
     let resolveTaskB: () => void = () => {};
     const taskADeferred = new Promise<void>((resolve) => {
@@ -8821,7 +8861,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('Regression C: dispose with pending transports: late resolve and late reject variants cannot recreate state, abort, commit, or retain leases', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     let resolveTask1: () => void = () => {};
     let rejectTask2: (err: Error) => void = () => {};
     const p1 = new Promise<void>((resolve) => {
@@ -8958,7 +8998,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('Regression D: duplicate quarantined completion through BOTH synchronous tool-output and injected-completion paths renders running placeholder and keeps job running uncertain', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     let promptStarted = (): void => {};
     const started = new Promise<void>((resolve) => {
       promptStarted = resolve;
@@ -9119,7 +9159,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('late prompt accept after hard quarantine is ignored locally without model commit, tracker registration, or abort', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     let resolvePrompt: () => void = () => {};
     const promptDeferred = new Promise<void>((resolve) => {
       resolvePrompt = resolve;
@@ -9246,7 +9286,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('late prompt reject after hard quarantine does not overwrite quarantine disposition or terminalize uncertain job', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     let rejectPrompt: (err: Error) => void = () => {};
     const promptDeferred = new Promise<void>((_, reject) => {
       rejectPrompt = reject;
@@ -9383,7 +9423,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('late prompt accept before quarantine deadline commits once and registers tracker', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     let resolvePrompt: () => void = () => {};
     const promptDeferred = new Promise<void>((resolve) => {
       resolvePrompt = resolve;
@@ -9497,7 +9537,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('late prompt reject before quarantine deadline terminalizes to error on board', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     let rejectPrompt: (err: Error) => void = () => {};
     const promptDeferred = new Promise<void>((_, reject) => {
       rejectPrompt = reject;
@@ -9600,7 +9640,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('same-key recreation keeps the successor quarantine deadline effective after the old transport settles', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const deferred: Array<() => void> = [];
     const promptAsync = mock(
       () =>
@@ -9687,7 +9727,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
 
   test('transport acceptance after board ownership is dropped returns aborted rather than launched', async () => {
     const board = new BackgroundJobBoard();
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     let resolvePrompt = (): void => {};
     const promptDeferred = new Promise<void>((resolve) => {
       resolvePrompt = resolve;

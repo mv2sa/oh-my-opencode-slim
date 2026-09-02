@@ -234,6 +234,7 @@ export const OutcomeUserMessageReceiptSchema = z
     contentDigest: Digest,
     observedEpoch: Id,
     observedAt: Timestamp,
+    createdRevision: Revision,
   })
   .strict();
 export type OutcomeUserMessageReceipt = z.infer<
@@ -247,6 +248,8 @@ export const OutcomeDecisionReceiptSchema = z
     options: z.array(ShortText).min(1).max(16),
     blocking: z.boolean(),
     impact: Text.optional(),
+    createdAt: Timestamp,
+    createdRevision: Revision,
     chosenOption: ShortText.optional(),
     sourceUserMessageReceiptId: Id.optional(),
     decidedAt: Timestamp.optional(),
@@ -508,8 +511,45 @@ export const OutcomeWaitConditionSchema = z
     referenceId: Id,
     reason: Text,
     createdAt: Timestamp,
+    createdRevision: Revision,
+    originatingServerEpoch: Id.optional(),
+    restartObservedRevision: Revision.optional(),
+    instructions: Text.optional(),
+    expectedPostRestartCheck: Text.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((wait, ctx) => {
+    if (
+      (wait.kind === 'external_handoff') !==
+      (wait.originatingServerEpoch !== undefined)
+    ) {
+      issue(
+        ctx,
+        ['originatingServerEpoch'],
+        'External handoff requires its originating server epoch; other waits forbid it',
+      );
+    }
+    if (
+      wait.kind !== 'external_handoff' &&
+      wait.restartObservedRevision !== undefined
+    ) {
+      issue(
+        ctx,
+        ['restartObservedRevision'],
+        'Only an external handoff can record a restart observation',
+      );
+    }
+    if (
+      wait.restartObservedRevision !== undefined &&
+      wait.restartObservedRevision <= wait.createdRevision
+    ) {
+      issue(
+        ctx,
+        ['restartObservedRevision'],
+        'Restart observation must follow handoff creation',
+      );
+    }
+  });
 export type OutcomeWaitCondition = z.infer<typeof OutcomeWaitConditionSchema>;
 
 export const OutcomeActionRequiredSchema = z
@@ -525,17 +565,80 @@ export const OutcomeActionRequiredSchema = z
     referenceId: Id,
     reason: Text,
     createdAt: Timestamp,
+    createdRevision: Revision,
     resolvedAt: Timestamp.optional(),
+    resolutionKind: z
+      .enum(['controller_reconciliation', 'orchestrator_provenance'])
+      .optional(),
+    resolutionReason: Text.optional(),
+    resolutionUserMessageReceiptId: Id.optional(),
+    resolutionEvidenceAttestationIds: z.array(Id).max(16).optional(),
+    resolutionEvidenceAssurance: z
+      .literal('orchestrator_attestation')
+      .optional(),
   })
   .strict()
-  .refine(
-    (action) =>
-      action.resolvedAt === undefined || action.resolvedAt >= action.createdAt,
-    {
-      message: 'Action resolution cannot precede creation',
-      path: ['resolvedAt'],
-    },
-  );
+  .superRefine((action, ctx) => {
+    const resolutionFields = [
+      action.resolutionKind,
+      action.resolutionReason,
+      action.resolutionUserMessageReceiptId,
+      action.resolutionEvidenceAttestationIds,
+      action.resolutionEvidenceAssurance,
+    ];
+    if (action.resolvedAt === undefined) {
+      if (resolutionFields.some((value) => value !== undefined)) {
+        issue(
+          ctx,
+          ['resolvedAt'],
+          'Unresolved action cannot carry resolution provenance',
+        );
+      }
+      return;
+    }
+    if (action.resolvedAt < action.createdAt) {
+      issue(ctx, ['resolvedAt'], 'Action resolution cannot precede creation');
+    }
+    if (!action.resolutionReason) {
+      issue(ctx, ['resolutionReason'], 'Resolved action requires a reason');
+    }
+    if (
+      action.resolutionKind === 'orchestrator_provenance' &&
+      !action.resolutionUserMessageReceiptId &&
+      (action.resolutionEvidenceAttestationIds?.length ?? 0) === 0
+    ) {
+      issue(
+        ctx,
+        ['resolvedAt'],
+        'Resolved action requires user or evidence provenance',
+      );
+    }
+    const evidenceCount = action.resolutionEvidenceAttestationIds?.length ?? 0;
+    if (
+      evidenceCount > 0 !==
+      (action.resolutionEvidenceAssurance === 'orchestrator_attestation')
+    ) {
+      issue(
+        ctx,
+        ['resolutionEvidenceAssurance'],
+        'Evidence-backed action resolution requires explicit orchestrator-attestation assurance',
+      );
+    }
+    if (action.resolutionEvidenceAttestationIds) {
+      addDuplicateStringIssues(
+        action.resolutionEvidenceAttestationIds,
+        ['resolutionEvidenceAttestationIds'],
+        ctx,
+      );
+    }
+    if (!action.resolutionKind) {
+      issue(
+        ctx,
+        ['resolutionKind'],
+        'Resolved action requires a provenance kind',
+      );
+    }
+  });
 export type OutcomeActionRequired = z.infer<typeof OutcomeActionRequiredSchema>;
 
 export const OutcomeEvidenceAssuranceSchema = z.enum([
@@ -609,10 +712,49 @@ export function canonicalDigest(domain: string, value: unknown): string {
 export function computeOutcomeContractDigest(
   contract: OutcomeContract,
 ): string {
-  return canonicalDigest(
-    'omos/outcome-contract/v1',
-    OutcomeContractSchema.parse(contract),
-  );
+  const parsed = OutcomeContractSchema.parse(contract);
+  return canonicalDigest('omos/outcome-contract/v1', {
+    ...parsed,
+    goals: parsed.goals.map(({ status: _status, ...goal }) => goal),
+  });
+}
+
+export function computeOutcomeEvidenceAttestationDigest(
+  attestation: Pick<
+    OutcomeEvidenceAttestation,
+    | 'id'
+    | 'description'
+    | 'assertedStatus'
+    | 'assertedFreshness'
+    | 'candidateFingerprint'
+    | 'linkedObservationId'
+    | 'createdAt'
+  >,
+): string {
+  return canonicalDigest('omos/evidence-attestation/v1', {
+    id: attestation.id,
+    description: attestation.description,
+    assertedStatus: attestation.assertedStatus,
+    assertedFreshness: attestation.assertedFreshness,
+    candidateFingerprint: attestation.candidateFingerprint,
+    linkedObservationId: attestation.linkedObservationId,
+    createdAt: attestation.createdAt,
+  });
+}
+
+export function computeOutcomeAuthorizationDigest(
+  authorization: Pick<
+    OutcomeAuthorizationReceipt,
+    'id' | 'kind' | 'reference' | 'decisionId' | 'observedAt'
+  >,
+): string {
+  return canonicalDigest('omos/outcome-authorization/v1', {
+    id: authorization.id,
+    kind: authorization.kind,
+    reference: authorization.reference,
+    decisionId: authorization.decisionId,
+    observedAt: authorization.observedAt,
+  });
 }
 
 export function computeOutcomeCheckpointFingerprint(
@@ -719,6 +861,18 @@ function validateRecordRelations(
     ['reviewSummaries'],
     ctx,
   );
+  const reviewedClaims = new Set<string>();
+  for (const [index, summary] of record.reviewSummaries.entries()) {
+    const identity = `${summary.checkpointId}:${summary.claimGeneration}`;
+    if (reviewedClaims.has(identity)) {
+      issue(
+        ctx,
+        ['reviewSummaries', index],
+        'Duplicate review summary for checkpoint claim',
+      );
+    }
+    reviewedClaims.add(identity);
+  }
   addDuplicateIssues(record.operations, 'id', ['operations'], ctx);
   addDuplicateIssues(record.actionsRequired, 'id', ['actionsRequired'], ctx);
 
@@ -734,6 +888,15 @@ function validateRecordRelations(
   );
   for (const [index, entry] of record.receipts.evidence.entries()) {
     if (entry.kind !== 'orchestrator_attestation') continue;
+    if (
+      entry.payloadDigest !== computeOutcomeEvidenceAttestationDigest(entry)
+    ) {
+      issue(
+        ctx,
+        ['receipts', 'evidence', index, 'payloadDigest'],
+        'Attestation digest does not match its minted fields',
+      );
+    }
     if (entry.createdRevision > record.revision) {
       issue(
         ctx,
@@ -756,10 +919,26 @@ function validateRecordRelations(
   const decisions = new Map(
     record.receipts.decisions.map((entry) => [entry.id, entry]),
   );
-  const userMessages = new Set(
-    record.receipts.userMessages.map((entry) => entry.id),
+  const userMessages = new Map(
+    record.receipts.userMessages.map((entry) => [entry.id, entry]),
   );
+  for (const [index, receipt] of record.receipts.userMessages.entries()) {
+    if (receipt.createdRevision > record.revision) {
+      issue(
+        ctx,
+        ['receipts', 'userMessages', index, 'createdRevision'],
+        'User receipt revision is in the future',
+      );
+    }
+  }
   for (const [index, decision] of record.receipts.decisions.entries()) {
+    if (decision.createdRevision > record.revision) {
+      issue(
+        ctx,
+        ['receipts', 'decisions', index, 'createdRevision'],
+        'Decision revision is in the future',
+      );
+    }
     if (
       decision.sourceUserMessageReceiptId &&
       !userMessages.has(decision.sourceUserMessageReceiptId)
@@ -774,10 +953,82 @@ function validateRecordRelations(
   const authorizations = new Map(
     record.receipts.authorizations.map((entry) => [entry.id, entry]),
   );
+  for (const [index, action] of record.actionsRequired.entries()) {
+    if (action.createdRevision > record.revision) {
+      issue(
+        ctx,
+        ['actionsRequired', index, 'createdRevision'],
+        'Action revision is in the future',
+      );
+    }
+    if (
+      action.createdRevision === record.revision &&
+      action.resolvedAt !== undefined
+    ) {
+      issue(
+        ctx,
+        ['actionsRequired', index, 'createdRevision'],
+        'Resolved action provenance must be persisted in a later revision',
+      );
+    }
+    if (
+      action.resolutionUserMessageReceiptId &&
+      !userMessages.has(action.resolutionUserMessageReceiptId)
+    ) {
+      issue(
+        ctx,
+        ['actionsRequired', index, 'resolutionUserMessageReceiptId'],
+        'Action resolution references missing user receipt',
+      );
+    }
+    const resolutionUserReceipt = action.resolutionUserMessageReceiptId
+      ? userMessages.get(action.resolutionUserMessageReceiptId)
+      : undefined;
+    if (
+      resolutionUserReceipt &&
+      resolutionUserReceipt.createdRevision <= action.createdRevision
+    ) {
+      issue(
+        ctx,
+        ['actionsRequired', index, 'resolutionUserMessageReceiptId'],
+        'Action resolution user receipt must be minted after the action',
+      );
+    }
+    for (const evidenceId of action.resolutionEvidenceAttestationIds ?? []) {
+      const attestation = attestations.get(evidenceId);
+      if (!attestation) {
+        issue(
+          ctx,
+          ['actionsRequired', index, 'resolutionEvidenceAttestationIds'],
+          'Action resolution references missing evidence attestation',
+        );
+      } else if (
+        attestation.createdRevision <= action.createdRevision ||
+        attestation.assertedStatus !== 'passed' ||
+        attestation.assertedFreshness !== 'fresh'
+      ) {
+        issue(
+          ctx,
+          ['actionsRequired', index, 'resolutionEvidenceAttestationIds'],
+          'Action resolution evidence must be a fresh passed attestation minted after the action',
+        );
+      }
+    }
+  }
   for (const [
     index,
     authorization,
   ] of record.receipts.authorizations.entries()) {
+    if (
+      authorization.payloadDigest !==
+      computeOutcomeAuthorizationDigest(authorization)
+    ) {
+      issue(
+        ctx,
+        ['receipts', 'authorizations', index, 'payloadDigest'],
+        'Authorization digest does not match its minted fields',
+      );
+    }
     if (authorization.decisionId) {
       const decision = decisions.get(authorization.decisionId);
       if (!decision?.chosenOption || !decision.sourceUserMessageReceiptId) {
@@ -785,6 +1036,23 @@ function validateRecordRelations(
           ctx,
           ['receipts', 'authorizations', index, 'decisionId'],
           'User authorization requires a resolved, user-backed decision',
+        );
+      }
+      if (decision && authorization.reference !== decision.id) {
+        issue(
+          ctx,
+          ['receipts', 'authorizations', index, 'reference'],
+          'User authorization reference must equal its decision ID',
+        );
+      }
+      if (
+        decision?.decidedAt !== undefined &&
+        authorization.observedAt < decision.decidedAt
+      ) {
+        issue(
+          ctx,
+          ['receipts', 'authorizations', index, 'observedAt'],
+          'User authorization cannot precede its decision',
         );
       }
     }
@@ -832,6 +1100,25 @@ function validateRecordRelations(
   }
 
   const checkpoint = record.checkpoint;
+  if (record.waitCondition) {
+    if (record.waitCondition.createdRevision > record.revision) {
+      issue(
+        ctx,
+        ['waitCondition', 'createdRevision'],
+        'Wait revision is in the future',
+      );
+    }
+    if (
+      record.waitCondition.restartObservedRevision !== undefined &&
+      record.waitCondition.restartObservedRevision > record.revision
+    ) {
+      issue(
+        ctx,
+        ['waitCondition', 'restartObservedRevision'],
+        'Restart observation revision is in the future',
+      );
+    }
+  }
   if (checkpoint) {
     if (checkpoint.outcomeId !== record.outcomeId)
       issue(ctx, ['checkpoint', 'outcomeId'], 'Checkpoint outcome mismatch');

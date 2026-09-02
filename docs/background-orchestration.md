@@ -42,6 +42,7 @@ The task API and background-control tools are:
 | `task_cancel` | Stop a generation while retaining its session |
 | `task_revive` | Resume a retained session with a new instruction |
 | `wait_for_user` | Plugin-provided orchestrator tool that pauses automatic orchestrator wakes while the user performs external manual work |
+| `outcome_control` | Authoritative outcome contract lifecycle, checkpointing, evidence attestation, review reconciliation, bounded progress/contract/action transitions, user decisions, external handoff completion, and final certification |
 
 If these are not available, the scheduler cannot use the default background
 workflow. Configure the environment variable through the installer or use the
@@ -421,6 +422,45 @@ errors, and idle/busy events do not clear it. Immediate choices, clarifications,
 and pasted command output continue to use the `question` tool. If
 `wait_for_user` is intentionally listed in `disabled_tools`, the orchestrator
 uses the `question` tool as the blocking boundary instead.
+
+For a managed outcome, restarting the OpenCode process is an explicit external
+handoff rather than ordinary shell work. The orchestrator must first call
+`outcome_control(action: "external_handoff", handoffKind:
+"restart_current_opencode", ...)`, give the user the restart instructions, and
+stop. As a narrow pre-execution guard, managed-root `bash` calls reject literal
+current-OpenCode-PID termination and explicit `pkill`/`killall`/`systemctl`/
+`service` restart commands that name OpenCode. Unrelated process and service
+commands remain permitted. This is intentionally recognizable-form detection,
+not shell analysis: aliases, wrapper scripts, substitutions, pipelines, and
+other obfuscated or indirect restart forms are outside its scope.
+
+The durable lifecycle has explicit exits rather than generic record mutation:
+
+- `update_goal_status` may only move a named goal to `satisfied`; goal status is
+  mutable progress and is excluded from the contract identity digest.
+- `revise_contract` validates the complete replacement contract. Objective or
+  scope changes require a later durable user-message receipt whose host message
+  ID is included in the revised contract's `sourceMessageIds`.
+- `resolve_action` requires a reason plus durable user or evidence provenance.
+  Controller-owned recovery transitions, such as uncertain-checkpoint
+  reconciliation and interrupted-operation acknowledgement, record their own
+  explicit reconciliation provenance.
+- `complete_external_handoff` requires a user receipt created after the handoff
+  and a later fresh, passed attestation matching the expected post-restart
+  check. Until then, the durable external wait remains active.
+
+`begin` and `checkpoint` results expose only non-secret checkpoint identity and
+`dispatchNudgePending`. The raw claim token and token-bearing Manager dispatch
+instruction are emitted exclusively through the tagged trailing volatile
+message transform; they are never serialized in ordinary tool output.
+
+Outcome Manager dispatch uses its checkpoint claim as the durable operation
+boundary. A reservation that later fails task-session preflight is retired
+immediately and does not leave a generic running operation or require a process
+restart to recover. A successful native launch is bound exactly once to its
+task ID and board generation. Manager-result consumption is retry-safe only for
+that exact `(root session, task ID, generation)` after completed reconciliation;
+a different parent, generation, or terminal outcome is rejected.
 
 ### Background Job Board Injection
 

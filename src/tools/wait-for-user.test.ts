@@ -135,4 +135,49 @@ describe('wait_for_user tool', () => {
     expect(beginUserWait).toHaveBeenCalledWith('parent-1');
     expect(String(output)).toContain('state: waiting_for_user');
   });
+
+  test('validates managed outcome phase and respects background task guard precedence', async () => {
+    const beginUserWait = mock((_sessionID: string) => {});
+    let allowed = false;
+    let hasRunningTasks = false;
+    const waitForUser = createWaitForUserTool({
+      shouldManageSession: () => true,
+      beginUserWait,
+      waitForUserGuardEnabled: true,
+      hasOutstandingBackgroundTasks: () => hasRunningTasks,
+      validateManagedWait: () => ({
+        isManaged: true,
+        allowed,
+        reason: 'Outcome phase is active',
+      }),
+    }).wait_for_user;
+
+    // 1. Outstanding background task skips before managed wait validation
+    hasRunningTasks = true;
+    const skippedRes = await waitForUser.execute(
+      { reason: 'Wait for human review' },
+      { sessionID: 'parent-1', agent: 'orchestrator' } as never,
+    );
+    expect(String(skippedRes)).toContain('state: waiting_for_user_skipped');
+    expect(beginUserWait).not.toHaveBeenCalled();
+
+    // 2. No background task + not allowed managed wait -> rejected
+    hasRunningTasks = false;
+    await expect(
+      waitForUser.execute({ reason: 'Wait for user' }, {
+        sessionID: 'parent-1',
+        agent: 'orchestrator',
+      } as never),
+    ).rejects.toThrow('Outcome phase is active');
+    expect(beginUserWait).not.toHaveBeenCalled();
+
+    // 3. No background task + allowed managed wait -> arms wait
+    allowed = true;
+    const armedRes = await waitForUser.execute(
+      { reason: 'Wait for user decision' },
+      { sessionID: 'parent-1', agent: 'orchestrator' } as never,
+    );
+    expect(String(armedRes)).toContain('state: waiting_for_user');
+    expect(beginUserWait).toHaveBeenCalledWith('parent-1');
+  });
 });

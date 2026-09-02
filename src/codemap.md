@@ -131,9 +131,9 @@ Key event flows:
 
 - **Config System** (`src/config/`): Configuration loading, validation, the `RuntimeConfig` runtime-state singleton, and runtime presets
 - **Agents** (`src/agents/`): Agent personalities and permission sets
-- **Outcome Management** (`src/outcome/`): Strict review contract and parser for outcome governance and acceptance
-- **Tools** (`src/tools/`): Tool implementations (task lifecycle controls, webfetch, AST operations, ACP)
-- **Hooks** (`src/hooks/`): Lifecycle hooks for auto-update, phase reminders, cache monitor, orchestrator wake, etc.
+- **Outcome Management** (`src/outcome/`): Strict review contract, durable outcome store, and `OutcomeController` service for outcome governance and acceptance
+- **Tools** (`src/tools/`): Tool implementations (task lifecycle controls, outcome_control, webfetch, AST operations, ACP)
+- **Hooks** (`src/hooks/`): Lifecycle hooks for auto-update, phase reminders, cache monitor, orchestrator wake, outcome controller, etc.
 - **Multiplexer** (`src/multiplexer/`): Tmux/Zellij session management for child sessions
 - **Council** (`src/agents/council.ts`, `src/agents/council-agents.ts`): Multi-LLM council orchestration
 - **Companion** (`src/companion/`): Companion version management

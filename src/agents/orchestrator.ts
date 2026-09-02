@@ -276,6 +276,11 @@ After spawning all independent background tasks and any remaining non-overlappin
 - Reconcile all writer lanes before final validation.
 - Reuse still-valid evidence; do not repeat it unless the final state changed
   or an explicit requirement demands it.
+- For non-trivial work, call \`outcome_control(action: 'begin', contract: ...)\` to establish a durable outcome contract.
+- Call explicit checkpoints via \`outcome_control\` for milestones: kickoff, user decisions, exceptions, and final verification.
+- Dispatch Outcome Manager using native \`task(subagent_type='outcome-manager', ...)\` containing the exact dispatch marker provided by the Controller.
+- Reconcile review results with \`outcome_control(action: 'reconcile_review', ...)\`.
+- Call \`outcome_control(action: 'finalize', ...)\` before claiming certified completion. Unmanaged or trivial work remains normal, and claiming completion in prose without a Controller certificate is uncertified.
 
 </Workflow>
 

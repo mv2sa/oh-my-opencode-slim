@@ -30,11 +30,11 @@ This codemap covers the plugin repository itself and excludes the nested `openco
 |---|---|---|
 | `src/` | Main application surface that composes plugin bootstrap, runtime model chains, hook orchestration, task-session aliasing, and installer-facing code. | [View Map](src/codemap.md) |
 | `src/agents/` | Agent factory layer for orchestrator and specialists (incl. dynamic `councillor-<name>` agents from council presets), including prompt/model overrides, task-rejection instruction, display-name normalization, MCP assignment, and permission shaping. | [View Map](src/agents/codemap.md) |
-| `src/outcome/` | Outcome management review contract, strict schema definitions, envelope parsing, and acceptance invariant enforcement for the Outcome Manager subagent. | [View Map](src/outcome/codemap.md) |
+| `src/outcome/` | Outcome management review contract, strict schema definitions, envelope parsing, durable outcome store, and `OutcomeController` service. | [View Map](src/outcome/codemap.md) |
 | `src/cli/` | Installer, config editing, provider preset generation, and built-in skill installation. | [View Map](src/cli/codemap.md) |
 | `src/config/` | Configuration schema, layered loaders, preset merging, compatibility migrations, constant tables, the `RuntimeConfig` runtime-state singleton, and agent/MCP policy helpers. | [View Map](src/config/codemap.md) |
-
-| `src/hooks/` | Aggregated runtime hook surface: prompt transforms, cache-safe injection, recovery logic, task-session aliasing, cache monitoring, orchestrator wake, nudges, and lifecycle policies. | [View Map](src/hooks/codemap.md) |
+| `src/hooks/` | Aggregated runtime hook surface: prompt transforms, cache-safe injection, recovery logic, task-session aliasing, cache monitoring, orchestrator wake, outcome controller, nudges, and lifecycle policies. | [View Map](src/hooks/codemap.md) |
+| `src/hooks/outcome-controller/` | Outcome controller hook: volatile trailing dispatch nudges, Manager correlation on native task calls, tool observations, and external user turn receipts. | [View Map](src/hooks/outcome-controller/codemap.md) |
 | `src/hooks/apply-patch/` | Structured `apply_patch` parsing, matching, recovery, and rewrite pipeline. | [View Map](src/hooks/apply-patch/codemap.md) |
 | `src/hooks/auto-update-checker/` | Startup update detection, cache handling, and optional install prompt flow. | [View Map](src/hooks/auto-update-checker/codemap.md) |
 | `src/hooks/filter-available-skills/` | Skill-visibility filtering based on agent permission policy. | [View Map](src/hooks/filter-available-skills/codemap.md) |

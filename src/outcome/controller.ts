@@ -1,0 +1,2188 @@
+import { randomBytes, randomUUID } from 'node:crypto';
+import {
+  canonicalDigest,
+  computeOutcomeAuthorizationDigest,
+  computeOutcomeContractDigest,
+  computeOutcomeEvidenceAttestationDigest,
+  type OutcomeActionRequired,
+  type OutcomeAuthorizationReceipt,
+  type OutcomeCheckpointClaim,
+  type OutcomeCheckpointKind,
+  type OutcomeContract,
+  OutcomeContractSchema,
+  type OutcomeEvidenceAttestation,
+  type OutcomeFinalCertificate,
+  type OutcomeManagerReviewSummary,
+  type OutcomePendingOperation,
+  type OutcomePhase,
+  type OutcomeRecord,
+  type OutcomeToolObservation,
+  type OutcomeUserMessageReceipt,
+} from './controller-schema';
+import { safeParseOutcomeReview } from './parser';
+import { getProcessEpoch } from './process-epoch';
+import type { OutcomeReview } from './schema';
+import { OutcomeStore, type OutcomeStoreResult } from './store';
+
+const CLAIM_SECRETS_SYMBOL = Symbol.for('omos.outcome.claim_secrets');
+
+interface ClaimSecretRegistry {
+  get(key: string): string | undefined;
+  set(key: string, token: string): void;
+  delete(key: string): void;
+}
+
+function getGlobalClaimSecrets(): ClaimSecretRegistry {
+  const globalStore = globalThis as unknown as Record<
+    symbol,
+    Map<string, string> | undefined
+  >;
+  let secrets = globalStore[CLAIM_SECRETS_SYMBOL];
+  if (!secrets) {
+    secrets = new Map<string, string>();
+    globalStore[CLAIM_SECRETS_SYMBOL] = secrets;
+  }
+  return {
+    get: (key: string) => secrets.get(key),
+    set: (key: string, token: string) => {
+      secrets.set(key, token);
+    },
+    delete: (key: string) => {
+      secrets.delete(key);
+    },
+  };
+}
+
+export interface OutcomeDispatchMarker {
+  rootSession: string;
+  outcomeId: string;
+  checkpointId: string;
+  claimGeneration: number;
+  checkpointFingerprint: string;
+  claimToken: string;
+}
+
+export function formatOutcomeDispatchMarker(
+  marker: OutcomeDispatchMarker,
+): string {
+  return `<!-- OMOS_DISPATCH_MARKER rootSession="${marker.rootSession}" outcomeId="${marker.outcomeId}" checkpointId="${marker.checkpointId}" claimGeneration=${marker.claimGeneration} checkpointFingerprint="${marker.checkpointFingerprint}" claimToken="${marker.claimToken}" -->`;
+}
+
+export function extractOutcomeDispatchMarkers(
+  text: string,
+): OutcomeDispatchMarker[] {
+  if (typeof text !== 'string') return [];
+  const results: OutcomeDispatchMarker[] = [];
+  const regex = /<!--\s*OMOS_DISPATCH_MARKER\s+([\s\S]*?)\s*-->/g;
+  const matches = [...text.matchAll(regex)];
+  for (const match of matches) {
+    const attrText = match[1];
+    const rootSession = attrText.match(/rootSession="([^"]+)"/)?.[1];
+    const outcomeId = attrText.match(/outcomeId="([^"]+)"/)?.[1];
+    const checkpointId = attrText.match(/checkpointId="([^"]+)"/)?.[1];
+    const claimGenStr = attrText.match(/claimGeneration=(\d+)/)?.[1];
+    const checkpointFingerprint = attrText.match(
+      /checkpointFingerprint="([^"]+)"/,
+    )?.[1];
+    const claimToken = attrText.match(/claimToken="([^"]+)"/)?.[1];
+
+    if (
+      rootSession &&
+      outcomeId &&
+      checkpointId &&
+      claimGenStr &&
+      checkpointFingerprint &&
+      claimToken
+    ) {
+      results.push({
+        rootSession,
+        outcomeId,
+        checkpointId,
+        claimGeneration: Number.parseInt(claimGenStr, 10),
+        checkpointFingerprint,
+        claimToken,
+      });
+    }
+  }
+  return results;
+}
+
+export function parseOutcomeDispatchMarker(
+  text: string,
+): OutcomeDispatchMarker | null {
+  const markers = extractOutcomeDispatchMarkers(text);
+  return markers.length === 1 ? markers[0] : null;
+}
+
+export function buildOutcomeReviewPacket(
+  record: OutcomeRecord,
+  checkpoint: OutcomeCheckpointClaim,
+): string {
+  const lines: string[] = [
+    '# Outcome Contract Review Packet',
+    `Outcome ID: ${record.outcomeId}`,
+    `Revision: ${record.revision}`,
+    `Checkpoint ID: ${checkpoint.checkpointId}`,
+    `Checkpoint Kind: ${checkpoint.kind}`,
+    `Checkpoint Reason: ${checkpoint.reason}`,
+    '',
+    '## Objective',
+    record.contract.objective,
+    '',
+    '## Deliverables',
+    ...record.contract.deliverables.map((d) => `- ${d}`),
+    '',
+    '## Goals',
+    ...record.contract.goals.map(
+      (g) =>
+        `- [${g.id}] (${g.status}) ${g.description}${g.notes ? ` - ${g.notes}` : ''}`,
+    ),
+    '',
+    '## Scope',
+    '### In Scope',
+    ...record.contract.inScope.map((s) => `- ${s}`),
+    '### Out of Scope',
+    ...record.contract.outOfScope.map((s) => `- ${s}`),
+    '',
+    '## Rules',
+    ...(record.contract.rules.length > 0
+      ? record.contract.rules.map(
+          (r) =>
+            `- [${r.id}] ${r.summary} (type: ${r.ruleType}, status: ${r.enforcementStatus}, source: ${r.sourcePath})`,
+        )
+      : ['- None']),
+    '',
+    '## Exceptions & Authorizations',
+    ...(record.contract.exceptions.length > 0
+      ? record.contract.exceptions.map(
+          (e) =>
+            `- Rule ${e.ruleId}: ${e.justification} (scope: ${e.scope}, authId: ${e.authorizationId})`,
+        )
+      : ['- None']),
+  ];
+
+  if (checkpoint.includedEvidenceAttestationIds.length > 0) {
+    lines.push('', '## Checkpoint Evidence Attestations');
+    for (const evId of checkpoint.includedEvidenceAttestationIds) {
+      const ev = record.receipts.evidence.find((e) => e.id === evId);
+      if (ev?.kind === 'orchestrator_attestation') {
+        lines.push(
+          `- [${ev.id}] ${ev.description} (status: ${ev.assertedStatus}, freshness: ${ev.assertedFreshness}, fingerprint: ${ev.candidateFingerprint})`,
+        );
+      }
+    }
+  }
+
+  return lines.join('\n');
+}
+
+export function buildOutcomeManagerInstruction(
+  marker: OutcomeDispatchMarker,
+  record: OutcomeRecord,
+  checkpoint: OutcomeCheckpointClaim,
+): string {
+  const markerString = formatOutcomeDispatchMarker(marker);
+  const packet = buildOutcomeReviewPacket(record, checkpoint);
+  return [
+    `Call task(subagent_type='outcome-manager', description='Outcome Manager review: ${checkpoint.kind} checkpoint (${checkpoint.reason})', prompt=\`${markerString}\n\n${packet}\`)`,
+    "Reconcile the review result with outcome_control(action='reconcile_review') after completion.",
+  ].join('\n\n');
+}
+
+export interface OutcomeStatusProjection {
+  isManaged: boolean;
+  blocked?: {
+    code: string;
+    reason: string;
+  };
+  outcomeId?: string;
+  revision?: number;
+  phase?: OutcomePhase;
+  contractDigest?: string;
+  checkpoint?: {
+    checkpointId: string;
+    kind: OutcomeCheckpointKind;
+    claimGeneration: number;
+    state: OutcomeCheckpointClaim['state'];
+    reason: string;
+    expiresAt: number;
+    candidateFingerprint?: string;
+  };
+  waitCondition?: OutcomeRecord['waitCondition'];
+  actionsRequired: OutcomeActionRequired[];
+  activeOperations: {
+    id: string;
+    toolName: string;
+    status: string;
+  }[];
+  finalCertificate?: OutcomeFinalCertificate;
+}
+
+export type OutcomeControllerResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: string; code?: string };
+
+export interface OutcomeBeginResult {
+  outcomeId: string;
+  revision: number;
+  phase: OutcomePhase;
+  checkpoint: {
+    checkpointId: string;
+    kind: OutcomeCheckpointKind;
+    claimGeneration: number;
+    fingerprint: string;
+  };
+  dispatchNudgePending: boolean;
+  idempotent?: true;
+}
+
+export interface OutcomeCheckpointParams {
+  kind: OutcomeCheckpointKind;
+  reason: string;
+  candidateFingerprint?: string;
+  decisionIds?: string[];
+  exceptionRuleIds?: string[];
+  evidenceAttestationIds?: string[];
+  expiresInMs?: number;
+}
+
+export interface OutcomeCheckpointResult {
+  checkpointId: string;
+  kind: OutcomeCheckpointKind;
+  claimGeneration: number;
+  revision: number;
+  phase: OutcomePhase;
+  dispatchNudgePending: true;
+}
+
+export interface OutcomeSubmitEvidenceParams {
+  description: string;
+  assertedStatus: 'passed' | 'failed' | 'stale' | 'pending';
+  assertedFreshness: 'fresh' | 'stale' | 'unknown';
+  candidateFingerprint: string;
+  linkedObservationId?: string;
+}
+
+export interface OutcomeSubmitEvidenceResult {
+  attestationId: string;
+  revision: number;
+  payloadDigest: string;
+  assurance: 'orchestrator_attestation';
+}
+
+export interface OutcomeReconcileReviewParams {
+  checkpointId: string;
+  managerTaskId: string;
+  managerGeneration?: number;
+}
+
+export interface OutcomeReconcileReviewResult {
+  verdict: OutcomeReview['verdict'];
+  phase: OutcomePhase;
+  summary: OutcomeManagerReviewSummary;
+}
+
+export interface OutcomeResolveUserDecisionParams {
+  decisionId: string;
+  chosenOption: string;
+  sourceUserMessageReceiptId: string;
+  authorizationKind?: 'user_decision';
+}
+
+export interface OutcomeResolveUserDecisionResult {
+  decisionId: string;
+  revision: number;
+  phase: OutcomePhase;
+}
+
+export interface OutcomeRegisterRepositoryWaiverParams {
+  repositoryReference: string;
+}
+
+export interface OutcomeRegisterRepositoryWaiverResult {
+  authorizationId: string;
+  revision: number;
+  kind: 'repository_waiver';
+  reference: string;
+  payloadDigest: string;
+}
+
+export interface OutcomeExternalHandoffParams {
+  kind: 'restart_current_opencode';
+  reason?: string;
+  instructions?: string;
+  expectedPostRestartCheck?: string;
+}
+
+export interface OutcomeExternalHandoffResult {
+  phase: OutcomePhase;
+  instructions: string;
+  expectedPostRestartCheck?: string;
+}
+
+export interface OutcomeProtocolUpdateResult {
+  revision: number;
+  phase: OutcomePhase;
+  contractDigest: string;
+}
+
+export interface OutcomeFinalizeResult {
+  certificate: OutcomeFinalCertificate;
+  assurance: 'orchestrator_attestation';
+}
+
+export interface ManagerTaskVerification {
+  taskID: string;
+  parentSessionID: string;
+  agent: string;
+  generation: number;
+  state: string;
+  terminalState?: string;
+  terminalUnreconciled?: boolean;
+}
+
+export interface ChildSessionReaderResult {
+  text: string;
+  empty: boolean;
+  terminal: boolean;
+}
+
+export type OutcomeNudge =
+  | {
+      kind: 'dispatch';
+      instruction: string;
+      marker: OutcomeDispatchMarker;
+    }
+  | {
+      kind: 'recovery';
+      message: string;
+    };
+
+export interface OutcomeControllerOptions {
+  projectDirectory?: string;
+  storeDirectory?: string;
+  serverEpoch?: string;
+  store?: OutcomeStore;
+  getManagerTaskRecord?: (
+    taskId: string,
+  ) => ManagerTaskVerification | undefined;
+  readChildSessionResult?: (
+    childSessionId: string,
+  ) => Promise<ChildSessionReaderResult | undefined>;
+  consumeManagerTask?: (
+    rootSessionId: string,
+    taskId: string,
+    generation: number,
+  ) => boolean;
+  hasRunningChildren?: (rootSessionId: string) => boolean;
+  hasTerminalUnreconciledChildren?: (rootSessionId: string) => boolean;
+  resolveAgentName?: (agent: string) => string;
+  clock?: () => number;
+  randomId?: () => string;
+}
+
+export class OutcomeController {
+  readonly #store: OutcomeStore;
+  readonly #serverEpoch: string;
+  readonly #claimSecrets: ClaimSecretRegistry;
+  readonly #getManagerTaskRecord?: (
+    taskId: string,
+  ) => ManagerTaskVerification | undefined;
+  readonly #readChildSessionResult?: (
+    childSessionId: string,
+  ) => Promise<ChildSessionReaderResult | undefined>;
+  readonly #consumeManagerTask?: (
+    rootSessionId: string,
+    taskId: string,
+    generation: number,
+  ) => boolean;
+  readonly #hasRunningChildren?: (rootSessionId: string) => boolean;
+  readonly #hasTerminalUnreconciledChildren?: (
+    rootSessionId: string,
+  ) => boolean;
+  readonly #resolveAgentName: (agent: string) => string;
+  readonly #clock: () => number;
+  readonly #randomId: () => string;
+  readonly #consumedReviewDigests = new Map<string, string>();
+
+  constructor(options: OutcomeControllerOptions = {}) {
+    this.#serverEpoch = options.serverEpoch ?? getProcessEpoch();
+    this.#clock = options.clock ?? Date.now;
+    this.#randomId = options.randomId ?? randomUUID;
+    this.#claimSecrets = getGlobalClaimSecrets();
+    this.#getManagerTaskRecord = options.getManagerTaskRecord;
+    this.#readChildSessionResult = options.readChildSessionResult;
+    this.#consumeManagerTask = options.consumeManagerTask;
+    this.#hasRunningChildren = options.hasRunningChildren;
+    this.#hasTerminalUnreconciledChildren =
+      options.hasTerminalUnreconciledChildren;
+    this.#resolveAgentName =
+      options.resolveAgentName ?? ((agent: string) => agent);
+
+    this.#store =
+      options.store ??
+      new OutcomeStore({
+        projectDirectory: options.projectDirectory,
+        storeDirectory: options.storeDirectory,
+        serverEpoch: this.#serverEpoch,
+        clock: this.#clock,
+        randomId: this.#randomId,
+      });
+  }
+
+  get store(): OutcomeStore {
+    return this.#store;
+  }
+
+  get serverEpoch(): string {
+    return this.#serverEpoch;
+  }
+
+  isManaged(rootSessionId: string): boolean {
+    const res = this.#store.read(rootSessionId);
+    if (res.success) return true;
+    if (res.code === 'missing') return false;
+    throw new Error(
+      `Managed outcome state is unavailable (${res.code}): ${res.error.message}`,
+    );
+  }
+
+  readRecord(rootSessionId: string): OutcomeStoreResult<OutcomeRecord> {
+    const readRes = this.#store.read(rootSessionId);
+    if (!readRes.success) return readRes;
+    if (readRes.data.serverEpoch !== this.#serverEpoch) {
+      return this.#store.recover(rootSessionId);
+    }
+    return readRes;
+  }
+
+  getStatus(rootSessionId: string): OutcomeStatusProjection {
+    const res = this.readRecord(rootSessionId);
+    if (!res.success) {
+      if (res.code !== 'missing') {
+        return {
+          isManaged: true,
+          blocked: { code: res.code, reason: res.error.message },
+          phase: 'corrupted',
+          actionsRequired: [],
+          activeOperations: [],
+        };
+      }
+      return {
+        isManaged: false,
+        actionsRequired: [],
+        activeOperations: [],
+      };
+    }
+    const record = res.data;
+    return {
+      isManaged: true,
+      outcomeId: record.outcomeId,
+      revision: record.revision,
+      phase: record.phase,
+      contractDigest: record.contractDigest,
+      checkpoint: record.checkpoint
+        ? {
+            checkpointId: record.checkpoint.checkpointId,
+            kind: record.checkpoint.kind,
+            claimGeneration: record.checkpoint.claimGeneration,
+            state: record.checkpoint.state,
+            reason: record.checkpoint.reason,
+            expiresAt: record.checkpoint.expiresAt,
+            candidateFingerprint: record.checkpoint.candidateFingerprint,
+          }
+        : undefined,
+      waitCondition: record.waitCondition,
+      actionsRequired: record.actionsRequired.filter(
+        (a) => a.resolvedAt === undefined,
+      ),
+      activeOperations: record.operations
+        .filter((op) => op.status === 'running')
+        .map((op) => ({
+          id: op.id,
+          toolName: op.toolName,
+          status: op.status,
+        })),
+      finalCertificate: record.finalCertificate,
+    };
+  }
+
+  getPendingNudge(rootSessionId: string): OutcomeNudge | undefined {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      if (recRes.code === 'missing') return undefined;
+      throw new Error(
+        `Managed outcome state is unavailable (${recRes.code}): ${recRes.error.message}`,
+      );
+    }
+    const record = recRes.data;
+
+    if (record.checkpoint && record.checkpoint.state === 'claimed') {
+      const claim = record.checkpoint;
+      const rawToken =
+        this.#claimSecrets.get(`${rootSessionId}:${claim.checkpointId}`) ??
+        this.#claimSecrets.get(`${rootSessionId}:${claim.claimGeneration}`);
+
+      if (
+        rawToken &&
+        canonicalDigest('omos/outcome-claim-token/v1', rawToken) ===
+          claim.claimTokenDigest
+      ) {
+        const marker: OutcomeDispatchMarker = {
+          rootSession: rootSessionId,
+          outcomeId: record.outcomeId,
+          checkpointId: claim.checkpointId,
+          claimGeneration: claim.claimGeneration,
+          checkpointFingerprint: claim.checkpointFingerprint,
+          claimToken: rawToken,
+        };
+        const instruction = buildOutcomeManagerInstruction(
+          marker,
+          record,
+          claim,
+        );
+        return { kind: 'dispatch', instruction, marker };
+      }
+
+      return {
+        kind: 'recovery',
+        message: `Active checkpoint claim '${claim.checkpointId}' lost its process claim token across restart. Call outcome_control(action='expire_checkpoint') after expiry or perform recovery.`,
+      };
+    }
+
+    if (record.phase === 'action_required') {
+      if (record.checkpoint?.state === 'review_uncertain') {
+        return {
+          kind: 'recovery',
+          message: `Manager review is uncertain for checkpoint '${record.checkpoint.checkpointId}'. Call outcome_control(action='reconcile_uncertain') to reconcile.`,
+        };
+      }
+      const unresolvedActions = record.actionsRequired.filter(
+        (a) => a.resolvedAt === undefined,
+      );
+      if (unresolvedActions.length > 0) {
+        return {
+          kind: 'recovery',
+          message: `Action required: ${unresolvedActions.map((a) => a.reason).join('; ')}`,
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  validateManagedWait(rootSessionId: string): {
+    isManaged: boolean;
+    allowed: boolean;
+    phase?: string;
+    reason?: string;
+  } {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      if (recRes.code === 'missing') {
+        return { isManaged: false, allowed: true };
+      }
+      return {
+        isManaged: true,
+        allowed: false,
+        phase: 'corrupted',
+        reason: `Managed outcome state is unavailable (${recRes.code}): ${recRes.error.message}`,
+      };
+    }
+    const record = recRes.data;
+
+    if (record.phase === 'waiting_user') {
+      const hasUnresolvedDecision =
+        record.waitCondition?.kind === 'user_decision' &&
+        record.receipts.decisions.some(
+          (d) =>
+            d.id === record.waitCondition?.referenceId &&
+            d.chosenOption === undefined,
+        );
+      if (hasUnresolvedDecision) {
+        return { isManaged: true, allowed: true, phase: 'waiting_user' };
+      }
+      return {
+        isManaged: true,
+        allowed: false,
+        phase: record.phase,
+        reason:
+          'Outcome is in waiting_user phase but lacks an unresolved durable user decision',
+      };
+    }
+
+    if (record.phase === 'waiting_external') {
+      if (record.waitCondition?.kind === 'external_handoff') {
+        return { isManaged: true, allowed: true, phase: 'waiting_external' };
+      }
+      return {
+        isManaged: true,
+        allowed: false,
+        phase: record.phase,
+        reason:
+          'Outcome is in waiting_external phase but lacks a durable external handoff wait condition',
+      };
+    }
+
+    return {
+      isManaged: true,
+      allowed: false,
+      phase: record.phase,
+      reason: `Outcome phase is '${record.phase}'. wait_for_user requires 'waiting_user' or 'waiting_external'`,
+    };
+  }
+
+  begin(
+    rootSessionId: string,
+    contract: OutcomeContract,
+    options?: { outcomeId?: string },
+  ): OutcomeControllerResult<OutcomeBeginResult> {
+    const parseRes = OutcomeContractSchema.safeParse(contract);
+    if (!parseRes.success) {
+      return {
+        success: false,
+        error: `Invalid outcome contract: ${parseRes.error.message}`,
+        code: 'invalid_contract',
+      };
+    }
+    const validContract = parseRes.data;
+
+    let record: OutcomeRecord;
+    const existing = this.#store.read(rootSessionId);
+    if (existing.success) {
+      const recovered = this.#store.recover(rootSessionId);
+      if (!recovered.success) {
+        return {
+          success: false,
+          error: `Failed to recover existing outcome record: ${recovered.error.message}`,
+          code: recovered.code,
+        };
+      }
+      record = recovered.data;
+      if (
+        record.contractDigest !== computeOutcomeContractDigest(validContract)
+      ) {
+        return {
+          success: false,
+          error:
+            'Existing managed outcome contract differs from the supplied contract',
+          code: 'contract_mismatch',
+        };
+      }
+    } else if (existing.code === 'missing') {
+      const initRes = this.#store.init(rootSessionId, {
+        outcomeId: options?.outcomeId,
+        contract: validContract,
+      });
+      if (!initRes.success) {
+        return {
+          success: false,
+          error: `Failed to initialize outcome record: ${initRes.error.message}`,
+          code: initRes.code,
+        };
+      }
+      record = initRes.data;
+    } else {
+      return {
+        success: false,
+        error: `Cannot initialize outcome over corrupt or unreadable record: ${existing.error.message}`,
+        code: existing.code,
+      };
+    }
+
+    if (!record.checkpoint) {
+      const claimToken = randomBytes(32).toString('hex');
+      const now = this.#clock();
+      const expiresAt = now + 600_000;
+      const mutateRes = this.#store.mutate(rootSessionId, record.revision, {
+        type: 'open_checkpoint',
+        kind: 'kickoff',
+        reason: 'Kickoff contract and scope verification',
+        claimToken,
+        expiresAt,
+      });
+      if (!mutateRes.success) {
+        return {
+          success: false,
+          error: `Failed to open kickoff checkpoint: ${mutateRes.error.message}`,
+          code: mutateRes.code,
+        };
+      }
+      record = mutateRes.data;
+      const checkpoint = record.checkpoint as OutcomeCheckpointClaim;
+      this.#claimSecrets.set(
+        `${rootSessionId}:${checkpoint.checkpointId}`,
+        claimToken,
+      );
+      this.#claimSecrets.set(
+        `${rootSessionId}:${checkpoint.claimGeneration}`,
+        claimToken,
+      );
+
+      return {
+        success: true,
+        data: {
+          outcomeId: record.outcomeId,
+          revision: record.revision,
+          phase: record.phase,
+          checkpoint: {
+            checkpointId: checkpoint.checkpointId,
+            kind: checkpoint.kind,
+            claimGeneration: checkpoint.claimGeneration,
+            fingerprint: checkpoint.checkpointFingerprint,
+          },
+          dispatchNudgePending: true,
+        },
+      };
+    }
+
+    const checkpoint = record.checkpoint;
+    if (isSettledCheckpoint(checkpoint.state)) {
+      return {
+        success: true,
+        data: {
+          outcomeId: record.outcomeId,
+          revision: record.revision,
+          phase: record.phase,
+          checkpoint: {
+            checkpointId: checkpoint.checkpointId,
+            kind: checkpoint.kind,
+            claimGeneration: checkpoint.claimGeneration,
+            fingerprint: checkpoint.checkpointFingerprint,
+          },
+          dispatchNudgePending: false,
+          idempotent: true,
+        },
+      };
+    }
+    const nudge = this.getPendingNudge(rootSessionId);
+    if (nudge?.kind !== 'dispatch') {
+      return {
+        success: false,
+        error:
+          nudge?.message ??
+          `Existing checkpoint '${checkpoint.checkpointId}' is not dispatchable`,
+        code: 'checkpoint_not_dispatchable',
+      };
+    }
+    return {
+      success: true,
+      data: {
+        outcomeId: record.outcomeId,
+        revision: record.revision,
+        phase: record.phase,
+        checkpoint: {
+          checkpointId: checkpoint.checkpointId,
+          kind: checkpoint.kind,
+          claimGeneration: checkpoint.claimGeneration,
+          fingerprint: checkpoint.checkpointFingerprint,
+        },
+        dispatchNudgePending: true,
+      },
+    };
+  }
+
+  checkpoint(
+    rootSessionId: string,
+    params: OutcomeCheckpointParams,
+  ): OutcomeControllerResult<OutcomeCheckpointResult> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return {
+        success: false,
+        error: `No managed outcome record found: ${recRes.error.message}`,
+        code: recRes.code,
+      };
+    }
+    const record = recRes.data;
+
+    if (record.waitCondition) {
+      return {
+        success: false,
+        error: `Cannot open checkpoint while wait '${record.waitCondition.referenceId}' is unresolved`,
+        code: 'wait_unresolved',
+      };
+    }
+    if (
+      record.actionsRequired.some((action) => action.resolvedAt === undefined)
+    ) {
+      return {
+        success: false,
+        error:
+          'Cannot open checkpoint while Controller actions remain unresolved',
+        code: 'action_unresolved',
+      };
+    }
+
+    if (
+      record.checkpoint &&
+      ![
+        'review_accepted',
+        'review_rejected',
+        'review_invalid',
+        'retired',
+      ].includes(record.checkpoint.state)
+    ) {
+      const existing = record.checkpoint;
+      return {
+        success: false,
+        error: `An active checkpoint '${existing.checkpointId}' (generation ${existing.claimGeneration}, state '${existing.state}') is already in-flight.`,
+        code: 'checkpoint_in_flight',
+      };
+    }
+
+    if (params.kind === 'final' && !params.candidateFingerprint) {
+      return {
+        success: false,
+        error: 'Final checkpoint requires candidateFingerprint',
+        code: 'invalid_checkpoint_params',
+      };
+    }
+
+    const claimToken = randomBytes(32).toString('hex');
+    const now = this.#clock();
+    const expiresAt = now + (params.expiresInMs ?? 600_000);
+
+    const mutateRes = this.#store.mutate(rootSessionId, record.revision, {
+      type: 'open_checkpoint',
+      kind: params.kind,
+      reason: params.reason,
+      claimToken,
+      expiresAt,
+      candidateFingerprint: params.candidateFingerprint,
+      decisionIds: params.decisionIds,
+      exceptionRuleIds: params.exceptionRuleIds,
+      evidenceAttestationIds: params.evidenceAttestationIds,
+    });
+    if (!mutateRes.success) {
+      return {
+        success: false,
+        error: `Failed to open checkpoint: ${mutateRes.error.message}`,
+        code: mutateRes.code,
+      };
+    }
+
+    const updated = mutateRes.data;
+    const checkpoint = updated.checkpoint as OutcomeCheckpointClaim;
+    this.#claimSecrets.set(
+      `${rootSessionId}:${checkpoint.checkpointId}`,
+      claimToken,
+    );
+    this.#claimSecrets.set(
+      `${rootSessionId}:${checkpoint.claimGeneration}`,
+      claimToken,
+    );
+
+    return {
+      success: true,
+      data: {
+        checkpointId: checkpoint.checkpointId,
+        kind: checkpoint.kind,
+        claimGeneration: checkpoint.claimGeneration,
+        revision: updated.revision,
+        phase: updated.phase,
+        dispatchNudgePending: true,
+      },
+    };
+  }
+
+  submitEvidence(
+    rootSessionId: string,
+    params: OutcomeSubmitEvidenceParams,
+  ): OutcomeControllerResult<OutcomeSubmitEvidenceResult> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return {
+        success: false,
+        error: `No managed outcome record found: ${recRes.error.message}`,
+        code: recRes.code,
+      };
+    }
+    const currentRecord = recRes.data;
+
+    if (params.linkedObservationId) {
+      const observationExistsInStore = currentRecord.receipts.evidence.some(
+        (e) => e.id === params.linkedObservationId,
+      );
+      if (!observationExistsInStore) {
+        return {
+          success: false,
+          error: `Linked observation '${params.linkedObservationId}' not found in durable record`,
+          code: 'missing_observation',
+        };
+      }
+    }
+
+    const attestationId = `att_${this.#randomId().replace(/-/g, '').slice(0, 16)}`;
+    const now = this.#clock();
+    const nextRevision = currentRecord.revision + 1;
+    const payloadDigest = computeOutcomeEvidenceAttestationDigest({
+      id: attestationId,
+      description: params.description,
+      assertedStatus: params.assertedStatus,
+      assertedFreshness: params.assertedFreshness,
+      candidateFingerprint: params.candidateFingerprint,
+      linkedObservationId: params.linkedObservationId,
+      createdAt: now,
+    });
+
+    const attestation: OutcomeEvidenceAttestation = {
+      id: attestationId,
+      kind: 'orchestrator_attestation',
+      description: params.description,
+      assertedStatus: params.assertedStatus,
+      assertedFreshness: params.assertedFreshness,
+      candidateFingerprint: params.candidateFingerprint,
+      linkedObservationId: params.linkedObservationId,
+      payloadDigest,
+      createdRevision: nextRevision,
+      createdAt: now,
+    };
+
+    const mutateRes = this.#store.mutate(
+      rootSessionId,
+      currentRecord.revision,
+      {
+        type: 'append_evidence',
+        entry: attestation,
+      },
+    );
+    if (!mutateRes.success) {
+      return {
+        success: false,
+        error: `Failed to submit evidence attestation: ${mutateRes.error.message}`,
+        code: mutateRes.code,
+      };
+    }
+
+    return {
+      success: true,
+      data: {
+        attestationId,
+        revision: mutateRes.data.revision,
+        payloadDigest,
+        assurance: 'orchestrator_attestation',
+      },
+    };
+  }
+
+  async reconcileReview(
+    rootSessionId: string,
+    params: OutcomeReconcileReviewParams,
+  ): Promise<OutcomeControllerResult<OutcomeReconcileReviewResult>> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return {
+        success: false,
+        error: `No managed outcome record found: ${recRes.error.message}`,
+        code: recRes.code,
+      };
+    }
+    const record = recRes.data;
+
+    const claim = record.checkpoint;
+    if (!claim) {
+      return {
+        success: false,
+        error: 'No active checkpoint found to reconcile',
+        code: 'missing_checkpoint',
+      };
+    }
+    if (claim.checkpointId !== params.checkpointId) {
+      return {
+        success: false,
+        error: `Checkpoint mismatch: expected '${claim.checkpointId}', got '${params.checkpointId}'`,
+        code: 'checkpoint_mismatch',
+      };
+    }
+    if (claim.managerTaskId && claim.managerTaskId !== params.managerTaskId) {
+      return {
+        success: false,
+        error: `Bound Manager task mismatch: expected '${claim.managerTaskId}', got '${params.managerTaskId}'`,
+        code: 'manager_task_mismatch',
+      };
+    }
+    if (
+      params.managerGeneration !== undefined &&
+      claim.managerGeneration !== undefined &&
+      claim.managerGeneration !== params.managerGeneration
+    ) {
+      return {
+        success: false,
+        error: `Manager generation mismatch: expected ${claim.managerGeneration}, got ${params.managerGeneration}`,
+        code: 'generation_mismatch',
+      };
+    }
+
+    // Authoritatively check background job board record
+    if (!this.#getManagerTaskRecord) {
+      return {
+        success: false,
+        error: 'Manager task verifier is not configured',
+        code: 'verifier_unconfigured',
+      };
+    }
+    {
+      const taskRecord = this.#getManagerTaskRecord(params.managerTaskId);
+      if (!taskRecord) {
+        return {
+          success: false,
+          error: `Manager task '${params.managerTaskId}' is untracked on the background job board`,
+          code: 'untracked_manager_task',
+        };
+      }
+      if (taskRecord.parentSessionID !== rootSessionId) {
+        return {
+          success: false,
+          error: `Manager task '${params.managerTaskId}' is parented by '${taskRecord.parentSessionID}', not root session '${rootSessionId}'`,
+          code: 'wrong_parent_session',
+        };
+      }
+      const resolvedAgent = this.#resolveAgentName(taskRecord.agent);
+      if (resolvedAgent !== 'outcome-manager') {
+        return {
+          success: false,
+          error: `Task '${params.managerTaskId}' agent is '${taskRecord.agent}' (${resolvedAgent}), expected 'outcome-manager'`,
+          code: 'wrong_agent_identity',
+        };
+      }
+      if (
+        claim.managerGeneration !== undefined &&
+        taskRecord.generation !== claim.managerGeneration
+      ) {
+        return {
+          success: false,
+          error: `Task board generation ${taskRecord.generation} does not match claim managerGeneration ${claim.managerGeneration}`,
+          code: 'generation_mismatch',
+        };
+      }
+      const isCompleted =
+        taskRecord.state === 'completed' ||
+        (taskRecord.state === 'reconciled' &&
+          taskRecord.terminalState === 'completed');
+      if (!isCompleted) {
+        return {
+          success: false,
+          error: `Manager task '${params.managerTaskId}' state is '${taskRecord.state}' and is not confirmed terminal completed`,
+          code: 'task_not_completed',
+        };
+      }
+    }
+
+    if (!this.#readChildSessionResult) {
+      return {
+        success: false,
+        error:
+          'readChildSessionResult reader not configured on OutcomeController',
+        code: 'reader_unconfigured',
+      };
+    }
+    if (!this.#consumeManagerTask) {
+      return {
+        success: false,
+        error: 'Manager task consumer is not configured',
+        code: 'consumer_unconfigured',
+      };
+    }
+
+    const sessionResult = await this.#readChildSessionResult(
+      params.managerTaskId,
+    );
+    if (sessionResult?.terminal !== true || sessionResult.empty === true) {
+      return {
+        success: false,
+        error: `Manager child session '${params.managerTaskId}' has not produced a non-empty terminal completed output`,
+        code: 'result_not_terminal',
+      };
+    }
+
+    const rawResultText = sessionResult.text;
+    const resultDigest = canonicalDigest(
+      'omos/manager-result/v1',
+      rawResultText,
+    );
+    const existingSummary = record.reviewSummaries.find(
+      (entry) =>
+        entry.checkpointId === claim.checkpointId &&
+        entry.claimGeneration === claim.claimGeneration,
+    );
+    if (
+      existingSummary &&
+      ['review_accepted', 'review_rejected'].includes(claim.state)
+    ) {
+      if (existingSummary.resultDigest !== resultDigest) {
+        return {
+          success: false,
+          error:
+            'Fetched Manager result differs from the result already reconciled for this claim',
+          code: 'result_digest_mismatch',
+        };
+      }
+      if (
+        !this.#consumeManagerTask(
+          rootSessionId,
+          params.managerTaskId,
+          claim.managerGeneration as number,
+        )
+      ) {
+        return {
+          success: false,
+          error:
+            'Persisted Manager task completion could not be consumed idempotently',
+          code: 'manager_consumption_failed',
+        };
+      }
+      return {
+        success: true,
+        data: {
+          verdict: existingSummary.verdict,
+          phase: record.phase,
+          summary: existingSummary,
+        },
+      };
+    }
+    if (claim.state === 'review_invalid') {
+      if (claim.resultDigest !== resultDigest) {
+        return {
+          success: false,
+          error:
+            'Fetched Manager result differs from the invalid result already reconciled for this claim',
+          code: 'result_digest_mismatch',
+        };
+      }
+      if (
+        !this.#consumeManagerTask(
+          rootSessionId,
+          params.managerTaskId,
+          claim.managerGeneration as number,
+        )
+      ) {
+        return {
+          success: false,
+          error:
+            'Persisted invalid Manager task could not be consumed idempotently',
+          code: 'manager_consumption_failed',
+        };
+      }
+      return {
+        success: false,
+        error: claim.recoveryNote ?? 'Manager review is invalid',
+        code: 'review_invalid',
+      };
+    }
+    if (
+      claim.state === 'result_available' &&
+      claim.resultDigest !== resultDigest
+    ) {
+      return {
+        success: false,
+        error:
+          'Fetched Manager result does not match the result digest already bound to this claim',
+        code: 'result_digest_mismatch',
+      };
+    }
+    const claimToken =
+      this.#claimSecrets.get(`${rootSessionId}:${claim.checkpointId}`) ??
+      this.#claimSecrets.get(`${rootSessionId}:${claim.claimGeneration}`) ??
+      '';
+    const isRecoveredReview =
+      claim.state === 'result_available' &&
+      claim.serverEpoch !== this.#serverEpoch;
+    const reconciliationKey = `${rootSessionId}:${params.managerTaskId}:${claim.managerGeneration}`;
+    const previouslyConsumedDigest =
+      this.#consumedReviewDigests.get(reconciliationKey);
+    if (
+      previouslyConsumedDigest !== undefined &&
+      previouslyConsumedDigest !== resultDigest
+    ) {
+      return {
+        success: false,
+        error:
+          'Manager result changed after its task generation was consumed; exact-result retry is required',
+        code: 'consumed_result_mismatch',
+      };
+    }
+    const claimValidation = this.#store.validateReviewClaim(rootSessionId, {
+      checkpointId: claim.checkpointId,
+      claimGeneration: claim.claimGeneration,
+      claimToken: isRecoveredReview ? undefined : claimToken,
+      resultDigest,
+      recovered: isRecoveredReview,
+    });
+    if (!claimValidation.success) {
+      return {
+        success: false,
+        error: `Review claim authentication failed: ${claimValidation.error.message}`,
+        code: 'review_auth_failed',
+      };
+    }
+
+    const parseResult = safeParseOutcomeReview(rawResultText);
+    let review: OutcomeReview | undefined;
+    let invalidReason: string | undefined;
+    let invalidCode: 'review_invalid' | 'review_auth_failed' = 'review_invalid';
+    if (parseResult.success) {
+      review = parseResult.data;
+      const validation = this.#store.validateReview(rootSessionId, {
+        checkpointId: claim.checkpointId,
+        claimGeneration: claim.claimGeneration,
+        claimToken: isRecoveredReview ? undefined : claimToken,
+        resultDigest,
+        review,
+        recovered: isRecoveredReview,
+      });
+      if (!validation.success) {
+        invalidReason =
+          `Review authentication failed against Controller contract: ${validation.error.message}`.slice(
+            0,
+            500,
+          );
+        invalidCode = 'review_auth_failed';
+      }
+    } else {
+      invalidReason =
+        `Malformed outcome review payload: ${parseResult.error}`.slice(0, 500);
+    }
+
+    if (
+      !this.#consumeManagerTask(
+        rootSessionId,
+        params.managerTaskId,
+        claim.managerGeneration as number,
+      )
+    ) {
+      return {
+        success: false,
+        error: 'Manager task completion could not be consumed consistently',
+        code: 'manager_consumption_failed',
+      };
+    }
+    this.#consumedReviewDigests.set(reconciliationKey, resultDigest);
+
+    const reviewRes = this.#store.persistReconciledReview(
+      rootSessionId,
+      invalidReason
+        ? {
+            outcome: 'invalid',
+            checkpointId: claim.checkpointId,
+            claimGeneration: claim.claimGeneration,
+            claimToken: isRecoveredReview ? undefined : claimToken,
+            resultDigest,
+            reason: invalidReason,
+            recovered: isRecoveredReview,
+          }
+        : {
+            outcome: 'valid',
+            checkpointId: claim.checkpointId,
+            claimGeneration: claim.claimGeneration,
+            claimToken: isRecoveredReview ? undefined : claimToken,
+            resultDigest,
+            review: review as OutcomeReview,
+            recovered: isRecoveredReview,
+          },
+    );
+
+    if (!reviewRes.success) {
+      return {
+        success: false,
+        error: `Failed to persist reconciled review state: ${reviewRes.error.message}`,
+        code: reviewRes.code,
+      };
+    }
+
+    if (invalidReason) {
+      this.#consumedReviewDigests.delete(reconciliationKey);
+      return { success: false, error: invalidReason, code: invalidCode };
+    }
+
+    const updatedRecord = reviewRes.data;
+    const latestSummary = updatedRecord.reviewSummaries.find(
+      (entry) =>
+        entry.checkpointId === claim.checkpointId &&
+        entry.claimGeneration === claim.claimGeneration,
+    ) as OutcomeManagerReviewSummary;
+    this.#consumedReviewDigests.delete(reconciliationKey);
+
+    return {
+      success: true,
+      data: {
+        verdict: (review as OutcomeReview).verdict,
+        phase: updatedRecord.phase,
+        summary: latestSummary,
+      },
+    };
+  }
+
+  resolveUserDecision(
+    rootSessionId: string,
+    params: OutcomeResolveUserDecisionParams,
+  ): OutcomeControllerResult<OutcomeResolveUserDecisionResult> {
+    if (
+      params.authorizationKind !== undefined &&
+      params.authorizationKind !== 'user_decision'
+    ) {
+      return {
+        success: false,
+        error:
+          'Decision resolution can mint only user_decision authority; use registerRepositoryWaiver for repository authority',
+        code: 'invalid_authorization_kind',
+      };
+    }
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return {
+        success: false,
+        error: `No managed outcome record found: ${recRes.error.message}`,
+        code: recRes.code,
+      };
+    }
+    let record = recRes.data;
+
+    const existingDecision = record.receipts.decisions.find(
+      (d) => d.id === params.decisionId,
+    );
+    if (!existingDecision) {
+      return {
+        success: false,
+        error: `Decision '${params.decisionId}' does not exist in durable outcome record`,
+        code: 'decision_not_found',
+      };
+    }
+    if (existingDecision.chosenOption !== undefined) {
+      return {
+        success: false,
+        error: `Decision '${params.decisionId}' is already resolved with option '${existingDecision.chosenOption}'`,
+        code: 'decision_already_resolved',
+      };
+    }
+    if (!existingDecision.options.includes(params.chosenOption)) {
+      return {
+        success: false,
+        error: `Chosen option '${params.chosenOption}' is not in available options [${existingDecision.options.join(', ')}]`,
+        code: 'invalid_decision_option',
+      };
+    }
+
+    const userMessage = record.receipts.userMessages.find(
+      (m) => m.id === params.sourceUserMessageReceiptId,
+    );
+    if (!userMessage) {
+      return {
+        success: false,
+        error: `User message receipt '${params.sourceUserMessageReceiptId}' not found in durable record`,
+        code: 'missing_user_message',
+      };
+    }
+
+    const now = this.#clock();
+
+    const resolveDecisionRes = this.#store.mutate(
+      rootSessionId,
+      record.revision,
+      {
+        type: 'resolve_decision',
+        decisionId: params.decisionId,
+        chosenOption: params.chosenOption,
+        sourceUserMessageReceiptId: params.sourceUserMessageReceiptId,
+        decidedAt: now,
+      },
+    );
+    if (!resolveDecisionRes.success) {
+      return {
+        success: false,
+        error: `Failed to resolve decision: ${resolveDecisionRes.error.message}`,
+        code: resolveDecisionRes.code,
+      };
+    }
+    record = resolveDecisionRes.data;
+
+    if (params.authorizationKind === 'user_decision') {
+      const authId = `auth_${this.#randomId().replace(/-/g, '').slice(0, 16)}`;
+      const payloadDigest = computeOutcomeAuthorizationDigest({
+        id: authId,
+        kind: 'user_decision',
+        reference: params.decisionId,
+        decisionId: params.decisionId,
+        observedAt: now,
+      });
+      const authReceipt: OutcomeAuthorizationReceipt = {
+        id: authId,
+        kind: 'user_decision',
+        reference: params.decisionId,
+        payloadDigest,
+        decisionId: params.decisionId,
+        observedAt: now,
+      };
+      const appendAuthRes = this.#store.mutate(rootSessionId, record.revision, {
+        type: 'append_authorization',
+        receipt: authReceipt,
+      });
+      if (!appendAuthRes.success) {
+        return {
+          success: false,
+          error: `Failed to record authorization receipt: ${appendAuthRes.error.message}`,
+          code: appendAuthRes.code,
+        };
+      }
+      record = appendAuthRes.data;
+    }
+
+    return {
+      success: true,
+      data: {
+        decisionId: params.decisionId,
+        revision: record.revision,
+        phase: record.phase,
+      },
+    };
+  }
+
+  registerRepositoryWaiver(
+    rootSessionId: string,
+    params: OutcomeRegisterRepositoryWaiverParams,
+  ): OutcomeControllerResult<OutcomeRegisterRepositoryWaiverResult> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return { success: false, error: recRes.error.message, code: recRes.code };
+    }
+    if (recRes.data.phase === 'accepted') {
+      return {
+        success: false,
+        error: 'Accepted outcome is immutable',
+        code: 'invalid_transition',
+      };
+    }
+    const reference = params.repositoryReference.trim();
+    if (reference.length === 0 || reference.length > 256) {
+      return {
+        success: false,
+        error: 'Repository waiver reference must contain 1-256 characters',
+        code: 'invalid_repository_reference',
+      };
+    }
+    const authorizationId = `auth_${this.#randomId().replace(/-/g, '').slice(0, 16)}`;
+    const observedAt = this.#clock();
+    const receipt: OutcomeAuthorizationReceipt = {
+      id: authorizationId,
+      kind: 'repository_waiver',
+      reference,
+      payloadDigest: '',
+      observedAt,
+    };
+    receipt.payloadDigest = computeOutcomeAuthorizationDigest(receipt);
+    const result = this.#store.mutate(rootSessionId, recRes.data.revision, {
+      type: 'append_authorization',
+      receipt,
+    });
+    if (!result.success) {
+      return { success: false, error: result.error.message, code: result.code };
+    }
+    return {
+      success: true,
+      data: {
+        authorizationId,
+        revision: result.data.revision,
+        kind: 'repository_waiver',
+        reference,
+        payloadDigest: receipt.payloadDigest,
+      },
+    };
+  }
+
+  externalHandoff(
+    rootSessionId: string,
+    params: OutcomeExternalHandoffParams,
+  ): OutcomeControllerResult<OutcomeExternalHandoffResult> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return {
+        success: false,
+        error: `No managed outcome record found: ${recRes.error.message}`,
+        code: recRes.code,
+      };
+    }
+    const record = recRes.data;
+    const now = this.#clock();
+
+    const instructions =
+      params.instructions ??
+      'OpenCode process restart requested. Work is paused until restart completes and user returns.';
+
+    const mutateRes = this.#store.mutate(rootSessionId, record.revision, {
+      type: 'set_wait',
+      wait: {
+        kind: 'external_handoff',
+        referenceId: 'ext_restart',
+        reason:
+          params.reason ??
+          'Restarting OpenCode process to reload environment/configuration',
+        createdAt: now,
+        createdRevision: record.revision + 1,
+        originatingServerEpoch: this.#serverEpoch,
+        instructions,
+        expectedPostRestartCheck: params.expectedPostRestartCheck,
+      },
+    });
+    if (!mutateRes.success) {
+      return {
+        success: false,
+        error: `Failed to set external handoff wait: ${mutateRes.error.message}`,
+        code: mutateRes.code,
+      };
+    }
+
+    return {
+      success: true,
+      data: {
+        phase: mutateRes.data.phase,
+        instructions,
+        expectedPostRestartCheck: params.expectedPostRestartCheck,
+      },
+    };
+  }
+
+  updateGoalStatus(
+    rootSessionId: string,
+    params: { goalId: string; status: 'satisfied' },
+  ): OutcomeControllerResult<OutcomeProtocolUpdateResult> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return { success: false, error: recRes.error.message, code: recRes.code };
+    }
+    const result = this.#store.mutate(rootSessionId, recRes.data.revision, {
+      type: 'update_goal_status',
+      goalId: params.goalId,
+      newStatus: params.status,
+    });
+    return result.success
+      ? {
+          success: true,
+          data: {
+            revision: result.data.revision,
+            phase: result.data.phase,
+            contractDigest: result.data.contractDigest,
+          },
+        }
+      : { success: false, error: result.error.message, code: result.code };
+  }
+
+  reviseContract(
+    rootSessionId: string,
+    params: {
+      contract: OutcomeContract;
+      sourceUserMessageReceiptId?: string;
+    },
+  ): OutcomeControllerResult<OutcomeProtocolUpdateResult> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return { success: false, error: recRes.error.message, code: recRes.code };
+    }
+    const result = this.#store.mutate(rootSessionId, recRes.data.revision, {
+      type: 'revise_contract',
+      contract: params.contract,
+      sourceUserMessageReceiptId: params.sourceUserMessageReceiptId,
+    });
+    return result.success
+      ? {
+          success: true,
+          data: {
+            revision: result.data.revision,
+            phase: result.data.phase,
+            contractDigest: result.data.contractDigest,
+          },
+        }
+      : { success: false, error: result.error.message, code: result.code };
+  }
+
+  completeExternalHandoff(
+    rootSessionId: string,
+    params: {
+      sourceUserMessageReceiptId: string;
+      evidenceAttestationId: string;
+    },
+  ): OutcomeControllerResult<OutcomeProtocolUpdateResult> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return { success: false, error: recRes.error.message, code: recRes.code };
+    }
+    const record = recRes.data;
+    const wait = record.waitCondition;
+    if (wait?.kind !== 'external_handoff') {
+      return { success: false, error: 'No external handoff is waiting' };
+    }
+    if (
+      !wait.originatingServerEpoch ||
+      wait.originatingServerEpoch === this.#serverEpoch ||
+      wait.restartObservedRevision === undefined
+    ) {
+      return {
+        success: false,
+        error:
+          'External handoff completion requires a different Controller server epoch',
+        code: 'restart_not_observed',
+      };
+    }
+    const userReceipt = record.receipts.userMessages.find(
+      (entry) => entry.id === params.sourceUserMessageReceiptId,
+    );
+    const restartRevision = wait.restartObservedRevision;
+    if (
+      !userReceipt ||
+      userReceipt.createdRevision <= restartRevision ||
+      userReceipt.observedEpoch !== this.#serverEpoch
+    ) {
+      return {
+        success: false,
+        error: 'External handoff completion requires a subsequent user receipt',
+      };
+    }
+    const evidence = record.receipts.evidence.find(
+      (entry) => entry.id === params.evidenceAttestationId,
+    );
+    if (
+      evidence?.kind !== 'orchestrator_attestation' ||
+      evidence.createdRevision <= restartRevision ||
+      evidence.assertedStatus !== 'passed' ||
+      evidence.assertedFreshness !== 'fresh' ||
+      (wait.expectedPostRestartCheck &&
+        evidence.description !== wait.expectedPostRestartCheck)
+    ) {
+      return {
+        success: false,
+        error:
+          'External handoff completion requires matching fresh passed post-restart evidence',
+      };
+    }
+    const result = this.#store.mutate(rootSessionId, record.revision, {
+      type: 'clear_wait',
+      referenceId: wait.referenceId,
+    });
+    return result.success
+      ? {
+          success: true,
+          data: {
+            revision: result.data.revision,
+            phase: result.data.phase,
+            contractDigest: result.data.contractDigest,
+          },
+        }
+      : { success: false, error: result.error.message, code: result.code };
+  }
+
+  resolveAction(
+    rootSessionId: string,
+    params: {
+      actionId: string;
+      reason: string;
+      sourceUserMessageReceiptId?: string;
+      evidenceAttestationIds?: string[];
+    },
+  ): OutcomeControllerResult<OutcomeProtocolUpdateResult> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return { success: false, error: recRes.error.message, code: recRes.code };
+    }
+    const result = this.#store.mutate(rootSessionId, recRes.data.revision, {
+      type: 'resolve_action',
+      ...params,
+    });
+    return result.success
+      ? {
+          success: true,
+          data: {
+            revision: result.data.revision,
+            phase: result.data.phase,
+            contractDigest: result.data.contractDigest,
+          },
+        }
+      : { success: false, error: result.error.message, code: result.code };
+  }
+
+  finalize(
+    rootSessionId: string,
+    params: { summary: string },
+  ): OutcomeControllerResult<OutcomeFinalizeResult> {
+    if (this.#hasRunningChildren?.(rootSessionId)) {
+      return {
+        success: false,
+        error:
+          'Active running child tasks block finalization. Wait for all subagents to finish or cancel obsolete tasks.',
+        code: 'running_tasks_present',
+      };
+    }
+    if (this.#hasTerminalUnreconciledChildren?.(rootSessionId)) {
+      return {
+        success: false,
+        error:
+          'Terminal unreconciled background tasks block finalization. Retrieve or acknowledge terminal tasks before finalization.',
+        code: 'unreconciled_tasks_present',
+      };
+    }
+
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return {
+        success: false,
+        error: `No managed outcome record found: ${recRes.error.message}`,
+        code: recRes.code,
+      };
+    }
+    const record = recRes.data;
+
+    const finalizeRes = this.#store.mutate(rootSessionId, record.revision, {
+      type: 'finalize',
+      summary: params.summary,
+    });
+    if (!finalizeRes.success) {
+      return {
+        success: false,
+        error: `Finalization blocked: ${finalizeRes.error.message}`,
+        code: finalizeRes.code,
+      };
+    }
+
+    const updated = finalizeRes.data;
+    const certificate = updated.finalCertificate as OutcomeFinalCertificate;
+
+    return {
+      success: true,
+      data: {
+        certificate,
+        assurance: 'orchestrator_attestation',
+      },
+    };
+  }
+
+  expireCheckpoint(
+    rootSessionId: string,
+    params: { checkpointId: string; reason: string },
+  ): OutcomeControllerResult<OutcomeRecord> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) return { success: false, error: recRes.error.message };
+    const record = recRes.data;
+    const claim = record.checkpoint;
+    if (!claim || claim.checkpointId !== params.checkpointId) {
+      return {
+        success: false,
+        error: `Checkpoint '${params.checkpointId}' not found on record`,
+      };
+    }
+    const claimToken =
+      this.#claimSecrets.get(`${rootSessionId}:${claim.checkpointId}`) ?? '';
+    const res = this.#store.mutate(rootSessionId, record.revision, {
+      type: 'expire_checkpoint',
+      checkpointId: params.checkpointId,
+      claimGeneration: claim.claimGeneration,
+      claimToken,
+      reason: params.reason,
+    });
+    return res.success
+      ? { success: true, data: res.data }
+      : { success: false, error: res.error.message };
+  }
+
+  reconcileUncertain(
+    rootSessionId: string,
+    params: {
+      checkpointId: string;
+      resolution:
+        | { kind: 'retire'; reason: string }
+        | {
+            kind: 'result_available';
+            dispatchCallId: string;
+            managerTaskId: string;
+            managerGeneration: number;
+            resultDigest: string;
+          };
+    },
+  ): OutcomeControllerResult<OutcomeRecord> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) return { success: false, error: recRes.error.message };
+    const record = recRes.data;
+    const claim = record.checkpoint;
+    if (!claim || claim.checkpointId !== params.checkpointId) {
+      return {
+        success: false,
+        error: `Checkpoint '${params.checkpointId}' not found on record`,
+      };
+    }
+    const res = this.#store.mutate(rootSessionId, record.revision, {
+      type: 'reconcile_uncertain_checkpoint',
+      checkpointId: params.checkpointId,
+      claimGeneration: claim.claimGeneration,
+      resolution: params.resolution,
+    });
+    return res.success
+      ? { success: true, data: res.data }
+      : { success: false, error: res.error.message };
+  }
+
+  acknowledgeOperation(
+    rootSessionId: string,
+    params: { operationId: string },
+  ): OutcomeControllerResult<OutcomeRecord> {
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) return { success: false, error: recRes.error.message };
+    const record = recRes.data;
+    const res = this.#store.mutate(rootSessionId, record.revision, {
+      type: 'acknowledge_operation',
+      operationId: params.operationId,
+    });
+    return res.success
+      ? { success: true, data: res.data }
+      : { success: false, error: res.error.message };
+  }
+
+  observeToolBefore(
+    rootSessionId: string,
+    callId: string,
+    toolName: string,
+    args: unknown,
+  ): OutcomeControllerResult<{ observationId: string; operationId: string }> {
+    if (toolName === 'outcome_control') {
+      return {
+        success: true,
+        data: { observationId: '', operationId: '' },
+      };
+    }
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return {
+        success: false,
+        error: recRes.error.message,
+        code: recRes.code,
+      };
+    }
+    const record = recRes.data;
+
+    const argumentDigest = canonicalDigest('omos/tool-args/v1', args);
+    const now = this.#clock();
+    const operationId = `op_${callId}`;
+    const observationId = `obs_${callId}`;
+
+    const operation: OutcomePendingOperation = {
+      id: operationId,
+      callId,
+      toolName,
+      argumentDigest,
+      serverEpoch: this.#serverEpoch,
+      status: 'running',
+      startedAt: now,
+      updatedAt: now,
+    };
+
+    const observation: OutcomeToolObservation = {
+      id: observationId,
+      kind: 'controller_observed',
+      callId,
+      toolName,
+      argumentDigest,
+      startedEpoch: this.#serverEpoch,
+      startedAt: now,
+      completionObserved: false,
+    };
+
+    const startRes = this.#store.mutate(rootSessionId, record.revision, {
+      type: 'start_tool_call',
+      operation,
+      observation,
+    });
+    if (!startRes.success) {
+      return {
+        success: false,
+        error: startRes.error.message,
+        code: startRes.code,
+      };
+    }
+    return { success: true, data: { observationId, operationId } };
+  }
+
+  observeToolAfter(
+    rootSessionId: string,
+    callId: string,
+    toolName: string,
+    output: unknown,
+  ): OutcomeControllerResult<{ observationId: string; operationId: string }> {
+    if (toolName === 'outcome_control') {
+      return {
+        success: true,
+        data: { observationId: '', operationId: '' },
+      };
+    }
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return {
+        success: false,
+        error: recRes.error.message,
+        code: recRes.code,
+      };
+    }
+    const record = recRes.data;
+
+    const observationId = `obs_${callId}`;
+    const operationId = `op_${callId}`;
+    const outputDigest = canonicalDigest('omos/tool-output/v1', output);
+    const now = this.#clock();
+
+    const completeRes = this.#store.mutate(rootSessionId, record.revision, {
+      type: 'complete_tool_call',
+      operationId,
+      observationId,
+      outputDigest,
+      completedEpoch: this.#serverEpoch,
+      completedAt: now,
+    });
+    if (!completeRes.success) {
+      return {
+        success: false,
+        error: completeRes.error.message,
+        code: completeRes.code,
+      };
+    }
+    return { success: true, data: { observationId, operationId } };
+  }
+
+  observeUserTurn(
+    rootSessionId: string,
+    messageId: string,
+    text: string,
+  ): void {
+    if (!messageId.trim()) return;
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      if (recRes.code === 'missing') return;
+      throw new Error(
+        `Managed outcome state is unavailable (${recRes.code}): ${recRes.error.message}`,
+      );
+    }
+    const record = recRes.data;
+
+    const receiptId = `usr_${this.#randomId().replace(/-/g, '').slice(0, 16)}`;
+    const now = this.#clock();
+    const receipt: OutcomeUserMessageReceipt = {
+      id: receiptId,
+      messageId,
+      contentDigest: canonicalDigest('omos/user-message/v1', text),
+      observedEpoch: this.#serverEpoch,
+      observedAt: now,
+      createdRevision: record.revision + 1,
+    };
+
+    this.#store.mutate(rootSessionId, record.revision, {
+      type: 'append_user_message',
+      receipt,
+    });
+  }
+
+  validateAndMarkDispatching(
+    sessionID: string,
+    callID: string,
+    promptText: string,
+  ):
+    | { success: true; marker: OutcomeDispatchMarker }
+    | { success: false; error: string } {
+    if (!callID || typeof callID !== 'string' || callID.trim() === '') {
+      return {
+        success: false,
+        error: 'Outcome Manager task dispatch requires a non-empty callID',
+      };
+    }
+
+    const markers = extractOutcomeDispatchMarkers(promptText);
+    if (markers.length === 0) {
+      return {
+        success: false,
+        error:
+          'Task prompt for outcome-manager must contain exactly one valid OMOS dispatch marker',
+      };
+    }
+    if (markers.length > 1) {
+      return {
+        success: false,
+        error: `Task prompt for outcome-manager contains ${markers.length} dispatch markers; exactly one is required`,
+      };
+    }
+
+    const marker = markers[0];
+    if (marker.rootSession !== sessionID) {
+      return {
+        success: false,
+        error: `Dispatch marker root session '${marker.rootSession}' does not match caller session '${sessionID}'`,
+      };
+    }
+
+    const recRes = this.readRecord(sessionID);
+    if (!recRes.success) {
+      return {
+        success: false,
+        error: `No managed outcome found for session '${sessionID}': ${recRes.error.message}`,
+      };
+    }
+    const record = recRes.data;
+    const claim = record.checkpoint;
+    if (!claim) {
+      return {
+        success: false,
+        error: 'No active checkpoint found to dispatch',
+      };
+    }
+
+    if (
+      claim.checkpointId !== marker.checkpointId ||
+      claim.claimGeneration !== marker.claimGeneration ||
+      claim.checkpointFingerprint !== marker.checkpointFingerprint
+    ) {
+      return {
+        success: false,
+        error: 'Dispatch marker does not match current active checkpoint claim',
+      };
+    }
+
+    if (claim.state !== 'claimed') {
+      return {
+        success: false,
+        error: `Checkpoint is in '${claim.state}' state and cannot be dispatched again`,
+      };
+    }
+
+    const mutateRes = this.#store.mutate(sessionID, record.revision, {
+      type: 'mark_dispatching',
+      checkpointId: claim.checkpointId,
+      claimGeneration: claim.claimGeneration,
+      claimToken: marker.claimToken,
+      dispatchCallId: callID,
+    });
+
+    if (!mutateRes.success) {
+      return {
+        success: false,
+        error: `Failed to mark checkpoint dispatching: ${mutateRes.error.message}`,
+      };
+    }
+
+    return { success: true, marker };
+  }
+
+  hasDispatchCall(sessionID: string, callID: string): boolean {
+    const record = this.readRecord(sessionID);
+    return (
+      record.success &&
+      record.data.checkpoint?.state === 'dispatching' &&
+      record.data.checkpoint.dispatchCallId === callID
+    );
+  }
+
+  bindManagerTask(
+    sessionID: string,
+    callID: string,
+    managerTaskId: string,
+  ): OutcomeControllerResult<OutcomeRecord> {
+    const recRes = this.readRecord(sessionID);
+    if (!recRes.success) return { success: false, error: recRes.error.message };
+    let record = recRes.data;
+    const claim = record.checkpoint;
+    if (claim?.state !== 'dispatching' || claim.dispatchCallId !== callID) {
+      return {
+        success: false,
+        error: 'No matching durable dispatch claim for Manager binding',
+      };
+    }
+    if (!this.#getManagerTaskRecord) {
+      return this.#invalidateDispatch(
+        sessionID,
+        record,
+        claim,
+        'Manager task verifier is not configured',
+      );
+    }
+    const taskRecord = this.#getManagerTaskRecord(managerTaskId);
+    if (
+      !taskRecord ||
+      taskRecord.taskID !== managerTaskId ||
+      taskRecord.parentSessionID !== sessionID ||
+      this.#resolveAgentName(taskRecord.agent) !== 'outcome-manager'
+    ) {
+      return this.#invalidateDispatch(
+        sessionID,
+        record,
+        claim,
+        `Manager task '${managerTaskId}' is missing or has invalid parent/agent identity`,
+      );
+    }
+    const claimToken =
+      this.#claimSecrets.get(`${sessionID}:${claim.checkpointId}`) ??
+      this.#claimSecrets.get(`${sessionID}:${claim.claimGeneration}`) ??
+      '';
+
+    if (claim.state === 'dispatching') {
+      const bindRes = this.#store.mutate(sessionID, record.revision, {
+        type: 'bind_manager',
+        checkpointId: claim.checkpointId,
+        claimGeneration: claim.claimGeneration,
+        claimToken,
+        managerTaskId,
+        managerGeneration: taskRecord.generation,
+      });
+      if (!bindRes.success) {
+        return {
+          success: false,
+          error: `Failed to bind manager task: ${bindRes.error.message}`,
+        };
+      }
+      record = bindRes.data;
+    }
+
+    return { success: true, data: record };
+  }
+
+  failManagerDispatch(
+    sessionID: string,
+    callID: string,
+    reason: string,
+  ): OutcomeControllerResult<OutcomeRecord> {
+    const recRes = this.readRecord(sessionID);
+    if (!recRes.success) {
+      return { success: false, error: recRes.error.message, code: recRes.code };
+    }
+    const record = recRes.data;
+    const claim = record.checkpoint;
+    if (claim?.state !== 'dispatching' || claim.dispatchCallId !== callID) {
+      return {
+        success: false,
+        error: 'No matching durable dispatch claim to invalidate',
+        code: 'dispatch_claim_mismatch',
+      };
+    }
+    return this.#invalidateDispatch(sessionID, record, claim, reason);
+  }
+
+  #invalidateDispatch(
+    sessionID: string,
+    record: OutcomeRecord,
+    claim: OutcomeCheckpointClaim,
+    reason: string,
+  ): OutcomeControllerResult<OutcomeRecord> {
+    const invalid = this.#store.mutate(sessionID, record.revision, {
+      type: 'record_invalid_dispatch',
+      checkpointId: claim.checkpointId,
+      claimGeneration: claim.claimGeneration,
+      reason,
+    });
+    return invalid.success
+      ? { success: false, error: reason, code: 'manager_binding_invalid' }
+      : {
+          success: false,
+          error: `${reason}; failed to persist invalid dispatch: ${invalid.error.message}`,
+          code: invalid.code,
+        };
+  }
+}
+
+function isSettledCheckpoint(state: OutcomeCheckpointClaim['state']): boolean {
+  return [
+    'review_accepted',
+    'review_rejected',
+    'review_invalid',
+    'retired',
+  ].includes(state);
+}

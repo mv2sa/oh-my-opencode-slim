@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { RuntimeConfig } from './config/runtime';
 import { CooldownRegistry } from './hooks/foreground-fallback/cooldown-registry';
-import { OhMyOpenCodeLite as plugin } from './index';
+import {
+  consumeCompletedManagerTask,
+  OhMyOpenCodeLite as plugin,
+} from './index';
+import {
+  type OutcomeRecord,
+  serializeOutcomeRecord,
+} from './outcome/controller-schema';
+import { BackgroundJobBoard } from './utils/background-job-board';
 
 function createPluginClient(
   noop: () => Promise<unknown>,
@@ -85,6 +93,97 @@ describe('plugin env disable', () => {
     expect(hooks.config).toBeUndefined();
     expect(hooks.event).toBeUndefined();
     expect(hooks.tool).toBeUndefined();
+  });
+});
+
+describe('Outcome Manager board consumption composition', () => {
+  test('accepts exact completed identity repeatedly after reconciliation', () => {
+    const board = new BackgroundJobBoard();
+    const task = board.registerLaunch({
+      taskID: 'manager_completed',
+      parentSessionID: 'root-1',
+      agent: 'outcome-manager',
+    });
+    board.updateStatus({
+      taskID: task.taskID,
+      state: 'completed',
+      expectedGeneration: task.generation,
+    });
+
+    expect(
+      consumeCompletedManagerTask(
+        board,
+        task.parentSessionID,
+        task.taskID,
+        task.generation,
+      ),
+    ).toBe(true);
+    expect(board.get(task.taskID)).toMatchObject({
+      state: 'reconciled',
+      terminalState: 'completed',
+      generation: task.generation,
+    });
+    expect(
+      consumeCompletedManagerTask(
+        board,
+        task.parentSessionID,
+        task.taskID,
+        task.generation,
+      ),
+    ).toBe(true);
+  });
+
+  test('rejects wrong parent, task, generation, and terminal outcome', () => {
+    const board = new BackgroundJobBoard();
+    const completed = board.registerLaunch({
+      taskID: 'manager_completed',
+      parentSessionID: 'root-1',
+      agent: 'outcome-manager',
+    });
+    board.updateStatus({ taskID: completed.taskID, state: 'completed' });
+
+    expect(
+      consumeCompletedManagerTask(
+        board,
+        'wrong-root',
+        completed.taskID,
+        completed.generation,
+      ),
+    ).toBe(false);
+    expect(
+      consumeCompletedManagerTask(
+        board,
+        completed.parentSessionID,
+        'wrong-task',
+        completed.generation,
+      ),
+    ).toBe(false);
+    expect(
+      consumeCompletedManagerTask(
+        board,
+        completed.parentSessionID,
+        completed.taskID,
+        completed.generation + 1,
+      ),
+    ).toBe(false);
+
+    for (const terminalState of ['error', 'cancelled'] as const) {
+      const task = board.registerLaunch({
+        taskID: `manager_${terminalState}`,
+        parentSessionID: 'root-1',
+        agent: 'outcome-manager',
+      });
+      board.updateStatus({ taskID: task.taskID, state: terminalState });
+      board.markReconciled(task.taskID);
+      expect(
+        consumeCompletedManagerTask(
+          board,
+          task.parentSessionID,
+          task.taskID,
+          task.generation,
+        ),
+      ).toBe(false);
+    }
   });
 });
 
@@ -397,6 +496,422 @@ describe('Outcome Manager host config boundary', () => {
   });
 });
 
+describe('Outcome Controller plugin integration', () => {
+  let originalEnv: typeof process.env;
+  let configDir: string;
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    configDir = await mkdtemp('/tmp/omos-outcome-plugin-');
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_CONFIG_HOME: configDir,
+      XDG_DATA_HOME: `${configDir}/data`,
+      XDG_CACHE_HOME: `${configDir}/cache`,
+      OPENCODE_LOG_DIR: `${configDir}/logs`,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await writeFile(
+      `${configDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({ autoUpdate: false }),
+    );
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(configDir, { recursive: true, force: true });
+  });
+
+  async function createOutcomeHooks(promptCalls: unknown[] = []) {
+    const noop = async () => ({});
+    const promptAsync = mock(async (request: unknown) => {
+      promptCalls.push(request);
+      return {};
+    });
+    const client = createPluginClient(noop) as {
+      session: Record<string, unknown>;
+    };
+    client.session.promptAsync = promptAsync;
+    const hooks = await plugin({
+      client,
+      directory: configDir,
+      worktree: configDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+
+    const root = 'ses_outcome_plugin';
+    await hooks['chat.message']?.(
+      {
+        sessionID: root,
+        agent: 'orchestrator',
+        messageID: 'msg_outcome_plugin',
+        parts: [{ type: 'text', text: 'Manage this outcome' }],
+      } as never,
+      {
+        message: {
+          id: 'msg_outcome_plugin',
+          sessionID: root,
+          role: 'user',
+          agent: 'orchestrator',
+        },
+        parts: [{ type: 'text', text: 'Manage this outcome' }],
+      } as never,
+    );
+
+    return { hooks, root, promptAsync };
+  }
+
+  async function pendingOutcomeInstruction(
+    hooks: Awaited<ReturnType<typeof plugin>>,
+    root: string,
+  ): Promise<string> {
+    const output = {
+      messages: [
+        {
+          info: { id: 'msg_instruction_anchor', role: 'user', sessionID: root },
+          parts: [{ type: 'text', text: 'Continue managed outcome' }],
+        },
+      ],
+    };
+    await hooks['experimental.chat.messages.transform']?.(
+      {} as never,
+      output as never,
+    );
+    for (const message of output.messages as Array<{
+      parts?: Array<{ text?: string }>;
+    }>) {
+      for (const part of message.parts ?? []) {
+        if (part.text?.includes('OMOS_DISPATCH_MARKER')) return part.text;
+      }
+    }
+    throw new Error('volatile Outcome Manager instruction missing');
+  }
+
+  function contract(sourceMessageId: string) {
+    return {
+      classification: 'non_trivial' as const,
+      objective: 'Exercise Outcome Controller plugin integration',
+      deliverables: ['Integrated hook behavior'],
+      goals: [
+        {
+          id: 'goal_plugin',
+          description: 'Complete plugin integration checks',
+          status: 'in_progress' as const,
+        },
+      ],
+      inScope: ['src/index.ts'],
+      outOfScope: [],
+      constraints: ['Use real plugin hooks'],
+      safetyBoundaries: ['Do not bypass controller state'],
+      handoffRequirements: ['Regression checks pass'],
+      sourceMessageIds: [sourceMessageId],
+      rules: [],
+      exceptions: [],
+    };
+  }
+
+  test('routes normal idle through Outcome Controller once with canonical promptAsync', async () => {
+    const calls: unknown[] = [];
+    const { hooks, root, promptAsync } = await createOutcomeHooks(calls);
+    try {
+      await hooks.tool?.outcome_control?.execute(
+        { action: 'begin', contract: contract('msg_outcome_plugin') },
+        { sessionID: root, agent: 'orchestrator' } as never,
+      );
+
+      for (let index = 0; index < 2; index += 1) {
+        await hooks.event?.({
+          event: {
+            type: 'session.status',
+            properties: { sessionID: root, status: { type: 'idle' } },
+          },
+        });
+      }
+
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(calls[0]).toMatchObject({
+        path: { id: root },
+        query: { directory: configDir },
+        body: {
+          agent: 'orchestrator',
+          parts: [{ type: 'text', synthetic: true }],
+        },
+        throwOnError: true,
+      });
+      expect(
+        (
+          calls[0] as {
+            body: { parts: Array<{ text: string }> };
+          }
+        ).body.parts[0].text,
+      ).toStartWith(
+        'Action required on outcome protocol. Check outcome_control status or pending checkpoint instructions.',
+      );
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('task-session terminal reconciliation runs before Outcome Controller idle wake', async () => {
+    const calls: unknown[] = [];
+    const { hooks, root, promptAsync } = await createOutcomeHooks(calls);
+    try {
+      await hooks.tool?.outcome_control?.execute(
+        { action: 'begin', contract: contract('msg_outcome_plugin') },
+        { sessionID: root, agent: 'orchestrator' } as never,
+      );
+      const instruction = await pendingOutcomeInstruction(hooks, root);
+      await hooks['tool.execute.before']?.(
+        { tool: 'task', sessionID: root, callID: 'call_running_manager' },
+        {
+          args: {
+            subagent_type: 'outcome-manager',
+            background: true,
+            description: 'Running Outcome Manager review',
+            prompt: instruction,
+          },
+        },
+      );
+      await hooks['tool.execute.after']?.(
+        { tool: 'task', sessionID: root, callID: 'call_running_manager' },
+        {
+          output:
+            '<task id="mgr_running" state="running">\n<summary>Running Outcome Manager review</summary>\n</task>',
+        },
+      );
+
+      await hooks.event?.({
+        event: {
+          type: 'session.status',
+          properties: { sessionID: root, status: { type: 'idle' } },
+        },
+      });
+      expect(promptAsync).toHaveBeenCalledTimes(0);
+
+      await hooks.event?.({
+        event: {
+          type: 'message.part.updated',
+          properties: {
+            part: {
+              id: 'part_mgr_running_terminal',
+              sessionID: root,
+              messageID: 'msg_mgr_running_terminal',
+              type: 'text',
+              synthetic: true,
+              text: '<task id="mgr_running" state="error">\n<summary>Background task failed: Running Outcome Manager review</summary>\n<task_error>Manager failed</task_error>\n</task>',
+            },
+          },
+        },
+      });
+      const terminalOutput = {
+        messages: [
+          {
+            info: {
+              id: 'msg_mgr_running_terminal',
+              role: 'user',
+              sessionID: root,
+            },
+            parts: [
+              {
+                id: 'part_mgr_running_terminal',
+                sessionID: root,
+                messageID: 'msg_mgr_running_terminal',
+                type: 'text',
+                synthetic: true,
+                text: '<task id="mgr_running" state="error">\n<summary>Background task failed: Running Outcome Manager review</summary>\n<task_error>Manager failed</task_error>\n</task>',
+              },
+            ],
+          },
+        ],
+      };
+      await hooks['experimental.chat.messages.transform']?.(
+        {} as never,
+        terminalOutput as never,
+      );
+      await hooks.event?.({
+        event: {
+          type: 'session.status',
+          properties: { sessionID: root, status: { type: 'idle' } },
+        },
+      });
+
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(calls[0]).toMatchObject({ path: { id: root } });
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('retires a reserved Manager claim when task-session preflight rejects', async () => {
+    const { hooks, root } = await createOutcomeHooks();
+    try {
+      await hooks.tool?.outcome_control?.execute(
+        { action: 'begin', contract: contract('msg_outcome_plugin') },
+        { sessionID: root, agent: 'orchestrator' } as never,
+      );
+      const instruction = await pendingOutcomeInstruction(hooks, root);
+
+      await hooks['tool.execute.before']?.(
+        { tool: 'task', sessionID: root, callID: 'call_existing' },
+        {
+          args: {
+            subagent_type: 'outcome-manager',
+            background: true,
+            description: 'Outcome Manager review',
+            prompt: instruction,
+          },
+        },
+      );
+      await hooks['tool.execute.after']?.(
+        { tool: 'task', sessionID: root, callID: 'call_existing' },
+        {
+          output:
+            '<task id="mgr_existing" state="completed">\n<summary>Background task completed: Outcome Manager review</summary>\n<task_result>done</task_result>\n</task>',
+        },
+      );
+
+      const recordPath = `${configDir}/.opencode/outcomes`;
+      const files = await Array.fromAsync(
+        new Bun.Glob('*.json').scan({ cwd: recordPath, absolute: true }),
+      );
+      expect(files).toHaveLength(1);
+      const record = JSON.parse(
+        await Bun.file(files[0]).text(),
+      ) as OutcomeRecord;
+      const checkpoint = record.checkpoint;
+      expect(checkpoint).toBeDefined();
+      if (!checkpoint) return;
+      const claimed = {
+        outcomeId: record.outcomeId,
+        rootSessionId: record.rootSessionId,
+        checkpointId: checkpoint.checkpointId,
+        kind: checkpoint.kind,
+        reason: checkpoint.reason,
+        claimGeneration: checkpoint.claimGeneration,
+        claimTokenDigest: checkpoint.claimTokenDigest,
+        checkpointFingerprint: checkpoint.checkpointFingerprint,
+        contractDigest: checkpoint.contractDigest,
+        outcomeRevision: checkpoint.outcomeRevision,
+        serverEpoch: checkpoint.serverEpoch,
+        claimedAt: checkpoint.claimedAt,
+        expiresAt: checkpoint.expiresAt,
+        candidateFingerprint: checkpoint.candidateFingerprint,
+        includedDecisionIds: checkpoint.includedDecisionIds,
+        includedExceptionRuleIds: checkpoint.includedExceptionRuleIds,
+        includedEvidenceAttestationIds:
+          checkpoint.includedEvidenceAttestationIds,
+        state: 'claimed' as const,
+      };
+      record.checkpoint = claimed;
+      record.phase = 'checkpointing';
+      record.actionsRequired = [];
+      record.operations = [];
+      record.receipts.evidence = [];
+      record.revision += 1;
+      await Bun.write(files[0], serializeOutcomeRecord(record));
+
+      await expect(
+        hooks['tool.execute.before']?.(
+          { tool: 'task', sessionID: root, callID: 'call_rejected' },
+          {
+            args: {
+              subagent_type: 'outcome-manager',
+              background: true,
+              description: 'Outcome Manager review',
+              prompt: instruction,
+            },
+          },
+        ),
+      ).rejects.toThrow('same objective already finished');
+
+      const status = JSON.parse(
+        String(
+          await hooks.tool?.outcome_control?.execute({ action: 'status' }, {
+            sessionID: root,
+            agent: 'orchestrator',
+          } as never),
+        ),
+      );
+      expect(status).toMatchObject({
+        phase: 'action_required',
+        checkpoint: { state: 'retired' },
+        activeOperations: [],
+      });
+
+      const rejectedRecord = JSON.parse(
+        await Bun.file(files[0]).text(),
+      ) as OutcomeRecord;
+      expect(rejectedRecord.operations).toEqual([]);
+      expect(
+        rejectedRecord.actionsRequired.some(
+          (action) => action.code === 'interrupted_operation',
+        ),
+      ).toBe(false);
+
+      const retryStatus = JSON.parse(
+        String(
+          await hooks.tool?.outcome_control?.execute({ action: 'status' }, {
+            sessionID: root,
+            agent: 'orchestrator',
+          } as never),
+        ),
+      );
+      expect(retryStatus).toMatchObject({
+        checkpoint: { state: 'retired' },
+        activeOperations: [],
+      });
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('successful Manager dispatch binds normally without a generic operation', async () => {
+    const { hooks, root } = await createOutcomeHooks();
+    try {
+      await hooks.tool?.outcome_control?.execute(
+        { action: 'begin', contract: contract('msg_outcome_plugin') },
+        { sessionID: root, agent: 'orchestrator' } as never,
+      );
+      const instruction = await pendingOutcomeInstruction(hooks, root);
+      await hooks['tool.execute.before']?.(
+        { tool: 'task', sessionID: root, callID: 'call_manager_success' },
+        {
+          args: {
+            subagent_type: 'outcome-manager',
+            background: true,
+            description: 'Fresh Outcome Manager review',
+            prompt: instruction,
+          },
+        },
+      );
+      await hooks['tool.execute.after']?.(
+        { tool: 'task', sessionID: root, callID: 'call_manager_success' },
+        {
+          output:
+            '<task id="mgr_success" state="running">\n<summary>Running</summary>\n</task>',
+        },
+      );
+
+      const recordPath = `${configDir}/.opencode/outcomes`;
+      const files = await Array.fromAsync(
+        new Bun.Glob('*.json').scan({ cwd: recordPath, absolute: true }),
+      );
+      const record = JSON.parse(
+        await Bun.file(files[0]).text(),
+      ) as OutcomeRecord;
+      expect(record.operations).toEqual([]);
+      expect(record.checkpoint).toMatchObject({
+        state: 'running',
+        managerTaskId: 'mgr_success',
+      });
+      expect(record.checkpoint?.managerGeneration).toBeNumber();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+});
+
 describe('persistent cooldown plugin hooks', () => {
   let originalEnv: typeof process.env;
   let configDir: string;
@@ -666,6 +1181,52 @@ describe('persistent cooldown plugin hooks', () => {
       providerID: 'google',
       modelID: 'antigravity-gemini-3.7-flash',
     });
+
+    await hooks.dispose?.();
+  });
+
+  test('plugin registers outcome_control and enforces immutable deny for outcome-manager after host merge', async () => {
+    const hooks = await createHooks();
+    expect(hooks.tool?.outcome_control).toBeDefined();
+
+    const hostConfig: Record<string, any> = {
+      agent: {
+        'outcome-manager': {
+          permission: {
+            '*': 'allow',
+            outcome_control: 'allow',
+          },
+        },
+      },
+    };
+    await hooks.config?.(hostConfig);
+
+    const outcomeMgr = hostConfig.agent['outcome-manager'];
+    expect(outcomeMgr.permission.outcome_control).toBe('deny');
+    expect(outcomeMgr.permission['*']).toBe('deny');
+
+    await hooks.dispose?.();
+  });
+
+  test('plugin outcome_control tool rejects unmanaged session and absent agent caller', async () => {
+    const hooks = await createHooks();
+    const outcomeControl = hooks.tool?.outcome_control;
+    expect(outcomeControl).toBeDefined();
+
+    // Absent agent
+    await expect(
+      outcomeControl.execute({ action: 'status' }, {
+        sessionID: 'ses-unmanaged',
+      } as never),
+    ).rejects.toThrow('requires an explicit caller agent');
+
+    // Unmanaged session
+    await expect(
+      outcomeControl.execute({ action: 'status' }, {
+        sessionID: 'ses-unmanaged',
+        agent: 'orchestrator',
+      } as never),
+    ).rejects.toThrow('not managed');
 
     await hooks.dispose?.();
   });

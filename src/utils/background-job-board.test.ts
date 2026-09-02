@@ -481,6 +481,72 @@ describe('BackgroundJobBoard', () => {
     expect(board.formatForPrompt('parent-1')).toContain('Reusable Sessions');
   });
 
+  test('repeats reconciliation idempotently without changing terminal identity', () => {
+    const board = new BackgroundJobBoard();
+    const launched = board.registerLaunch({
+      taskID: 'ses_completed_retry',
+      parentSessionID: 'parent-1',
+      agent: 'outcome-manager',
+      now: 100,
+    });
+    board.updateStatus({
+      taskID: launched.taskID,
+      state: 'completed',
+      expectedGeneration: launched.generation,
+      now: 200,
+    });
+    const first = board.markReconciled(launched.taskID, 300);
+    board.markUsed('parent-1', launched.taskID, 400);
+    const repeated = board.markReconciled(launched.taskID, 500);
+
+    expect(first).toMatchObject({
+      parentSessionID: 'parent-1',
+      generation: launched.generation,
+      state: 'reconciled',
+      terminalState: 'completed',
+    });
+    expect(repeated).toMatchObject({
+      parentSessionID: 'parent-1',
+      generation: launched.generation,
+      state: 'reconciled',
+      terminalState: 'completed',
+    });
+    expect(repeated?.lastUsedAt).toBe(400);
+  });
+
+  test('reconciled identity still distinguishes parent generation and terminal outcome', () => {
+    const board = new BackgroundJobBoard();
+    const completed = board.registerLaunch({
+      taskID: 'ses_completed_identity',
+      parentSessionID: 'parent-1',
+      agent: 'outcome-manager',
+    });
+    board.updateStatus({ taskID: completed.taskID, state: 'completed' });
+    board.markReconciled(completed.taskID);
+
+    expect(board.resolve('parent-1', completed.taskID)).toMatchObject({
+      generation: completed.generation,
+      terminalState: 'completed',
+    });
+    expect(board.resolve('wrong-parent', completed.taskID)).toBeUndefined();
+    expect(board.get(completed.taskID)?.generation).not.toBe(
+      completed.generation + 1,
+    );
+
+    const failed = board.registerLaunch({
+      taskID: 'ses_failed_identity',
+      parentSessionID: 'parent-1',
+      agent: 'outcome-manager',
+    });
+    board.updateStatus({ taskID: failed.taskID, state: 'error' });
+    board.markReconciled(failed.taskID);
+    expect(board.get(failed.taskID)).toMatchObject({
+      generation: failed.generation,
+      state: 'reconciled',
+      terminalState: 'error',
+    });
+  });
+
   test('does not expose unreconciled terminal jobs as reusable', () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({

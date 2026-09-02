@@ -9,6 +9,11 @@ interface WaitForUserToolOptions {
   beginUserWait: (sessionID: string) => void;
   hasOutstandingBackgroundTasks?: (sessionID: string) => boolean;
   waitForUserGuardEnabled?: boolean;
+  validateManagedWait?: (sessionID: string) => {
+    isManaged: boolean;
+    allowed: boolean;
+    reason?: string;
+  };
 }
 
 export function createWaitForUserTool(
@@ -62,6 +67,16 @@ Use this only as the final tool action after you have already given the user con
           '',
           'Background tasks are still outstanding for this session. Do not block on manual input — end this turn now. The system resumes automatically via the Background Job Board and orchestrator wake scheduler when the background tasks complete.',
         ].join('\n');
+      }
+
+      if (options.validateManagedWait) {
+        const validation = options.validateManagedWait(sessionID);
+        if (validation.isManaged && !validation.allowed) {
+          throw new Error(
+            validation.reason ??
+              'wait_for_user is not permitted for the current outcome state',
+          );
+        }
       }
 
       options.beginUserWait(sessionID);

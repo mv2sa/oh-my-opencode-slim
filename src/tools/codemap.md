@@ -28,6 +28,7 @@ Each tool is implemented as a factory function that returns a `ToolDefinition` r
 | Tool Family | Purpose | Key Components |
 |------------|---------|----------------|
 | **Task Management** | Background task communication, cancellation, status, results, revival, and HITL continuation control | `task-message.ts`, `cancel-task.ts`, `task-status.ts`, `task-result.ts`, `task-revive.ts`, `wait-for-user.ts` |
+| **Outcome Control** | Authoritative outcome contract lifecycle, checkpointing, evidence submission, bounded repository-waiver registration, review reconciliation, bounded goal/contract/action transitions, user decisions, external handoff completion, and final certification | `outcome-control.ts` |
 | **Task Policy & Activity** | Shared live-status policy and activity tracking consumed by `task_status` and event wiring | `task-policy.ts` (`summarizeTaskStatus`), `task-activity.ts` (`TaskActivityTracker`) |
 | **ACP Integration** | External agent protocol execution | `acp-run.ts`, ACP client implementation |
 | **Code Intelligence** | AST-based code manipulation | `ast-grep/` directory, `tools.ts` |
@@ -205,6 +206,8 @@ Tools Layer → Web Layer
 └─ webfetch tool → Network utilities with caching and model processing
 ```
 
+`outcome_control(action='register_repository_waiver')` accepts only a bounded repository reference and mints a Controller-digested `repository_waiver` authorization. It cannot mint `user_decision` authority; user authority remains tied to durable decision resolution.
+
 ### Configuration Integration
 
 - **ACP Agents**: Defined in `src/config/agents.ts`, consumed by `acp_run.ts`
@@ -229,6 +232,7 @@ Tools Layer → Web Layer
 export { createAcpRunTool } from './acp-run';
 export { ast_grep_replace, ast_grep_search } from './ast-grep';
 export { createCancelTaskTool } from './cancel-task';
+export { createOutcomeControlTool } from './outcome-control';
 export { createWebfetchTool } from './smartfetch';
 export { createTaskMessageTool } from './task-message';
 export { createTaskResultTool } from './task-result';

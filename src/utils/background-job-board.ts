@@ -608,6 +608,10 @@ export class BackgroundJobBoard implements BackgroundJobStore {
   ): BackgroundJobRecord | undefined {
     const existing = this.jobs.get(taskID);
     if (!existing) return undefined;
+    // Reconciliation is an acknowledgement boundary. Replaying that exact
+    // acknowledgement must preserve the terminal identity instead of turning
+    // a valid retry into a failure.
+    if (existing.state === 'reconciled') return existing;
     if (
       !existing.terminalUnreconciled &&
       !isCanonicalTerminalState(existing.state)

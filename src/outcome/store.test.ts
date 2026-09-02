@@ -46,6 +46,29 @@ function expectSuccess<T>(
   if (!result.success) throw result.error;
 }
 
+function attestationDigest(
+  entry: Pick<
+    import('./controller-schema').OutcomeEvidenceAttestation,
+    | 'id'
+    | 'description'
+    | 'assertedStatus'
+    | 'assertedFreshness'
+    | 'candidateFingerprint'
+    | 'linkedObservationId'
+    | 'createdAt'
+  >,
+): string {
+  return canonicalDigest('omos/evidence-attestation/v1', {
+    id: entry.id,
+    description: entry.description,
+    assertedStatus: entry.assertedStatus,
+    assertedFreshness: entry.assertedFreshness,
+    candidateFingerprint: entry.candidateFingerprint,
+    linkedObservationId: entry.linkedObservationId,
+    createdAt: entry.createdAt,
+  });
+}
+
 function reviewFor(
   record: OutcomeRecord,
   verdict: OutcomeReview['verdict'],
@@ -250,6 +273,7 @@ describe('OutcomeStore protocol and integrity', () => {
         referenceId: 'ref_stale',
         reason: 'stale write',
         createdAt: 100,
+        createdRevision: 2,
       },
     });
     expect(stale.success).toBe(false);
@@ -274,6 +298,211 @@ describe('OutcomeStore protocol and integrity', () => {
     expect(store.read('root_digest').code).toBe('corrupt');
     expect(store.recover('root_digest').code).toBe('corrupt');
     expect(fs.readFileSync(file, 'utf8')).toBe(forged);
+  });
+
+  test('reload rejects independent attestation bound-field tampering and accepts untouched bytes', () => {
+    const candidate = hash('tamper-candidate');
+    const fields = [
+      'id',
+      'description',
+      'assertedStatus',
+      'assertedFreshness',
+      'candidateFingerprint',
+      'linkedObservationId',
+      'createdAt',
+      'payloadDigest',
+    ] as const;
+    for (const field of fields) {
+      const root = `root_att_tamper_${field}`;
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        serverEpoch: 'epoch_one',
+      });
+      let current = store.init(root, { contract: contract() });
+      expectSuccess(current);
+      const entry = {
+        id: 'att_bound',
+        kind: 'orchestrator_attestation' as const,
+        description: 'bun test',
+        assertedStatus: 'passed' as const,
+        assertedFreshness: 'fresh' as const,
+        candidateFingerprint: candidate,
+        linkedObservationId: undefined,
+        payloadDigest: '',
+        createdRevision: 2,
+        createdAt: 100,
+      };
+      entry.payloadDigest = attestationDigest(entry);
+      current = store.mutate(root, 1, { type: 'append_evidence', entry });
+      expectSuccess(current);
+      expect(store.read(root).success).toBe(true);
+      const file = store.recordPath(root);
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const persisted = raw.receipts.evidence[0];
+      switch (field) {
+        case 'id':
+          persisted.id = 'att_changed';
+          break;
+        case 'description':
+          persisted.description = 'bun test changed';
+          break;
+        case 'assertedStatus':
+          persisted.assertedStatus = 'failed';
+          break;
+        case 'assertedFreshness':
+          persisted.assertedFreshness = 'stale';
+          break;
+        case 'candidateFingerprint':
+          persisted.candidateFingerprint = hash('changed-candidate');
+          break;
+        case 'linkedObservationId':
+          persisted.linkedObservationId = 'obs_missing';
+          break;
+        case 'createdAt':
+          persisted.createdAt = 101;
+          break;
+        case 'payloadDigest':
+          persisted.payloadDigest = hash('forged-attestation');
+          break;
+      }
+      fs.writeFileSync(file, `${JSON.stringify(raw, null, 2)}\n`);
+      expect(store.read(root).code).toBe('corrupt');
+    }
+  });
+
+  test('reload rejects independent authorization bound-field tampering', () => {
+    const fields = [
+      'id',
+      'kind',
+      'reference',
+      'observedAt',
+      'payloadDigest',
+    ] as const;
+    for (const field of fields) {
+      const root = `root_auth_tamper_${field}`;
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        serverEpoch: 'epoch_one',
+      });
+      let current = store.init(root, { contract: contract() });
+      expectSuccess(current);
+      const receipt = {
+        id: 'auth_bound',
+        kind: 'repository_waiver' as const,
+        reference: 'governance/waivers/one.json',
+        payloadDigest: '',
+        observedAt: 100,
+      };
+      receipt.payloadDigest = canonicalDigest('omos/outcome-authorization/v1', {
+        id: receipt.id,
+        kind: receipt.kind,
+        reference: receipt.reference,
+        decisionId: undefined,
+        observedAt: receipt.observedAt,
+      });
+      current = store.mutate(root, 1, {
+        type: 'append_authorization',
+        receipt,
+      });
+      expectSuccess(current);
+      const file = store.recordPath(root);
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const persisted = raw.receipts.authorizations[0];
+      switch (field) {
+        case 'id':
+          persisted.id = 'auth_changed';
+          break;
+        case 'kind':
+          persisted.kind = 'user_decision';
+          persisted.decisionId = 'dec_missing';
+          break;
+        case 'reference':
+          persisted.reference = 'governance/waivers/changed.json';
+          break;
+        case 'observedAt':
+          persisted.observedAt = 101;
+          break;
+        case 'payloadDigest':
+          persisted.payloadDigest = hash('forged-authorization');
+          break;
+      }
+      fs.writeFileSync(file, `${JSON.stringify(raw, null, 2)}\n`);
+      expect(store.read(root).code).toBe('corrupt');
+    }
+  });
+
+  test('untouched accepted certificate with bound attestation digest reloads', () => {
+    const candidate = hash('accepted-reload-candidate');
+    const store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_accept_reload',
+      randomId: (() => {
+        let index = 0;
+        return () => `accept_reload_${++index}`;
+      })(),
+      clock: () => 100,
+    });
+    let current = store.init('root_accept_reload', {
+      contract: contract({
+        goals: [
+          {
+            id: 'goal_protocol',
+            description: 'Implement the outcome protocol',
+            status: 'satisfied',
+          },
+        ],
+      }),
+    });
+    expectSuccess(current);
+    openCheckpoint(store, 'root_accept_reload', 1, 'kickoff-token', 'kickoff');
+    current = completeReview(
+      store,
+      'root_accept_reload',
+      2,
+      'kickoff-token',
+      'CONTINUE',
+    );
+    const entry = {
+      id: 'att_accept_reload',
+      kind: 'orchestrator_attestation' as const,
+      description: 'bun test accepted reload',
+      assertedStatus: 'passed' as const,
+      assertedFreshness: 'fresh' as const,
+      candidateFingerprint: candidate,
+      payloadDigest: '',
+      createdRevision: 7,
+      createdAt: 100,
+    };
+    entry.payloadDigest = attestationDigest(entry);
+    current = store.mutate('root_accept_reload', 6, {
+      type: 'append_evidence',
+      entry,
+    });
+    expectSuccess(current);
+    openCheckpoint(store, 'root_accept_reload', 7, 'final-token', 'final', {
+      candidateFingerprint: candidate,
+      evidenceAttestationIds: [entry.id],
+    });
+    current = completeReview(
+      store,
+      'root_accept_reload',
+      8,
+      'final-token',
+      'ACCEPT',
+    );
+    const accepted = store.mutate('root_accept_reload', 12, {
+      type: 'finalize',
+      summary: 'Untouched accepted record',
+    });
+    expectSuccess(accepted);
+    const reloaded = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_later',
+    }).read('root_accept_reload');
+    expectSuccess(reloaded);
+    expect(reloaded.data.finalCertificate).toEqual(
+      accepted.data.finalCertificate,
+    );
   });
 
   test('creates store-owned claims and requires the raw token for every transition', () => {
@@ -345,7 +574,14 @@ describe('OutcomeStore protocol and integrity', () => {
         assertedStatus: 'passed',
         assertedFreshness: 'fresh',
         candidateFingerprint: candidate,
-        payloadDigest: hash('attestation'),
+        payloadDigest: attestationDigest({
+          id: 'att_one',
+          description: 'bun test',
+          assertedStatus: 'passed',
+          assertedFreshness: 'fresh',
+          candidateFingerprint: candidate,
+          createdAt: 100,
+        }),
         createdRevision: 2,
         createdAt: 100,
       },
@@ -484,7 +720,14 @@ describe('OutcomeStore protocol and integrity', () => {
         assertedStatus: 'passed',
         assertedFreshness: 'fresh',
         candidateFingerprint: candidate,
-        payloadDigest: hash('attestation'),
+        payloadDigest: attestationDigest({
+          id: 'att_final',
+          description: 'bun test',
+          assertedStatus: 'passed',
+          assertedFreshness: 'fresh',
+          candidateFingerprint: candidate,
+          createdAt: 1_000,
+        }),
         createdRevision: 7,
         createdAt: 1_000,
       },
@@ -571,7 +814,15 @@ describe('OutcomeStore protocol and integrity', () => {
           assertedFreshness: defect === 'freshness' ? 'stale' : 'fresh',
           candidateFingerprint:
             defect === 'candidate' ? hash('other') : candidate,
-          payloadDigest: hash('attestation'),
+          payloadDigest: attestationDigest({
+            id: 'att_one',
+            description: 'bun test',
+            assertedStatus: defect === 'status' ? 'failed' : 'passed',
+            assertedFreshness: defect === 'freshness' ? 'stale' : 'fresh',
+            candidateFingerprint:
+              defect === 'candidate' ? hash('other') : candidate,
+            createdAt: 100,
+          }),
           createdRevision: 2,
           createdAt: 100,
         },
@@ -637,19 +888,13 @@ describe('OutcomeStore protocol and integrity', () => {
     expect(current.data.operations[0].status).toBe('interrupted');
 
     current = next.mutate('root_recovery', 5, {
-      type: 'resolve_action',
-      actionId: `uncertain_${opened.claim.checkpointId}`,
-    });
-    expectSuccess(current);
-    expect(current.data.phase).toBe('action_required');
-    current = next.mutate('root_recovery', 6, {
       type: 'reconcile_uncertain_checkpoint',
       checkpointId: opened.claim.checkpointId,
       claimGeneration: 1,
       resolution: { kind: 'retire', reason: 'Old Manager run was abandoned' },
     });
     expectSuccess(current);
-    current = next.mutate('root_recovery', 7, {
+    current = next.mutate('root_recovery', 6, {
       type: 'acknowledge_operation',
       operationId: 'op_one',
     });
@@ -658,7 +903,7 @@ describe('OutcomeStore protocol and integrity', () => {
     const reopened = openCheckpoint(
       next,
       'root_recovery',
-      8,
+      7,
       'new-token',
       'kickoff',
     );
@@ -980,7 +1225,14 @@ describe('OutcomeStore protocol and integrity', () => {
           assertedStatus: 'passed' as const,
           assertedFreshness: 'fresh' as const,
           candidateFingerprint: hash(`candidate_${index}`),
-          payloadDigest: hash(`payload_${index}`),
+          payloadDigest: attestationDigest({
+            id: `att_${index}`,
+            description: `${index}:${'e'.repeat(500)}`,
+            assertedStatus: 'passed',
+            assertedFreshness: 'fresh',
+            candidateFingerprint: hash(`candidate_${index}`),
+            createdAt: 1,
+          }),
           createdRevision: 1,
           createdAt: 1,
         })),
@@ -996,5 +1248,342 @@ describe('OutcomeStore protocol and integrity', () => {
     expect(
       OutcomeRecordSchema.safeParse({ ...record, unknown: true }).success,
     ).toBe(false);
+  });
+
+  test('records invalid review mutation and enters action_required phase', () => {
+    const store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_one',
+      clock: () => 100,
+    });
+    const root = 'ses_invalid_review_test';
+    const init = store.init(root, { contract: contract() });
+    expectSuccess(init);
+    const token = 'token_invalid_review_12345678901234';
+    const { claim } = openCheckpoint(store, root, 1, token, 'kickoff');
+
+    const dispatch = store.mutate(root, 2, {
+      type: 'mark_dispatching',
+      checkpointId: claim.checkpointId,
+      claimGeneration: claim.claimGeneration,
+      claimToken: token,
+      dispatchCallId: 'call_1',
+    });
+    expectSuccess(dispatch);
+
+    const bind = store.mutate(root, 3, {
+      type: 'bind_manager',
+      checkpointId: claim.checkpointId,
+      claimGeneration: claim.claimGeneration,
+      claimToken: token,
+      managerTaskId: 'mgr_task_1',
+      managerGeneration: 1,
+    });
+    expectSuccess(bind);
+
+    const available = store.mutate(root, 4, {
+      type: 'mark_result_available',
+      checkpointId: claim.checkpointId,
+      claimGeneration: claim.claimGeneration,
+      claimToken: token,
+      resultDigest: hash('malformed-result'),
+    });
+    expectSuccess(available);
+
+    const invalidRes = store.mutate(root, 5, {
+      type: 'record_invalid_review',
+      checkpointId: claim.checkpointId,
+      claimGeneration: claim.claimGeneration,
+      claimToken: token,
+      resultDigest: hash('malformed-result'),
+      reason: 'Malformed JSON payload from Manager',
+    });
+    expectSuccess(invalidRes);
+    expect(invalidRes.data.checkpoint?.state).toBe('review_invalid');
+    expect(invalidRes.data.phase).toBe('action_required');
+    expect(invalidRes.data.actionsRequired.length).toBeGreaterThan(0);
+    expect(invalidRes.data.checkpoint?.recoveryNote).toBe(
+      'Malformed JSON payload from Manager',
+    );
+  });
+
+  test('bounded compaction allows 100+ tool calls, respects schema caps, keeps recent history and referenced observations', () => {
+    const store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_one',
+      clock: () => 1_000,
+    });
+    const root = 'root_compact_100_calls';
+    let current = store.init(root, { contract: contract() });
+    expectSuccess(current);
+
+    // Execute 120 ordinary completed tool calls
+    for (let i = 1; i <= 120; i++) {
+      const callId = `call_${i}`;
+      const operation = {
+        id: `op_${callId}`,
+        callId,
+        toolName: 'bash',
+        argumentDigest: hash(`args_${i}`),
+        serverEpoch: 'epoch_one',
+        status: 'running' as const,
+        startedAt: 1_000 + i,
+        updatedAt: 1_000 + i,
+      };
+      const observation = {
+        id: `obs_${callId}`,
+        kind: 'controller_observed' as const,
+        callId,
+        toolName: 'bash',
+        argumentDigest: hash(`args_${i}`),
+        startedEpoch: 'epoch_one',
+        startedAt: 1_000 + i,
+        completionObserved: false,
+      };
+
+      current = store.mutate(root, current.revision, {
+        type: 'start_tool_call',
+        operation,
+        observation,
+      });
+      expectSuccess(current);
+
+      current = store.mutate(root, current.revision, {
+        type: 'complete_tool_call',
+        operationId: `op_${callId}`,
+        observationId: `obs_${callId}`,
+        outputDigest: hash(`output_${i}`),
+        completedEpoch: 'epoch_one',
+        completedAt: 1_000 + i + 1,
+      });
+      expectSuccess(current);
+
+      // At call 5, submit an orchestrator attestation linking obs_call_5
+      if (i === 5) {
+        const entry = {
+          id: 'att_linked_call_5',
+          kind: 'orchestrator_attestation' as const,
+          description: 'Linked test observation from call 5',
+          assertedStatus: 'passed' as const,
+          assertedFreshness: 'fresh' as const,
+          candidateFingerprint: hash('candidate_5'),
+          linkedObservationId: 'obs_call_5',
+          payloadDigest: '',
+          createdRevision: current.revision + 1,
+          createdAt: 1_000 + i + 2,
+        };
+        entry.payloadDigest = attestationDigest(entry);
+        current = store.mutate(root, current.revision, {
+          type: 'append_evidence',
+          entry,
+        });
+        expectSuccess(current);
+      }
+    }
+
+    const reloaded = store.read(root);
+    expectSuccess(reloaded);
+
+    // Hard schema caps are 32 operations and 64 evidence items
+    expect(reloaded.data.operations.length).toBeLessThanOrEqual(16);
+    expect(reloaded.data.receipts.evidence.length).toBeLessThanOrEqual(32);
+
+    // Referenced observation from call 5 must survive
+    const linkedObs = reloaded.data.receipts.evidence.find(
+      (entry) => entry.id === 'obs_call_5',
+    );
+    expect(linkedObs).toBeDefined();
+    expect(linkedObs?.kind).toBe('controller_observed');
+
+    const linkedAttestation = reloaded.data.receipts.evidence.find(
+      (entry) => entry.id === 'att_linked_call_5',
+    );
+    expect(linkedAttestation).toBeDefined();
+
+    // Most recent completed operations (e.g. call_120) must be present
+    const latestOp = reloaded.data.operations.find(
+      (entry) => entry.id === 'op_call_120',
+    );
+    expect(latestOp).toBeDefined();
+    expect(latestOp?.status).toBe('completed');
+
+    const latestObs = reloaded.data.receipts.evidence.find(
+      (entry) => entry.id === 'obs_call_120',
+    );
+    expect(latestObs).toBeDefined();
+
+    // Oldest unreferenced operations (e.g. call_1) must have been pruned
+    const oldestOp = reloaded.data.operations.find(
+      (entry) => entry.id === 'op_call_1',
+    );
+    expect(oldestOp).toBeUndefined();
+
+    const oldestObs = reloaded.data.receipts.evidence.find(
+      (entry) => entry.id === 'obs_call_1',
+    );
+    expect(oldestObs).toBeUndefined();
+  });
+
+  test('append_evidence preserves the incoming linked observation across same-mutation compaction', () => {
+    const store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_one',
+      clock: () => 1_000,
+    });
+    const root = 'root_compact_incoming_link';
+    let current = store.init(root, { contract: contract() });
+    expectSuccess(current);
+
+    for (let i = 1; i <= 9; i++) {
+      const callId = `call_incoming_${i}`;
+      current = store.mutate(root, current.revision, {
+        type: 'start_tool_call',
+        operation: {
+          id: `op_${callId}`,
+          callId,
+          toolName: 'bash',
+          argumentDigest: hash(`incoming_args_${i}`),
+          serverEpoch: 'epoch_one',
+          status: 'running',
+          startedAt: 1_000 + i,
+          updatedAt: 1_000 + i,
+        },
+        observation: {
+          id: `obs_${callId}`,
+          kind: 'controller_observed',
+          callId,
+          toolName: 'bash',
+          argumentDigest: hash(`incoming_args_${i}`),
+          startedEpoch: 'epoch_one',
+          startedAt: 1_000 + i,
+          completionObserved: false,
+        },
+      });
+      expectSuccess(current);
+      current = store.mutate(root, current.revision, {
+        type: 'complete_tool_call',
+        operationId: `op_${callId}`,
+        observationId: `obs_${callId}`,
+        outputDigest: hash(`incoming_output_${i}`),
+        completedEpoch: 'epoch_one',
+        completedAt: 1_100 + i,
+      });
+      expectSuccess(current);
+    }
+
+    const entry = {
+      id: 'att_incoming_oldest',
+      kind: 'orchestrator_attestation' as const,
+      description: 'Link the oldest retained observation atomically',
+      assertedStatus: 'passed' as const,
+      assertedFreshness: 'fresh' as const,
+      candidateFingerprint: hash('incoming_candidate'),
+      linkedObservationId: 'obs_call_incoming_1',
+      payloadDigest: '',
+      createdRevision: current.revision + 1,
+      createdAt: 2_000,
+    };
+    entry.payloadDigest = attestationDigest(entry);
+    current = store.mutate(root, current.revision, {
+      type: 'append_evidence',
+      entry,
+    });
+    expectSuccess(current);
+    expect(
+      current.data.receipts.evidence.some(
+        (item) => item.id === 'obs_call_incoming_1',
+      ),
+    ).toBe(true);
+    expect(
+      current.data.receipts.evidence.some(
+        (item) => item.id === 'att_incoming_oldest',
+      ),
+    ).toBe(true);
+  });
+
+  test('compaction retains active, interrupted, and failed operations alongside unreferenced history', () => {
+    const store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_one',
+      clock: () => 1_000,
+    });
+    const root = 'root_compact_special_ops';
+    let current = store.init(root, { contract: contract() });
+    expectSuccess(current);
+
+    // Add a failed operation
+    current = store.mutate(root, current.revision, {
+      type: 'start_operation',
+      operation: {
+        id: 'op_failed_1',
+        callId: 'call_failed_1',
+        toolName: 'bash',
+        argumentDigest: hash('failed_args'),
+        serverEpoch: 'epoch_one',
+        status: 'running',
+        startedAt: 100,
+        updatedAt: 100,
+      },
+    });
+    expectSuccess(current);
+    current = store.mutate(root, current.revision, {
+      type: 'finish_operation',
+      operationId: 'op_failed_1',
+      status: 'failed',
+      error: 'Command failed',
+    });
+    expectSuccess(current);
+
+    // Run 100 ordinary completed tool calls
+    for (let i = 1; i <= 100; i++) {
+      const callId = `call_loop_${i}`;
+      current = store.mutate(root, current.revision, {
+        type: 'start_tool_call',
+        operation: {
+          id: `op_${callId}`,
+          callId,
+          toolName: 'bash',
+          argumentDigest: hash(`loop_args_${i}`),
+          serverEpoch: 'epoch_one',
+          status: 'running',
+          startedAt: 200 + i,
+          updatedAt: 200 + i,
+        },
+        observation: {
+          id: `obs_${callId}`,
+          kind: 'controller_observed',
+          callId,
+          toolName: 'bash',
+          argumentDigest: hash(`loop_args_${i}`),
+          startedEpoch: 'epoch_one',
+          startedAt: 200 + i,
+          completionObserved: false,
+        },
+      });
+      expectSuccess(current);
+      current = store.mutate(root, current.revision, {
+        type: 'complete_tool_call',
+        operationId: `op_${callId}`,
+        observationId: `obs_${callId}`,
+        outputDigest: hash(`loop_out_${i}`),
+        completedEpoch: 'epoch_one',
+        completedAt: 200 + i + 1,
+      });
+      expectSuccess(current);
+    }
+
+    const reloaded = store.read(root);
+    expectSuccess(reloaded);
+
+    // Failed operation must still be preserved
+    const failedOp = reloaded.data.operations.find(
+      (entry) => entry.id === 'op_failed_1',
+    );
+    expect(failedOp).toBeDefined();
+    expect(failedOp?.status).toBe('failed');
+
+    // Total operations and evidence must respect bounds
+    expect(reloaded.data.operations.length).toBeLessThanOrEqual(16);
+    expect(reloaded.data.receipts.evidence.length).toBeLessThanOrEqual(32);
   });
 });

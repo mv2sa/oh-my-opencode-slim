@@ -31,6 +31,10 @@ export {
   ORCHESTRATOR_WAKE_TEXT,
   ORCHESTRATOR_WAKE_UNCHANGED_CAP,
 } from './orchestrator-wake';
+export {
+  createOutcomeControllerHook,
+  OUTCOME_CONTROLLER_METADATA_KEY,
+} from './outcome-controller';
 export { createPhaseReminderHook } from './phase-reminder';
 export { createPostFileToolNudgeHook } from './post-file-tool-nudge';
 export { createReflectCommandHook } from './reflect';

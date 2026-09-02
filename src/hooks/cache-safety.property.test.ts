@@ -354,16 +354,17 @@ describe('cache-safety: pipeline drift guard', () => {
       'postFileToolNudge',
       'phaseReminder',
       'filterAvailableSkills',
+      'outcomeControllerHook',
     ]);
     expect(source).toContain(
       'await taskSessionManagerHook.injectBackgroundJobBoard(',
     );
 
-    // One handler definition plus the four dispatch calls above.
+    // One handler definition plus the five dispatch calls above.
     const literalCount = source.split(
       "'experimental.chat.messages.transform'",
     ).length;
-    expect(literalCount - 1).toBe(5);
+    expect(literalCount - 1).toBe(6);
   });
 
   test('every hook module defining a message transform is covered here', async () => {
@@ -384,6 +385,7 @@ describe('cache-safety: pipeline drift guard', () => {
     // properties cover it, then add it to this list.
     expect(hookFilesWithTransforms.sort()).toEqual([
       'filter-available-skills/index.ts',
+      'outcome-controller/index.ts',
       'phase-reminder/index.ts',
       'post-file-tool-nudge/index.ts',
       'task-session-manager/index.ts',

@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { ZodError } from 'zod';
 import {
   canonicalDigest,
+  computeOutcomeAuthorizationDigest,
   computeOutcomeCheckpointFingerprint,
   computeOutcomeContractDigest,
   MAX_OUTCOME_RECORD_BYTES,
@@ -23,6 +24,7 @@ import {
   type OutcomeRecord,
   OutcomeRecordSchema,
   OutcomeSessionIdSchema,
+  type OutcomeToolObservation,
   type OutcomeUserMessageReceipt,
   parseOutcomeRecord,
   serializeOutcomeRecord,
@@ -81,13 +83,46 @@ interface OutcomeStoreOptions {
   filesystem?: Partial<
     Pick<typeof fs, 'fsyncSync' | 'renameSync' | 'writeSync'>
   >;
+  /** Test seam for post-consumption persistence failures. */
+  beforePersistReconciledReview?: () => void;
 }
 
 export type OutcomeRecordMutation =
-  | { type: 'revise_contract'; contract: OutcomeContract }
+  | {
+      type: 'revise_contract';
+      contract: OutcomeContract;
+      sourceUserMessageReceiptId?: string;
+    }
   | { type: 'append_evidence'; entry: OutcomeEvidenceEntry }
+  | {
+      type: 'start_tool_call';
+      operation: OutcomePendingOperation;
+      observation: OutcomeToolObservation;
+    }
+  | {
+      type: 'complete_observation';
+      observationId: string;
+      outputDigest: string;
+      completedEpoch: string;
+      completedAt: number;
+    }
+  | {
+      type: 'complete_tool_call';
+      operationId: string;
+      observationId: string;
+      outputDigest: string;
+      completedEpoch: string;
+      completedAt: number;
+    }
   | { type: 'append_user_message'; receipt: OutcomeUserMessageReceipt }
   | { type: 'append_decision'; receipt: OutcomeDecisionReceipt }
+  | {
+      type: 'resolve_decision';
+      decisionId: string;
+      chosenOption: string;
+      sourceUserMessageReceiptId: string;
+      decidedAt: number;
+    }
   | { type: 'append_authorization'; receipt: OutcomeAuthorizationReceipt }
   | {
       type: 'open_checkpoint';
@@ -131,11 +166,41 @@ export type OutcomeRecordMutation =
       review: OutcomeReview;
     }
   | {
+      type: 'record_consumed_review';
+      checkpointId: string;
+      claimGeneration: number;
+      claimToken: string;
+      resultDigest: string;
+      review: OutcomeReview;
+    }
+  | {
       type: 'record_recovered_review';
       checkpointId: string;
       claimGeneration: number;
       resultDigest: string;
       review: OutcomeReview;
+    }
+  | {
+      type: 'record_invalid_review';
+      checkpointId: string;
+      claimGeneration: number;
+      claimToken?: string;
+      resultDigest?: string;
+      reason: string;
+    }
+  | {
+      type: 'record_consumed_invalid_review';
+      checkpointId: string;
+      claimGeneration: number;
+      claimToken?: string;
+      resultDigest: string;
+      reason: string;
+    }
+  | {
+      type: 'record_invalid_dispatch';
+      checkpointId: string;
+      claimGeneration: number;
+      reason: string;
     }
   | {
       type: 'expire_checkpoint';
@@ -169,8 +234,30 @@ export type OutcomeRecordMutation =
           };
     }
   | { type: 'append_action'; action: OutcomeActionRequired }
-  | { type: 'resolve_action'; actionId: string }
+  | {
+      type: 'resolve_action';
+      actionId: string;
+      reason: string;
+      sourceUserMessageReceiptId?: string;
+      evidenceAttestationIds?: string[];
+    }
+  | {
+      type: 'update_goal_status';
+      goalId: string;
+      newStatus: 'satisfied';
+    }
   | { type: 'finalize'; summary: string };
+
+export interface OutcomeReviewPersistence {
+  outcome: 'valid' | 'invalid';
+  checkpointId: string;
+  claimGeneration: number;
+  claimToken?: string;
+  resultDigest: string;
+  review?: OutcomeReview;
+  reason?: string;
+  recovered?: boolean;
+}
 
 interface LockOwner {
   pid: number;
@@ -196,6 +283,7 @@ export class OutcomeStore {
   readonly #fsync: typeof fs.fsyncSync;
   readonly #rename: typeof fs.renameSync;
   readonly #write: typeof fs.writeSync;
+  readonly #beforePersistReconciledReview?: () => void;
 
   constructor(options: OutcomeStoreOptions = {}) {
     this.#projectDirectory = options.projectDirectory
@@ -216,6 +304,7 @@ export class OutcomeStore {
     this.#fsync = options.filesystem?.fsyncSync ?? fs.fsyncSync;
     this.#rename = options.filesystem?.renameSync ?? fs.renameSync;
     this.#write = options.filesystem?.writeSync ?? fs.writeSync;
+    this.#beforePersistReconciledReview = options.beforePersistReconciledReview;
   }
 
   get serverEpoch(): string {
@@ -371,6 +460,237 @@ export class OutcomeStore {
     });
   }
 
+  validateReview(
+    rootSessionId: string,
+    input: {
+      checkpointId: string;
+      claimGeneration: number;
+      claimToken?: string;
+      resultDigest: string;
+      review: OutcomeReview;
+      recovered?: boolean;
+    },
+  ): OutcomeStoreResult<OutcomeRecord> {
+    const currentResult = this.read(rootSessionId);
+    if (!currentResult.success) return currentResult;
+    try {
+      const current = currentResult.data;
+      const claim = requireClaim(current, input);
+      if (input.recovered) {
+        if (
+          claim.state !== 'result_available' ||
+          claim.serverEpoch === this.#serverEpoch
+        ) {
+          throw new Error(
+            'Recovered review requires a prior-epoch available result',
+          );
+        }
+      } else {
+        if (!['running', 'result_available'].includes(claim.state)) {
+          throw new Error(
+            'Review requires a running or available bound result',
+          );
+        }
+        requireClaimToken(claim, input.claimToken ?? '');
+      }
+      if (
+        claim.resultDigest !== undefined &&
+        claim.resultDigest !== input.resultDigest
+      ) {
+        throw new Error('Manager result digest mismatch');
+      }
+      const review = OutcomeReviewSchema.parse(input.review);
+      if (
+        claim.kind === 'final' &&
+        review.candidateFingerprint !== claim.candidateFingerprint
+      ) {
+        throw new Error('Manager review candidate mismatch');
+      }
+      authenticateReview(current, claim, review);
+      return {
+        success: true,
+        data: current,
+        revision: current.revision,
+        status: 'noop',
+      };
+    } catch (error) {
+      return failure(
+        new OutcomeStoreError(
+          'invalid_transition',
+          error instanceof Error ? error.message : String(error),
+          { rootSessionId, cause: error },
+        ),
+      );
+    }
+  }
+
+  validateReviewClaim(
+    rootSessionId: string,
+    input: {
+      checkpointId: string;
+      claimGeneration: number;
+      claimToken?: string;
+      resultDigest: string;
+      recovered?: boolean;
+    },
+  ): OutcomeStoreResult<OutcomeRecord> {
+    const currentResult = this.read(rootSessionId);
+    if (!currentResult.success) return currentResult;
+    try {
+      const current = currentResult.data;
+      const claim = requireClaim(current, input);
+      if (input.recovered) {
+        if (
+          claim.state !== 'result_available' ||
+          claim.serverEpoch === this.#serverEpoch
+        ) {
+          throw new Error(
+            'Recovered review requires a prior-epoch available result',
+          );
+        }
+      } else {
+        if (!['running', 'result_available'].includes(claim.state)) {
+          throw new Error(
+            'Review requires a running or available bound result',
+          );
+        }
+        requireClaimToken(claim, input.claimToken ?? '');
+      }
+      if (
+        claim.resultDigest !== undefined &&
+        claim.resultDigest !== input.resultDigest
+      ) {
+        throw new Error('Manager result digest mismatch');
+      }
+      return {
+        success: true,
+        data: current,
+        revision: current.revision,
+        status: 'noop',
+      };
+    } catch (error) {
+      return failure(
+        new OutcomeStoreError(
+          'invalid_transition',
+          error instanceof Error ? error.message : String(error),
+          { rootSessionId, cause: error },
+        ),
+      );
+    }
+  }
+
+  persistReconciledReview(
+    rootSessionId: string,
+    input: OutcomeReviewPersistence,
+  ): OutcomeStoreResult<OutcomeRecord> {
+    const session = safeSession(rootSessionId);
+    if (session instanceof OutcomeStoreError) return failure(session);
+    return this.#withLock(session, () => {
+      const currentResult = this.read(session);
+      if (!currentResult.success) return currentResult;
+      const current = currentResult.data;
+      if (current.serverEpoch !== this.#serverEpoch) {
+        return failure(
+          new OutcomeStoreError(
+            'invalid_transition',
+            'Recover prior-epoch outcome before review persistence',
+            { rootSessionId: session },
+          ),
+        );
+      }
+      try {
+        const claim = requireClaim(current, input);
+        const existing = current.reviewSummaries.find(
+          (entry) =>
+            entry.checkpointId === input.checkpointId &&
+            entry.claimGeneration === input.claimGeneration,
+        );
+        if (
+          existing &&
+          ['review_accepted', 'review_rejected'].includes(claim.state)
+        ) {
+          if (
+            input.outcome === 'valid' &&
+            existing.resultDigest === input.resultDigest &&
+            input.review &&
+            existing.reviewDigest ===
+              canonicalDigest('omos/outcome-manager-review/v1', {
+                resultDigest: input.resultDigest,
+                review: input.review,
+              })
+          ) {
+            return {
+              success: true,
+              data: current,
+              revision: current.revision,
+              status: 'noop',
+            };
+          }
+          throw new Error(
+            'A different review is already persisted for this claim',
+          );
+        }
+        if (input.outcome === 'valid') {
+          const review = OutcomeReviewSchema.parse(input.review);
+          if (
+            claim.kind === 'final' &&
+            review.candidateFingerprint !== claim.candidateFingerprint
+          ) {
+            throw new Error('Manager review candidate mismatch');
+          }
+          authenticateReview(current, claim, review);
+        }
+        const mutation: OutcomeRecordMutation =
+          input.outcome === 'invalid'
+            ? {
+                type: 'record_consumed_invalid_review',
+                checkpointId: input.checkpointId,
+                claimGeneration: input.claimGeneration,
+                claimToken: input.recovered ? undefined : input.claimToken,
+                resultDigest: input.resultDigest,
+                reason: input.reason ?? 'Invalid Manager review',
+              }
+            : input.recovered
+              ? {
+                  type: 'record_recovered_review',
+                  checkpointId: input.checkpointId,
+                  claimGeneration: input.claimGeneration,
+                  resultDigest: input.resultDigest,
+                  review: input.review as OutcomeReview,
+                }
+              : {
+                  type: 'record_consumed_review',
+                  checkpointId: input.checkpointId,
+                  claimGeneration: input.claimGeneration,
+                  claimToken: input.claimToken ?? '',
+                  resultDigest: input.resultDigest,
+                  review: input.review as OutcomeReview,
+                };
+        const revision = current.revision + 1;
+        this.#beforePersistReconciledReview?.();
+        const next = applyMutation(
+          structuredClone(current),
+          mutation,
+          revision,
+          this.#clock(),
+          this.#serverEpoch,
+          this.#randomId,
+        );
+        return this.#persist(session, next, 'written');
+      } catch (error) {
+        return failure(
+          error instanceof OutcomeStoreError
+            ? error
+            : new OutcomeStoreError(
+                'invalid_transition',
+                error instanceof Error ? error.message : String(error),
+                { rootSessionId: session, cause: error },
+              ),
+        );
+      }
+    });
+  }
+
   recover(rootSessionId: string): OutcomeStoreResult<OutcomeRecord> {
     const session = safeSession(rootSessionId);
     if (session instanceof OutcomeStoreError) return failure(session);
@@ -426,6 +746,7 @@ export class OutcomeStore {
               checkpoint.checkpointId,
               'Prior-epoch undispatched checkpoint was cleared',
               now,
+              current.revision + 1,
             ),
           );
           checkpoint = undefined;
@@ -443,6 +764,7 @@ export class OutcomeStore {
               checkpoint.checkpointId,
               'Prior-epoch Manager dispatch requires reconciliation',
               now,
+              current.revision + 1,
             ),
           );
         }
@@ -455,6 +777,7 @@ export class OutcomeStore {
             id,
             `Operation ${id} was interrupted by process restart`,
             now,
+            current.revision + 1,
           ),
         );
       }
@@ -478,6 +801,14 @@ export class OutcomeStore {
           ? 'action_required'
           : current.phase,
         checkpoint,
+        waitCondition:
+          current.waitCondition?.kind === 'external_handoff' &&
+          current.waitCondition.originatingServerEpoch !== this.#serverEpoch
+            ? {
+                ...current.waitCondition,
+                restartObservedRevision: current.revision + 1,
+              }
+            : current.waitCondition,
         operations,
         actionsRequired,
       };
@@ -756,6 +1087,39 @@ function applyMutation(
       if (current.checkpoint && !isReviewed(current.checkpoint.state))
         throw new Error('Contract cannot change while a checkpoint exists');
       const contract = OutcomeContractSchema.parse(mutation.contract);
+      const authorityChanged =
+        current.contract.objective !== contract.objective ||
+        canonicalDigest('omos/outcome-scope/v1', {
+          inScope: current.contract.inScope,
+          outOfScope: current.contract.outOfScope,
+        }) !==
+          canonicalDigest('omos/outcome-scope/v1', {
+            inScope: contract.inScope,
+            outOfScope: contract.outOfScope,
+          });
+      if (authorityChanged) {
+        const receipt = current.receipts.userMessages.find(
+          (entry) => entry.id === mutation.sourceUserMessageReceiptId,
+        );
+        if (
+          !receipt ||
+          !contract.sourceMessageIds.includes(receipt.messageId)
+        ) {
+          throw new Error(
+            'Objective or scope revision requires a durable user receipt included in sourceMessageIds',
+          );
+        }
+      }
+      for (const exception of contract.exceptions) {
+        const authorization = current.receipts.authorizations.find(
+          (entry) => entry.id === exception.authorizationId,
+        );
+        if (!authorization) {
+          throw new Error(
+            `Exception for rule '${exception.ruleId}' references an unknown authorization`,
+          );
+        }
+      }
       next = {
         ...next,
         contract,
@@ -766,6 +1130,13 @@ function applyMutation(
       break;
     }
     case 'append_evidence':
+      compactUnreferencedToolHistory(
+        next,
+        mutation.entry.kind === 'orchestrator_attestation' &&
+          mutation.entry.linkedObservationId
+          ? new Set([mutation.entry.linkedObservationId])
+          : undefined,
+      );
       if (
         mutation.entry.kind === 'orchestrator_attestation' &&
         mutation.entry.createdRevision !== revision
@@ -776,13 +1147,146 @@ function applyMutation(
       }
       next.receipts.evidence.push(mutation.entry);
       break;
+    case 'start_tool_call':
+      compactUnreferencedToolHistory(next);
+      if (
+        mutation.operation.serverEpoch !== epoch ||
+        mutation.operation.status !== 'running' ||
+        mutation.observation.startedEpoch !== epoch ||
+        mutation.observation.completionObserved
+      ) {
+        throw new Error('Tool call must start incomplete in the current epoch');
+      }
+      if (
+        mutation.operation.callId !== mutation.observation.callId ||
+        mutation.operation.toolName !== mutation.observation.toolName ||
+        mutation.operation.argumentDigest !==
+          mutation.observation.argumentDigest
+      ) {
+        throw new Error('Tool operation and observation identity mismatch');
+      }
+      next.operations.push(mutation.operation);
+      next.receipts.evidence.push(mutation.observation);
+      break;
+    case 'complete_observation': {
+      const index = next.receipts.evidence.findIndex(
+        (entry) => entry.id === mutation.observationId,
+      );
+      if (index < 0) throw new Error('Observation does not exist');
+      const existing = next.receipts.evidence[index];
+      if (existing.kind !== 'controller_observed') {
+        throw new Error('Target is not a tool observation');
+      }
+      if (existing.completionObserved) {
+        throw new Error('Observation is already completed');
+      }
+      if (existing.startedEpoch !== mutation.completedEpoch) {
+        throw new Error('A generic completion must belong to its start epoch');
+      }
+      next.receipts.evidence[index] = {
+        ...existing,
+        completionObserved: true,
+        outputDigest: mutation.outputDigest,
+        completedEpoch: mutation.completedEpoch,
+        completedAt: mutation.completedAt,
+      };
+      break;
+    }
+    case 'complete_tool_call': {
+      const operationIndex = next.operations.findIndex(
+        (entry) => entry.id === mutation.operationId,
+      );
+      const observationIndex = next.receipts.evidence.findIndex(
+        (entry) => entry.id === mutation.observationId,
+      );
+      if (
+        operationIndex < 0 ||
+        next.operations[operationIndex].status !== 'running'
+      ) {
+        throw new Error('Tool operation is not running');
+      }
+      const observation = next.receipts.evidence[observationIndex];
+      if (
+        observation?.kind !== 'controller_observed' ||
+        observation.completionObserved
+      ) {
+        throw new Error('Tool observation is missing or already complete');
+      }
+      if (
+        observation.callId !== next.operations[operationIndex].callId ||
+        observation.startedEpoch !== mutation.completedEpoch
+      ) {
+        throw new Error('Tool completion identity or epoch mismatch');
+      }
+      next.receipts.evidence[observationIndex] = {
+        ...observation,
+        completionObserved: true,
+        outputDigest: mutation.outputDigest,
+        completedEpoch: mutation.completedEpoch,
+        completedAt: mutation.completedAt,
+      };
+      next.operations[operationIndex] = {
+        ...next.operations[operationIndex],
+        status: 'completed',
+        updatedAt: mutation.completedAt,
+      };
+      break;
+    }
     case 'append_user_message':
+      if (mutation.receipt.createdRevision !== revision) {
+        throw new Error(
+          'User message createdRevision must equal its persisted revision',
+        );
+      }
       next.receipts.userMessages.push(mutation.receipt);
       break;
     case 'append_decision':
       next.receipts.decisions.push(mutation.receipt);
       break;
+    case 'resolve_decision': {
+      const index = next.receipts.decisions.findIndex(
+        (entry) => entry.id === mutation.decisionId,
+      );
+      if (index < 0) throw new Error('Decision does not exist');
+      const existing = next.receipts.decisions[index];
+      if (existing.chosenOption !== undefined) {
+        throw new Error('Decision is already resolved');
+      }
+      if (!existing.options.includes(mutation.chosenOption)) {
+        throw new Error('Chosen option is not in available options');
+      }
+      const userMsg = next.receipts.userMessages.find(
+        (entry) => entry.id === mutation.sourceUserMessageReceiptId,
+      );
+      if (!userMsg) {
+        throw new Error('Source user message receipt does not exist');
+      }
+      if (userMsg.createdRevision <= existing.createdRevision) {
+        throw new Error('Source user message must follow the decision request');
+      }
+      next.receipts.decisions[index] = {
+        ...existing,
+        chosenOption: mutation.chosenOption,
+        sourceUserMessageReceiptId: mutation.sourceUserMessageReceiptId,
+        decidedAt: mutation.decidedAt,
+      };
+      if (
+        next.waitCondition?.kind === 'user_decision' &&
+        next.waitCondition.referenceId === mutation.decisionId
+      ) {
+        delete next.waitCondition;
+      }
+      break;
+    }
     case 'append_authorization':
+      if (
+        mutation.receipt.payloadDigest !==
+        computeOutcomeAuthorizationDigest(mutation.receipt)
+      ) {
+        throw new Error(
+          'Authorization payloadDigest must be Controller-minted from its bound fields',
+        );
+      }
       next.receipts.authorizations.push(mutation.receipt);
       break;
     case 'open_checkpoint': {
@@ -859,12 +1363,25 @@ function applyMutation(
       };
       break;
     }
-    case 'record_review': {
+    case 'record_review':
+    case 'record_consumed_review': {
       const claim = requireClaim(next, mutation);
-      if (claim.state !== 'result_available')
-        throw new Error('Review requires an available bound result');
+      if (
+        mutation.type === 'record_review'
+          ? claim.state !== 'result_available'
+          : !['running', 'result_available'].includes(claim.state)
+      ) {
+        throw new Error(
+          mutation.type === 'record_review'
+            ? 'Review requires an available bound result'
+            : 'Consumed review requires a running or available bound result',
+        );
+      }
       requireClaimToken(claim, mutation.claimToken);
-      if (mutation.resultDigest !== claim.resultDigest)
+      if (
+        claim.resultDigest !== undefined &&
+        mutation.resultDigest !== claim.resultDigest
+      )
         throw new Error('Manager result digest mismatch');
       const review = OutcomeReviewSchema.parse(mutation.review);
       if (
@@ -880,6 +1397,7 @@ function applyMutation(
         review,
         mutation.resultDigest,
         now,
+        revision,
         randomId,
       );
       break;
@@ -907,7 +1425,83 @@ function applyMutation(
         review,
         mutation.resultDigest,
         now,
+        revision,
         randomId,
+      );
+      break;
+    }
+    case 'record_invalid_review':
+    case 'record_consumed_invalid_review': {
+      const claim = requireClaim(next, mutation);
+      if (
+        mutation.type === 'record_invalid_review'
+          ? claim.state !== 'result_available'
+          : !['running', 'result_available'].includes(claim.state)
+      ) {
+        throw new Error(
+          mutation.type === 'record_invalid_review'
+            ? 'Invalid review requires an available bound result'
+            : 'Consumed invalid review requires a running or available bound result',
+        );
+      }
+      if (mutation.claimToken) {
+        requireClaimToken(claim, mutation.claimToken);
+      } else if (claim.serverEpoch === epoch) {
+        throw new Error(
+          'Current-epoch invalid review requires its claim token',
+        );
+      }
+      if (
+        claim.resultDigest !== undefined &&
+        mutation.resultDigest !== undefined &&
+        mutation.resultDigest !== claim.resultDigest
+      ) {
+        throw new Error('Manager result digest mismatch');
+      }
+      const reviewDigest = canonicalDigest('omos/outcome-invalid-review/v1', {
+        checkpointId: claim.checkpointId,
+        claimGeneration: claim.claimGeneration,
+        reason: mutation.reason,
+      });
+      next.checkpoint = {
+        ...claim,
+        state: 'review_invalid',
+        resultDigest:
+          mutation.resultDigest ?? claim.resultDigest ?? reviewDigest,
+        reviewDigest,
+        recoveryNote: mutation.reason,
+      };
+      next.actionsRequired.push(
+        action(
+          `invalid_review_${claim.checkpointId}_${claim.claimGeneration}`,
+          'manual_intervention',
+          claim.checkpointId,
+          mutation.reason,
+          now,
+          revision,
+        ),
+      );
+      break;
+    }
+    case 'record_invalid_dispatch': {
+      const claim = requireClaim(next, mutation);
+      if (claim.state !== 'dispatching') {
+        throw new Error('Invalid dispatch requires dispatching state');
+      }
+      next.checkpoint = {
+        ...claim,
+        state: 'retired',
+        recoveryNote: mutation.reason,
+      };
+      next.actionsRequired.push(
+        action(
+          `invalid_dispatch_${claim.checkpointId}_${claim.claimGeneration}`,
+          'manual_intervention',
+          claim.checkpointId,
+          mutation.reason,
+          now,
+          revision,
+        ),
       );
       break;
     }
@@ -926,6 +1520,10 @@ function applyMutation(
     }
     case 'set_wait':
       if (!mutation.wait) throw new Error('Wait condition is required');
+      if (mutation.wait.createdRevision !== revision)
+        throw new Error(
+          'Wait createdRevision must equal its persisted revision',
+        );
       next.waitCondition = mutation.wait;
       next.phase =
         mutation.wait.kind === 'user_decision'
@@ -939,6 +1537,7 @@ function applyMutation(
       next.phase = 'active';
       break;
     case 'start_operation':
+      compactUnreferencedToolHistory(next);
       if (
         mutation.operation.serverEpoch !== epoch ||
         mutation.operation.status !== 'running'
@@ -984,6 +1583,9 @@ function applyMutation(
           action.resolvedAt === undefined
         ) {
           action.resolvedAt = now;
+          action.resolutionKind = 'controller_reconciliation';
+          action.resolutionReason =
+            'Resolved by explicit acknowledgement of the matching interrupted operation';
         }
       }
       break;
@@ -1022,6 +1624,11 @@ function applyMutation(
       break;
     }
     case 'append_action':
+      if (mutation.action.createdRevision !== revision) {
+        throw new Error(
+          'Action createdRevision must equal its persisted revision',
+        );
+      }
       next.actionsRequired.push(mutation.action);
       next.phase = 'action_required';
       break;
@@ -1031,12 +1638,69 @@ function applyMutation(
           entry.id === mutation.actionId && entry.resolvedAt === undefined,
       );
       if (index < 0) throw new Error('Action is not unresolved');
+      const unresolvedAction = next.actionsRequired[index];
+      const userReceipt = mutation.sourceUserMessageReceiptId
+        ? next.receipts.userMessages.find(
+            (entry) => entry.id === mutation.sourceUserMessageReceiptId,
+          )
+        : undefined;
+      const attestations = next.receipts.evidence.filter(
+        (entry) => entry.kind === 'orchestrator_attestation',
+      );
+      const evidence = (mutation.evidenceAttestationIds ?? []).map((id) =>
+        attestations.find((entry) => entry.id === id),
+      );
+      if (
+        (!userReceipt && evidence.length === 0) ||
+        (mutation.sourceUserMessageReceiptId !== undefined && !userReceipt) ||
+        evidence.some(
+          (entry) =>
+            !entry ||
+            entry.createdRevision <= unresolvedAction.createdRevision ||
+            entry.assertedStatus !== 'passed' ||
+            entry.assertedFreshness !== 'fresh',
+        ) ||
+        (userReceipt !== undefined &&
+          userReceipt.createdRevision <= unresolvedAction.createdRevision)
+      ) {
+        throw new Error(
+          'Action resolution requires subsequent user provenance or fresh passed subsequent orchestrator-attestation evidence',
+        );
+      }
       next.actionsRequired[index] = {
         ...next.actionsRequired[index],
         resolvedAt: now,
+        resolutionKind: 'orchestrator_provenance',
+        resolutionReason: mutation.reason,
+        ...(userReceipt
+          ? { resolutionUserMessageReceiptId: userReceipt.id }
+          : {}),
+        ...(evidence.length > 0
+          ? {
+              resolutionEvidenceAttestationIds: evidence.map(
+                (entry) => entry?.id as string,
+              ),
+              resolutionEvidenceAssurance: 'orchestrator_attestation' as const,
+            }
+          : {}),
       };
       if (!next.actionsRequired.some((entry) => entry.resolvedAt === undefined))
         next.phase = 'active';
+      break;
+    }
+    case 'update_goal_status': {
+      if (current.checkpoint && !isReviewed(current.checkpoint.state)) {
+        throw new Error('Goal status cannot change while a checkpoint exists');
+      }
+      const index = next.contract.goals.findIndex(
+        (goal) => goal.id === mutation.goalId,
+      );
+      if (index < 0) throw new Error('Goal does not exist');
+      next.contract.goals[index] = {
+        ...next.contract.goals[index],
+        status: mutation.newStatus,
+      };
+      next.contractDigest = computeOutcomeContractDigest(next.contract);
       break;
     }
     case 'finalize':
@@ -1137,6 +1801,7 @@ function recordParsedReview(
   review: OutcomeReview,
   resultDigest: string,
   evaluatedAt: number,
+  persistedRevision: number,
   randomId: () => string,
 ): void {
   const reviewDigest = canonicalDigest('omos/outcome-manager-review/v1', {
@@ -1165,14 +1830,31 @@ function recordParsedReview(
   record.checkpoint = {
     ...claim,
     state: review.verdict === 'ACCEPT' ? 'review_accepted' : 'review_rejected',
+    resultDigest,
     reviewDigest,
   };
   if (review.verdict === 'USER_DECISION_REQUIRED') {
+    const decisionId = `dec_${summary.reviewId}`;
+    if (review.userDecision) {
+      const decisionReceipt: OutcomeDecisionReceipt = {
+        id: decisionId,
+        decisionNeeded: review.userDecision.decisionNeeded,
+        options: review.userDecision.options,
+        blocking: review.userDecision.blocking,
+        createdAt: evaluatedAt,
+        createdRevision: persistedRevision,
+        ...(review.userDecision.impact
+          ? { impact: review.userDecision.impact }
+          : {}),
+      };
+      record.receipts.decisions.push(decisionReceipt);
+    }
     record.waitCondition = {
       kind: 'user_decision',
-      referenceId: summary.reviewId,
+      referenceId: decisionId,
       reason: review.userDecision?.decisionNeeded ?? review.summary,
       createdAt: evaluatedAt,
+      createdRevision: persistedRevision,
     };
   } else if (
     review.verdict === 'CORRECT_DRIFT' ||
@@ -1185,6 +1867,7 @@ function recordParsedReview(
         summary.reviewId,
         review.summary,
         evaluatedAt,
+        persistedRevision,
       ),
     );
   }
@@ -1315,7 +1998,13 @@ function resolveMatchingRecoveryActions(
   const actionId = `uncertain_${checkpointId}`;
   record.actionsRequired = record.actionsRequired.map((entry) =>
     entry.id === actionId && entry.resolvedAt === undefined
-      ? { ...entry, resolvedAt }
+      ? {
+          ...entry,
+          resolvedAt,
+          resolutionKind: 'controller_reconciliation',
+          resolutionReason:
+            'Resolved by the matching uncertain-checkpoint reconciliation transition',
+        }
       : entry,
   );
 }
@@ -1443,14 +2132,163 @@ function isReviewed(state: OutcomeCheckpointClaim['state']): boolean {
   ].includes(state);
 }
 
+function compactUnreferencedToolHistory(
+  record: OutcomeRecord,
+  additionalReferencedObservationIds: ReadonlySet<string> = new Set(),
+): void {
+  const referencedObsIds = new Set<string>(additionalReferencedObservationIds);
+  const referencedOpIds = new Set<string>();
+
+  for (const entry of record.receipts.evidence) {
+    if (
+      entry.kind === 'orchestrator_attestation' &&
+      entry.linkedObservationId
+    ) {
+      referencedObsIds.add(entry.linkedObservationId);
+    }
+  }
+
+  for (const rule of record.contract.rules) {
+    for (const id of rule.evidenceAttestationIds) {
+      referencedObsIds.add(id);
+    }
+  }
+
+  if (record.checkpoint) {
+    for (const id of record.checkpoint.includedEvidenceAttestationIds) {
+      referencedObsIds.add(id);
+    }
+    for (const id of record.checkpoint.includedDecisionIds) {
+      referencedObsIds.add(id);
+    }
+    for (const id of record.checkpoint.includedExceptionRuleIds) {
+      referencedObsIds.add(id);
+    }
+  }
+
+  for (const actionItem of record.actionsRequired) {
+    referencedOpIds.add(actionItem.referenceId);
+    referencedObsIds.add(actionItem.referenceId);
+    if (actionItem.resolutionEvidenceAttestationIds) {
+      for (const id of actionItem.resolutionEvidenceAttestationIds) {
+        referencedObsIds.add(id);
+      }
+    }
+  }
+
+  if (record.waitCondition) {
+    referencedOpIds.add(record.waitCondition.referenceId);
+    referencedObsIds.add(record.waitCondition.referenceId);
+  }
+
+  for (const summary of record.reviewSummaries) {
+    referencedObsIds.add(summary.checkpointId);
+    referencedObsIds.add(summary.managerTaskId);
+  }
+
+  if (record.finalCertificate) {
+    referencedObsIds.add(record.finalCertificate.acceptedCheckpointId);
+    referencedObsIds.add(record.finalCertificate.managerTaskId);
+    referencedObsIds.add(record.finalCertificate.managerReviewId);
+  }
+
+  const completedObsByCallId = new Map<string, OutcomeToolObservation[]>();
+  for (const entry of record.receipts.evidence) {
+    if (
+      entry.kind === 'controller_observed' &&
+      entry.completionObserved &&
+      entry.outputDigest !== undefined &&
+      entry.completedEpoch !== undefined &&
+      entry.completedAt !== undefined &&
+      !referencedObsIds.has(entry.id) &&
+      !referencedObsIds.has(entry.callId)
+    ) {
+      const list = completedObsByCallId.get(entry.callId) ?? [];
+      list.push(entry);
+      completedObsByCallId.set(entry.callId, list);
+    }
+  }
+
+  const completedOpsByCallId = new Map<string, OutcomePendingOperation[]>();
+  for (const op of record.operations) {
+    if (
+      op.status === 'completed' &&
+      !referencedOpIds.has(op.id) &&
+      !referencedOpIds.has(op.callId)
+    ) {
+      const list = completedOpsByCallId.get(op.callId) ?? [];
+      list.push(op);
+      completedOpsByCallId.set(op.callId, list);
+    }
+  }
+
+  const candidatePairs: Array<{
+    op: OutcomePendingOperation;
+    obs: OutcomeToolObservation;
+  }> = [];
+
+  for (const op of record.operations) {
+    if (
+      op.status !== 'completed' ||
+      referencedOpIds.has(op.id) ||
+      referencedOpIds.has(op.callId)
+    ) {
+      continue;
+    }
+    const matchingOps = completedOpsByCallId.get(op.callId);
+    const matchingObs = completedObsByCallId.get(op.callId);
+    if (matchingOps?.length === 1 && matchingObs?.length === 1) {
+      const obs = matchingObs[0];
+      if (
+        obs.toolName === op.toolName &&
+        obs.argumentDigest === op.argumentDigest &&
+        obs.startedEpoch === op.serverEpoch
+      ) {
+        candidatePairs.push({ op, obs });
+      }
+    }
+  }
+
+  const targetMaxOperations = 16;
+  const targetMaxEvidence = 32;
+  const maxRetainDefault = 8;
+
+  const nonCandidateOps = record.operations.length - candidatePairs.length;
+  const nonCandidateEvidence =
+    record.receipts.evidence.length - candidatePairs.length;
+
+  let maxToRetain = maxRetainDefault;
+  if (nonCandidateOps + maxToRetain > targetMaxOperations) {
+    maxToRetain = Math.max(0, targetMaxOperations - nonCandidateOps);
+  }
+  if (nonCandidateEvidence + maxToRetain > targetMaxEvidence) {
+    maxToRetain = Math.max(0, targetMaxEvidence - nonCandidateEvidence);
+  }
+
+  if (candidatePairs.length > maxToRetain) {
+    const pruneCount = candidatePairs.length - maxToRetain;
+    const pairsToPrune = candidatePairs.slice(0, pruneCount);
+    const opIdsToPrune = new Set(pairsToPrune.map((p) => p.op.id));
+    const obsIdsToPrune = new Set(pairsToPrune.map((p) => p.obs.id));
+
+    record.operations = record.operations.filter(
+      (op) => !opIdsToPrune.has(op.id),
+    );
+    record.receipts.evidence = record.receipts.evidence.filter(
+      (ev) => !obsIdsToPrune.has(ev.id),
+    );
+  }
+}
+
 function action(
   id: string,
   code: OutcomeActionRequired['code'],
   referenceId: string,
   reason: string,
   createdAt: number,
+  createdRevision: number,
 ): OutcomeActionRequired {
-  return { id, code, referenceId, reason, createdAt };
+  return { id, code, referenceId, reason, createdAt, createdRevision };
 }
 
 function sessionHash(session: string): string {

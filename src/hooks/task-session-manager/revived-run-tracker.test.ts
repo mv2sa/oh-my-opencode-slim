@@ -1,9 +1,41 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test';
+import { randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
 import { CooldownRegistry } from '../foreground-fallback/cooldown-registry';
 import { ForegroundFallbackManager } from '../foreground-fallback/index';
 import { createSyntheticQuotaCoordinator } from '../foreground-fallback/synthetic-quota';
 import { createRevivedRunTracker } from './revived-run-tracker';
+
+let cooldownTempDir: string | undefined;
+
+function createTestCooldownRegistry(): CooldownRegistry {
+  cooldownTempDir ??= fs.mkdtempSync(
+    path.join(os.tmpdir(), 'omos-cooldown-revived-test-'),
+  );
+  return new CooldownRegistry(
+    path.join(cooldownTempDir, `${randomUUID()}.json`),
+  );
+}
+
+afterEach(() => {
+  if (!cooldownTempDir) return;
+  for (const entry of fs.readdirSync(cooldownTempDir)) {
+    fs.rmSync(path.join(cooldownTempDir, entry), {
+      recursive: true,
+      force: true,
+    });
+  }
+});
+
+afterAll(() => {
+  if (cooldownTempDir) {
+    fs.rmSync(cooldownTempDir, { recursive: true, force: true });
+    cooldownTempDir = undefined;
+  }
+});
 
 function createHarness(
   messages: () => unknown,
@@ -421,7 +453,7 @@ describe('revived run tracker', () => {
   test('handles Antigravity synthetic quota turn by launching fallback continuation', async () => {
     const quotaText =
       'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const fallbackMgr = new ForegroundFallbackManager(
       {
         explorer: [
@@ -547,7 +579,7 @@ describe('revived run tracker', () => {
   test('marks error and notifies parent when chain is exhausted on Antigravity quota', async () => {
     const quotaText =
       'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const fallbackMgr = new ForegroundFallbackManager(
       {
         explorer: ['google/antigravity-gemini-3-flash'], // Single-model chain
@@ -611,7 +643,7 @@ describe('revived run tracker', () => {
   test('production registration sets baselineMessageID to failed message ID and avoids immediate re-cascade', async () => {
     const quotaText =
       'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const fallbackMgr = new ForegroundFallbackManager(
       {
         explorer: [
@@ -673,7 +705,7 @@ describe('revived run tracker', () => {
   test('probe does not prompt continuation if job cancellation was requested', async () => {
     const quotaText =
       'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
-    const registry = new CooldownRegistry();
+    const registry = createTestCooldownRegistry();
     const fallbackMgr = new ForegroundFallbackManager(
       {
         explorer: [

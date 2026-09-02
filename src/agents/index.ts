@@ -46,6 +46,7 @@ const TASK_CONTROL_TOOL_NAMES = [
   'task_revive',
   'task_status',
   'task_result',
+  'outcome_control',
 ] as const;
 const SAFE_AGENT_ALIAS_RE = /^[a-z][a-z0-9_-]*$/i;
 
