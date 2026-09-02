@@ -24,6 +24,7 @@ import { SESSION_ID_PATTERN } from '../../utils/session';
 import type { ForegroundFallbackManager } from '../foreground-fallback';
 import {
   isAntigravitySyntheticQuotaText,
+  isSyntheticQuotaContinuationActiveStatus,
   type SyntheticQuotaCoordinator,
 } from '../foreground-fallback/synthetic-quota';
 import { isMissingRememberedSessionError } from './board-injection';
@@ -379,10 +380,7 @@ export async function handleToolExecuteAfter(
               pendingAgent: pending.agentType,
             });
           if (outcome.handled) {
-            if (
-              outcome.status === 'launched' ||
-              outcome.status === 'already_active'
-            ) {
+            if (isSyntheticQuotaContinuationActiveStatus(outcome.status)) {
               output.output = renderRunningTaskPlaceholder(status.taskID);
               deps.taskContextTracker.pendingManagedTaskIds.add(status.taskID);
               return;

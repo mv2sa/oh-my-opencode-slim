@@ -40,6 +40,7 @@ import {
 import type { ForegroundFallbackManager } from '../foreground-fallback';
 import {
   isAntigravitySyntheticQuotaText,
+  isSyntheticQuotaContinuationActiveStatus,
   type SyntheticQuotaCoordinator,
 } from '../foreground-fallback/synthetic-quota';
 import type { MessagePart, MessageWithParts } from '../types';
@@ -919,10 +920,7 @@ export async function updateFromInjectedCompletion(
         revivedRunTracker: state.revivedRunTracker,
       });
     if (outcome.handled) {
-      if (
-        outcome.status === 'launched' ||
-        outcome.status === 'already_active'
-      ) {
+      if (isSyntheticQuotaContinuationActiveStatus(outcome.status)) {
         part.text = renderRunningTaskPlaceholder(status.taskID);
         rememberProcessedSyntheticTerminal(
           state,

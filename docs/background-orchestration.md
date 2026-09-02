@@ -535,6 +535,10 @@ Rather than establishing the quota text as canonical task completion, the plugin
 - marks a durable cooldown for the failed model matching the parsed reset interval (capped at 5 hours),
 - rewrites false completion task outputs/injected completions to the byte-stable running placeholder,
 - continues execution on the affected agent's configured model ladder via non-aborting continuation prompts,
+- fences continuation transport with a bounded caller wait and mutual-exclusion message/control lease so slow transport does not block callers while preventing premature error classification or duplicate dispatches,
+- enforces a hard transport quarantine deadline that releases the message lease, records incident deduplication, marks the running job's status uncertain with an explicit diagnostic, and skips model consumption if transport remains unresolved,
+- handles late transport resolutions safely: post-quarantine acceptances are ignored locally (no model ladder progression, tracker registration, or newer-generation mutation) because host session abort cannot safely target only the abandoned request, and late transport errors do not overwrite quarantine state or terminalize the uncertain job,
+- commits model ladder progress and registers with `RevivedRunTracker` upon transport acceptance,
 - tracks the replacement run through `RevivedRunTracker` so the real replacement result is delivered once to the parent orchestrator,
 - surfaces terminal error state if the fallback chain is exhausted or recovery cannot start.
 

@@ -1,9 +1,6 @@
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import { createInternalAgentTextPart } from '../../utils/internal-initiator';
-import {
-  abortSessionWithTimeout,
-  parseModelReference,
-} from '../../utils/session';
+import { parseModelReference } from '../../utils/session';
 import type { RevivedRunTracker } from '../task-session-manager/revived-run-tracker';
 import type { ForegroundFallbackManager } from './index';
 
@@ -19,6 +16,16 @@ export const ANTIGRAVITY_TEMPLATE_1 =
 
 export const ANTIGRAVITY_TEMPLATE_2 =
   /^Quota protection: All \d+ account\(s\) are over \d+(?:\.\d+)?% usage for .+?\. Quota resets in .+?\. Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable\.$/;
+
+export const DEFAULT_CONTINUATION_CALLER_WAIT_MS = 2_000;
+export const DEFAULT_CONTINUATION_TRANSPORT_TIMEOUT_MS = 10_000;
+
+export class ContinuationTransportTimeoutError extends Error {
+  constructor() {
+    super('Continuation prompt transport timed out');
+    this.name = 'ContinuationTransportTimeoutError';
+  }
+}
 
 export interface AntigravityMessageEvidence {
   role?: unknown;
@@ -212,6 +219,7 @@ export async function launchContinuationPrompt(options: {
   agent?: string;
   model?: string;
   variant?: string;
+  timeoutMs?: number;
 }): Promise<void> {
   if (!options.client || typeof options.client !== 'object') {
     throw new Error('client unavailable');
@@ -240,15 +248,57 @@ export async function launchContinuationPrompt(options: {
     },
   };
 
-  const response = await (
-    sessionClient as {
-      promptAsync: (args: unknown) => Promise<unknown>;
+  const dispatchPromise = (async (): Promise<void> => {
+    const response = await (
+      sessionClient as {
+        promptAsync: (args: unknown) => Promise<unknown>;
+      }
+    ).promptAsync(promptBody);
+    const err = responseError(response);
+    if (err !== undefined) {
+      throw new Error(errorText(err));
     }
-  ).promptAsync(promptBody);
-  const err = responseError(response);
-  if (err !== undefined) {
-    throw new Error(errorText(err));
+  })();
+
+  const timeoutMs =
+    options.timeoutMs ?? DEFAULT_CONTINUATION_TRANSPORT_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new ContinuationTransportTimeoutError());
+    }, timeoutMs);
+    timer.unref?.();
+  });
+
+  try {
+    await Promise.race([dispatchPromise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
+}
+
+export type SyntheticQuotaIncidentStatus =
+  | 'launching'
+  | 'launched'
+  | 'already_active'
+  | 'exhausted'
+  | 'transport_failed'
+  | 'quarantined'
+  | 'aborted';
+
+export function isSyntheticQuotaContinuationActiveStatus(
+  status: SyntheticQuotaIncidentStatus | string | undefined,
+): boolean {
+  return (
+    status === 'launched' ||
+    status === 'already_active' ||
+    status === 'quarantined'
+  );
+}
+
+export interface SyntheticQuotaCoordinatorOptions {
+  callerWaitTimeoutMs?: number;
+  hardTransportTimeoutMs?: number;
 }
 
 export interface SyntheticQuotaCoordinator {
@@ -276,41 +326,53 @@ export interface SyntheticQuotaCoordinator {
     pendingParentSessionId?: string;
     pendingLabel?: string;
     pendingAgent?: string;
+    callerWaitTimeoutMs?: number;
+    hardTransportTimeoutMs?: number;
   }): Promise<{
     handled: boolean;
-    status:
-      | 'launched'
-      | 'already_active'
-      | 'exhausted'
-      | 'transport_failed'
-      | 'aborted';
+    status: SyntheticQuotaIncidentStatus;
     nextModel?: string;
     variant?: string;
     failedMessageID?: string;
   }>;
 }
 
-export function createSyntheticQuotaCoordinator(): SyntheticQuotaCoordinator {
+interface IncidentReservation {
+  token: symbol;
+  status: SyntheticQuotaIncidentStatus;
+  model: string;
+  quarantineTimer?: ReturnType<typeof setTimeout>;
+  activeLease?: {
+    board: BackgroundJobStore;
+    lease: NonNullable<ReturnType<BackgroundJobStore['acquireMessageLease']>>;
+  };
+}
+
+export function createSyntheticQuotaCoordinator(
+  options?: SyntheticQuotaCoordinatorOptions,
+): SyntheticQuotaCoordinator {
+  const defaultCallerWaitTimeoutMs =
+    options?.callerWaitTimeoutMs ?? DEFAULT_CONTINUATION_CALLER_WAIT_MS;
+  const defaultHardTransportTimeoutMs =
+    options?.hardTransportTimeoutMs ??
+    DEFAULT_CONTINUATION_TRANSPORT_TIMEOUT_MS;
+
   // taskID:generation:failedMessageID -> reservation state
-  type IncidentStatus =
-    | 'launching'
-    | 'launched'
-    | 'exhausted'
-    | 'transport_failed'
-    | 'aborted';
-  const incidentReservations = new Map<
-    string,
-    { status: IncidentStatus; model: string }
-  >();
-  const activeLeases = new Map<
-    string,
-    {
-      board: BackgroundJobStore;
-      lease: NonNullable<ReturnType<BackgroundJobStore['acquireMessageLease']>>;
-    }
-  >();
-  let lifecycle = 0;
+  const incidentReservations = new Map<string, IncidentReservation>();
   let disposed = false;
+
+  const clearReservationTimer = (reservation: IncidentReservation): void => {
+    if (!reservation.quarantineTimer) return;
+    clearTimeout(reservation.quarantineTimer);
+    reservation.quarantineTimer = undefined;
+  };
+
+  const releaseReservationLease = (reservation: IncidentReservation): void => {
+    const active = reservation.activeLease;
+    if (!active) return;
+    reservation.activeLease = undefined;
+    active.board.releaseLease(active.lease);
+  };
 
   const incidentKey = (
     taskID: string,
@@ -330,32 +392,30 @@ export function createSyntheticQuotaCoordinator(): SyntheticQuotaCoordinator {
   };
 
   const clearSession = (taskID: string): void => {
-    for (const key of incidentReservations.keys()) {
-      if (key.startsWith(`${taskID}\u001f`)) {
+    const prefix = `${taskID}\u001f`;
+    for (const [key, reservation] of Array.from(
+      incidentReservations.entries(),
+    )) {
+      if (key.startsWith(prefix)) {
+        clearReservationTimer(reservation);
+        releaseReservationLease(reservation);
         incidentReservations.delete(key);
-        const active = activeLeases.get(key);
-        if (active) {
-          active.board.releaseLease(active.lease);
-          activeLeases.delete(key);
-        }
       }
     }
   };
 
   const dispose = (): void => {
     disposed = true;
-    lifecycle += 1;
-    for (const { board, lease } of activeLeases.values()) {
-      board.releaseLease(lease);
+    for (const reservation of incidentReservations.values()) {
+      clearReservationTimer(reservation);
+      releaseReservationLease(reservation);
     }
-    activeLeases.clear();
     incidentReservations.clear();
   };
 
   const handleTaskQuotaIncident: SyntheticQuotaCoordinator['handleTaskQuotaIncident'] =
     async (input) => {
       if (disposed) return { handled: false, status: 'aborted' };
-      const launchLifecycle = lifecycle;
       if (!isAntigravitySyntheticQuotaText(input.text)) {
         return { handled: false, status: 'aborted' };
       }
@@ -409,11 +469,20 @@ export function createSyntheticQuotaCoordinator(): SyntheticQuotaCoordinator {
         return { handled: false, status: 'aborted' };
       }
 
-      // Reserve incident
-      incidentReservations.set(key, {
+      // Reserve incident with unique token
+      const reservationToken = Symbol();
+      const reservation: IncidentReservation = {
+        token: reservationToken,
         status: 'launching',
         model: failedModel ?? '',
-      });
+      };
+      incidentReservations.set(key, reservation);
+
+      const ownsReservation = (): boolean => {
+        if (disposed) return false;
+        const current = incidentReservations.get(key);
+        return current !== undefined && current.token === reservationToken;
+      };
 
       // 3. Acquire continuation lease mutually exclusive with cancellation/relaunch/message (Point 4)
       const lease = input.backgroundJobBoard.acquireMessageLease(
@@ -422,10 +491,13 @@ export function createSyntheticQuotaCoordinator(): SyntheticQuotaCoordinator {
       );
       if (!lease) {
         // Job is cancelled or already leased by another lifecycle operation -> do not prompt!
-        incidentReservations.delete(key);
+        if (ownsReservation()) incidentReservations.delete(key);
         return { handled: false, status: 'aborted' };
       }
-      activeLeases.set(key, { board: input.backgroundJobBoard, lease });
+      reservation.activeLease = {
+        board: input.backgroundJobBoard,
+        lease,
+      };
 
       // 4. Mark cooldown and resolve next model (Points 3, 4, 5)
       input.fallbackManager?.markModelCooldown(failedModel, input.text);
@@ -438,12 +510,9 @@ export function createSyntheticQuotaCoordinator(): SyntheticQuotaCoordinator {
 
       if (!next) {
         // Chain exhausted -> release lease and update status
-        input.backgroundJobBoard.releaseLease(lease);
-        activeLeases.delete(key);
-        incidentReservations.set(key, {
-          status: 'exhausted',
-          model: failedModel,
-        });
+        releaseReservationLease(reservation);
+        reservation.status = 'exhausted';
+        reservation.model = failedModel;
         input.backgroundJobBoard.updateStatus({
           taskID: input.taskID,
           expectedGeneration: generation,
@@ -454,89 +523,224 @@ export function createSyntheticQuotaCoordinator(): SyntheticQuotaCoordinator {
         return { handled: true, status: 'exhausted', failedMessageID };
       }
 
-      // 5. Launch continuation prompt with bounded timeout & error inspection (Point 3)
-      try {
-        if (!input.client) throw new Error('client unavailable');
-        await launchContinuationPrompt({
-          client: input.client,
-          directory: input.directory,
-          taskID: input.taskID,
-          agent,
-          model: next.model,
-          variant: next.variant,
-        });
-      } catch (err) {
-        // Transport failed -> release lease, rollback reservation, update status (Point 3)
-        input.backgroundJobBoard.releaseLease(lease);
-        activeLeases.delete(key);
-        incidentReservations.set(key, {
-          status: 'transport_failed',
-          model: next.model,
-        });
-        input.backgroundJobBoard.updateStatus({
-          taskID: input.taskID,
-          expectedGeneration: generation,
-          state: 'error',
-          resultSummary: `Continuation launch failed: ${errorText(err)}`,
-        });
-        return { handled: true, status: 'transport_failed', failedMessageID };
-      }
-
-      // Validate lease after launch
-      const current = input.backgroundJobBoard.get(input.taskID);
+      // 5. Dispatch exactly one continuation prompt transport (Points 1, 3)
+      const sessionClient = (input.client as Record<string, unknown>)?.session;
       if (
-        disposed ||
-        lifecycle !== launchLifecycle ||
-        !input.backgroundJobBoard.validateLease(lease) ||
-        !current ||
-        current.generation !== generation ||
-        current.state !== 'running' ||
-        current.cancellationRequested ||
-        current.deadlineExceededAt !== undefined ||
-        !next.commit()
+        !sessionClient ||
+        typeof (sessionClient as Record<string, unknown>).promptAsync !==
+          'function'
       ) {
-        input.backgroundJobBoard.releaseLease(lease);
-        activeLeases.delete(key);
-        incidentReservations.set(key, {
-          status: 'aborted',
-          model: next.model,
-        });
-        await abortSession(input.client, input.taskID);
-        const latest = input.backgroundJobBoard.get(input.taskID);
-        if (
-          latest?.generation === generation &&
-          latest.state === 'running' &&
-          !latest.cancellationRequested &&
-          latest.deadlineExceededAt === undefined
-        ) {
-          input.backgroundJobBoard.updateStatus({
-            taskID: input.taskID,
-            expectedGeneration: generation,
-            state: 'error',
-            resultSummary:
-              'Continuation was accepted but its lifecycle commit was invalidated.',
-          });
-        }
-        return { handled: true, status: 'aborted', failedMessageID };
+        releaseReservationLease(reservation);
+        if (ownsReservation()) incidentReservations.delete(key);
+        return { handled: false, status: 'aborted' };
       }
-      input.backgroundJobBoard.releaseLease(lease);
-      activeLeases.delete(key);
 
-      // 6. Commit state and register with RevivedRunTracker (Points 2, 3, 4)
-      incidentReservations.set(key, {
-        status: 'launched',
-        model: next.model,
+      const ref = next.model ? parseModelReference(next.model) : undefined;
+      const promptBody = {
+        path: { id: input.taskID },
+        ...(input.directory ? { query: { directory: input.directory } } : {}),
+        body: {
+          parts: [
+            createInternalAgentTextPart(
+              "<system-reminder>\nThe previous model request failed and is being retried with a fallback model. Continue processing the user's original request above. Do not respond to this reminder.\n</system-reminder>",
+            ),
+          ],
+          ...(ref ? { model: ref } : {}),
+          ...(next.variant ? { variant: next.variant } : {}),
+          ...(agent ? { agent } : {}),
+        },
+      };
+
+      const dispatchPromise = (async (): Promise<void> => {
+        const response = await (
+          sessionClient as { promptAsync: (args: unknown) => Promise<unknown> }
+        ).promptAsync(promptBody);
+        const err = responseError(response);
+        if (err !== undefined) {
+          throw new Error(errorText(err));
+        }
+      })();
+
+      // 6. Hard transport quarantine deadline (Points 2, 3)
+      const hardTransportTimeoutMs =
+        input.hardTransportTimeoutMs ?? defaultHardTransportTimeoutMs;
+
+      let quarantined = false;
+
+      const onQuarantine = (): void => {
+        if (!ownsReservation()) return;
+        clearReservationTimer(reservation);
+
+        quarantined = true;
+
+        // Release message lease exactly once
+        releaseReservationLease(reservation);
+
+        // Deduplication disposition for that exact incident
+        reservation.status = 'quarantined';
+        reservation.model = next.model;
+
+        // Mark still-current running board generation status uncertain
+        const current = input.backgroundJobBoard.get(input.taskID);
+        const isValid =
+          current &&
+          current.generation === generation &&
+          current.state === 'running' &&
+          !current.cancellationRequested &&
+          current.deadlineExceededAt === undefined;
+
+        if (isValid) {
+          input.backgroundJobBoard.markStatusUncertain(
+            input.taskID,
+            'Continuation transport quarantine deadline exceeded',
+            generation,
+          );
+        }
+      };
+
+      reservation.quarantineTimer = setTimeout(
+        onQuarantine,
+        hardTransportTimeoutMs,
+      );
+      reservation.quarantineTimer.unref?.();
+
+      // 7. Background settlement tracker for late resolution/invalidation (Points 4, 5, 6)
+      const backgroundSettlement = (async (): Promise<void> => {
+        try {
+          await dispatchPromise;
+
+          if (!ownsReservation()) {
+            // Ownership lost (cleared, disposed, or superseded).
+            // Do not mutate maps, board, or abort.
+            return;
+          }
+          clearReservationTimer(reservation);
+
+          if (quarantined) {
+            // Late resolution accepted after quarantine:
+            // Ignored locally: no model commit, tracker registration, or newer-generation mutation.
+            // Host abort is not invoked because it cannot safely target only the abandoned request.
+            return;
+          }
+
+          // Validate lease and current lifecycle at resolution time
+          const current = input.backgroundJobBoard.get(input.taskID);
+          const isValid =
+            input.backgroundJobBoard.validateLease(lease) &&
+            current &&
+            current.generation === generation &&
+            current.state === 'running' &&
+            !current.cancellationRequested &&
+            current.deadlineExceededAt === undefined;
+
+          if (isValid && next.commit()) {
+            releaseReservationLease(reservation);
+            reservation.status = 'launched';
+            reservation.model = next.model;
+            input.revivedRunTracker?.register({
+              taskID: input.taskID,
+              generation,
+              parentSessionID:
+                job.parentSessionID ?? input.pendingParentSessionId ?? '',
+              description:
+                job.description ?? input.pendingLabel ?? input.taskID,
+              baselineMessageID: failedMessageID,
+            });
+          } else {
+            // Invalidation occurred while transport was running:
+            // Disposal, cancellation, deletion, or lease invalidated.
+            releaseReservationLease(reservation);
+            reservation.status = 'aborted';
+            reservation.model = next.model;
+            const latest = input.backgroundJobBoard.get(input.taskID);
+            if (
+              latest?.generation === generation &&
+              latest.state === 'running' &&
+              !latest.cancellationRequested &&
+              latest.deadlineExceededAt === undefined
+            ) {
+              input.backgroundJobBoard.updateStatus({
+                taskID: input.taskID,
+                expectedGeneration: generation,
+                state: 'error',
+                resultSummary:
+                  'Continuation was accepted but its lifecycle commit was invalidated.',
+              });
+            }
+          }
+        } catch (err) {
+          if (!ownsReservation()) {
+            // Ownership lost. Do not mutate maps or board.
+            return;
+          }
+          clearReservationTimer(reservation);
+
+          if (quarantined) {
+            // Late rejection after quarantine must not overwrite quarantine disposition
+            // or terminalize the still-running uncertain job.
+            return;
+          }
+
+          releaseReservationLease(reservation);
+          reservation.status = 'transport_failed';
+          reservation.model = next.model;
+
+          const current = input.backgroundJobBoard.get(input.taskID);
+          const isValid =
+            current &&
+            current.generation === generation &&
+            current.state === 'running' &&
+            !current.cancellationRequested &&
+            current.deadlineExceededAt === undefined;
+
+          if (isValid) {
+            input.backgroundJobBoard.updateStatus({
+              taskID: input.taskID,
+              expectedGeneration: generation,
+              state: 'error',
+              resultSummary: `Continuation launch failed: ${errorText(err)}`,
+            });
+          }
+        }
+      })();
+
+      // 8. Bounded caller wait (Points 1, 2, 3)
+      const callerWaitTimeoutMs =
+        input.callerWaitTimeoutMs ?? defaultCallerWaitTimeoutMs;
+
+      let waitTimer: ReturnType<typeof setTimeout> | undefined;
+      const waitPromise = new Promise<'timeout'>((resolve) => {
+        waitTimer = setTimeout(() => resolve('timeout'), callerWaitTimeoutMs);
+        waitTimer.unref?.();
       });
 
-      input.revivedRunTracker?.register({
-        taskID: input.taskID,
-        generation,
-        parentSessionID:
-          job?.parentSessionID ?? input.pendingParentSessionId ?? '',
-        description: job?.description ?? input.pendingLabel ?? input.taskID,
-        baselineMessageID: failedMessageID,
-      });
+      const callerRace = await Promise.race([
+        dispatchPromise.then(
+          () => 'settled' as const,
+          () => 'settled' as const,
+        ),
+        waitPromise,
+      ]);
+      if (waitTimer) clearTimeout(waitTimer);
 
+      if (callerRace === 'settled') {
+        await backgroundSettlement;
+        const finalRes = incidentReservations.get(key);
+        const finalStatus =
+          finalRes?.token === reservationToken ? finalRes.status : 'aborted';
+        return {
+          handled: true,
+          status: finalStatus,
+          ...(finalStatus === 'launched'
+            ? { nextModel: next.model, variant: next.variant }
+            : {}),
+          failedMessageID,
+        };
+      }
+
+      // Caller wait timed out: delivery is uncertain, not rejected.
+      // Incident reservation ('launching') and message lease remain held until transport settles or quarantines.
+      // Return status 'launched' so caller rewrites to running placeholder without blocking.
       return {
         handled: true,
         status: 'launched',
@@ -552,20 +756,4 @@ export function createSyntheticQuotaCoordinator(): SyntheticQuotaCoordinator {
     dispose,
     handleTaskQuotaIncident,
   };
-}
-
-async function abortSession(client: unknown, taskID: string): Promise<void> {
-  if (!client || typeof client !== 'object') return;
-  const session = (client as Record<string, unknown>).session;
-  if (!session || typeof session !== 'object') return;
-  const abort = (session as Record<string, unknown>).abort;
-  if (typeof abort !== 'function') return;
-  try {
-    await abortSessionWithTimeout(
-      { session: { abort } } as Parameters<typeof abortSessionWithTimeout>[0],
-      taskID,
-    );
-  } catch {
-    // The lifecycle was already invalidated; abort is best-effort containment.
-  }
 }

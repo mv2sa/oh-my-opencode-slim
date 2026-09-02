@@ -11,6 +11,10 @@ import {
 import { CooldownRegistry } from '../foreground-fallback/cooldown-registry';
 import { ForegroundFallbackManager } from '../foreground-fallback/index';
 import {
+  createSyntheticQuotaCoordinator,
+  type SyntheticQuotaCoordinator,
+} from '../foreground-fallback/synthetic-quota';
+import {
   createPhaseReminderHook,
   PHASE_REMINDER_METADATA_KEY,
 } from '../phase-reminder';
@@ -120,6 +124,7 @@ type HookOptions = {
   backgroundJobSupervisor?: BackgroundJobSupervisor;
   fallbackManager?: ForegroundFallbackManager;
   revivedRunTracker?: ReturnType<typeof createRevivedRunTracker>;
+  syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
 };
 
 function createHook(options?: HookOptions) {
@@ -153,6 +158,7 @@ function createHook(options?: HookOptions) {
       stopConfirmationMs: options?.stopConfirmationMs,
       fallbackManager: options?.fallbackManager,
       revivedRunTracker: options?.revivedRunTracker,
+      syntheticQuotaCoordinator: options?.syntheticQuotaCoordinator,
     },
   );
 
@@ -8353,29 +8359,23 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
 
-  test('disposal invalidates an in-flight continuation and bounds a hanging containment abort', async () => {
+  test('permanently unresolved prompt returns within caller bound, and at hard quarantine deadline releases message lease, marks running+statusUncertain with diagnostic, leaves model uncommitted, and dedupes subsequent observations', async () => {
     const board = new BackgroundJobBoard();
     const registry = new CooldownRegistry();
-    let acceptPrompt = (): void => {};
-    const promptAccepted = new Promise<void>((resolve) => {
-      acceptPrompt = resolve;
-    });
     let promptStarted = (): void => {};
     const started = new Promise<void>((resolve) => {
       promptStarted = resolve;
     });
     const promptAsync = mock(async () => {
       promptStarted();
-      await promptAccepted;
-      return {};
+      return new Promise(() => {}); // never resolves
     });
-    const abort = mock(() => new Promise(() => {}));
     const messagesMock = mock(async () => ({
       data: [
         {
           info: {
             role: 'assistant',
-            id: 'asst-dispose-1',
+            id: 'asst-hang-1',
             providerID: 'google',
             modelID: 'antigravity-gemini-3-flash',
             finish: 'stop',
@@ -8391,6 +8391,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
         oracle: [
           'google/antigravity-gemini-3-flash',
           'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
         ],
       },
       true,
@@ -8399,13 +8400,28 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
       undefined,
       registry,
     );
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 25,
+    });
     const { hook } = createHook({
       backgroundJobBoard: board,
       fallbackManager: fallbackMgr,
-      sessionClient: { promptAsync, messages: messagesMock, abort },
+      revivedRunTracker: revivedTracker,
+      syntheticQuotaCoordinator,
+      sessionClient: { promptAsync, messages: messagesMock },
     });
     await hook['tool.execute.before'](
-      { tool: 'task', sessionID: 'parent-1', callID: 'call-dispose-1' },
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-hang-1' },
       {
         args: {
           description: 'Run oracle',
@@ -8416,7 +8432,7 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
     );
     const output = {
       output: [
-        'task_id: ses-child-dispose-1',
+        'task_id: ses-child-hang-1',
         'state: completed',
         '',
         '<task_result>',
@@ -8425,27 +8441,1313 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
       ].join('\n'),
     };
     const completion = hook['tool.execute.after'](
-      { tool: 'task', sessionID: 'parent-1', callID: 'call-dispose-1' },
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-hang-1' },
       output,
     );
     await started;
-    await hook.event({ event: { type: 'server.instance.disposed' } });
-    acceptPrompt();
 
     const settled = await Promise.race([
       completion.then(() => true),
       new Promise<boolean>((resolve) =>
-        setTimeout(() => resolve(false), 1_500),
+        setTimeout(() => resolve(false), 1_000),
       ),
     ]);
     expect(settled).toBe(true);
+    expect(output.output).toContain('state="running"');
+    expect(output.output).toContain('Background task running');
+    expect(board.get('ses-child-hang-1')?.state).toBe('running');
+
+    // Exactly one promptAsync dispatch and no retry
     expect(promptAsync).toHaveBeenCalledTimes(1);
-    expect(abort).toHaveBeenCalledTimes(1);
-    expect(output.output).toContain('state="error"');
-    expect(board.get('ses-child-dispose-1')?.state).toBe('error');
+
+    // Before hard quarantine deadline, cancellation and relaunch leases remain fenced
+    expect(
+      board.acquireCancellationLease('ses-child-hang-1', 1),
+    ).toBeUndefined();
+    expect(board.acquireRelaunchLease('ses-child-hang-1', 1)).toBeUndefined();
+
+    // Elapse past the hard transport quarantine deadline (25ms)
+    await new Promise((resolve) => setTimeout(resolve, 35));
+
+    // Job remains running, marked statusUncertain with explicit diagnostic
+    const quarantinedJob = board.get('ses-child-hang-1');
+    expect(quarantinedJob?.state).toBe('running');
+    expect(quarantinedJob?.statusUncertain).toBe(true);
+    expect(quarantinedJob?.lastStatusError).toContain(
+      'quarantine deadline exceeded',
+    );
+
+    // Message lease was released: cancellation or relaunch lease can now be acquired
+    const cancellationLease = board.acquireCancellationLease(
+      'ses-child-hang-1',
+      1,
+    );
+    expect(cancellationLease).toBeDefined();
+    if (cancellationLease) {
+      board.releaseLease(cancellationLease);
+    }
+
+    const relaunchLease = board.acquireRelaunchLease('ses-child-hang-1', 1);
+    expect(relaunchLease).toBeDefined();
+    if (relaunchLease) {
+      board.releaseLease(relaunchLease);
+    }
+
+    // Fallback model was not committed
     expect(
       fallbackMgr.prepareNextModel({
-        sessionID: 'ses-child-dispose-1',
+        sessionID: 'ses-child-hang-1',
+        agentName: 'oracle',
+        currentModel: 'google/antigravity-gemini-3-flash',
+      })?.model,
+    ).toBe('google/antigravity-gemini-3.7-flash');
+
+    // RevivedRunTracker was not registered
+    expect(revivedTracker.isTracked('ses-child-hang-1', 1)).toBe(false);
+
+    // Duplicate observation of the quarantined incident does not dispatch promptAsync again
+    const duplicatePart = {
+      type: 'text',
+      synthetic: true,
+      text: [
+        '<task id="ses-child-hang-1" state="completed">',
+        '<summary>Background task completed: Run oracle</summary>',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+        '</task>',
+      ].join('\n'),
+    };
+    await hook['experimental.chat.messages.transform']({}, {
+      messages: [
+        {
+          info: {
+            role: 'user',
+            agent: 'orchestrator',
+            sessionID: 'parent-1',
+          },
+          parts: [duplicatePart],
+        },
+      ],
+    } as any);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('Regression A: quarantine generation 1, release lease, relaunch generation 2, then resolve generation-1 transport: abort not called, generation 2 unchanged/running, no model commit or tracker registration', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    let resolveGen1: () => void = () => {};
+    const gen1Deferred = new Promise<void>((resolve) => {
+      resolveGen1 = resolve;
+    });
+    let promptStarted = (): void => {};
+    const started = new Promise<void>((resolve) => {
+      promptStarted = resolve;
+    });
+    const promptAsync = mock(async () => {
+      promptStarted();
+      await gen1Deferred;
+      return {};
+    });
+    const abort = mock(async () => ({}));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-relaunch-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 25,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      syntheticQuotaCoordinator,
+      sessionClient: { promptAsync, messages: messagesMock, abort },
+    });
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-relaunch-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+    const output = {
+      output: [
+        'task_id: ses-child-relaunch-1',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+    const completion = hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-relaunch-1' },
+      output,
+    );
+    await started;
+    await completion;
+
+    // Wait past quarantine deadline (25ms) so generation 1 is quarantined and lease released
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    expect(board.get('ses-child-relaunch-1')?.statusUncertain).toBe(true);
+
+    // Relaunch as generation 2 on the same taskID
+    board.registerLaunch({
+      taskID: 'ses-child-relaunch-1',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      description: 'Run oracle gen 2',
+      background: true,
+    });
+    const gen2Job = board.get('ses-child-relaunch-1');
+    expect(gen2Job?.generation).toBe(2);
+    expect(gen2Job?.state).toBe('running');
+    expect(gen2Job?.statusUncertain).toBe(false);
+
+    // Generation 1 continuation transport now completes late
+    resolveGen1();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Abort must NOT be called
+    expect(abort).not.toHaveBeenCalled();
+
+    // Generation 2 remains running and untouched
+    const currentJob = board.get('ses-child-relaunch-1');
+    expect(currentJob?.generation).toBe(2);
+    expect(currentJob?.state).toBe('running');
+    expect(currentJob?.statusUncertain).toBe(false);
+
+    // Generation 1 did not commit model ladder or register tracker
+    expect(revivedTracker.isTracked('ses-child-relaunch-1', 1)).toBe(false);
+    expect(
+      fallbackMgr.prepareNextModel({
+        sessionID: 'ses-child-relaunch-1',
+        agentName: 'oracle',
+        currentModel: 'google/antigravity-gemini-3-flash',
+      })?.model,
+    ).toBe('google/antigravity-gemini-3.7-flash');
+  });
+
+  test('Regression B: task A and B pending; clear A; task A late settle cannot mutate or abort while task B settles normally and commits once', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    let resolveTaskA: () => void = () => {};
+    let resolveTaskB: () => void = () => {};
+    const taskADeferred = new Promise<void>((resolve) => {
+      resolveTaskA = resolve;
+    });
+    const taskBDeferred = new Promise<void>((resolve) => {
+      resolveTaskB = resolve;
+    });
+    const promptAsync = mock(async (req: any) => {
+      if (req.path?.id === 'task-A') {
+        await taskADeferred;
+      } else {
+        await taskBDeferred;
+      }
+      return {};
+    });
+    const abort = mock(async () => ({}));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-task-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 200,
+    });
+
+    board.registerLaunch({
+      taskID: 'task-A',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      description: 'task A',
+      background: true,
+    });
+    board.registerLaunch({
+      taskID: 'task-B',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      description: 'task B',
+      background: true,
+    });
+
+    // Launch quota incidents for task A and task B
+    const outcomeAPromise = syntheticQuotaCoordinator.handleTaskQuotaIncident({
+      taskID: 'task-A',
+      text: quotaText1,
+      failedMessageID: 'asst-task-A',
+      verifiedEvidence: {
+        model: 'google/antigravity-gemini-3-flash',
+        agent: 'oracle',
+        failedMessageID: 'asst-task-A',
+      },
+      client: { session: { promptAsync, messages: messagesMock, abort } },
+      directory: '/tmp',
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 200,
+    });
+
+    const outcomeBPromise = syntheticQuotaCoordinator.handleTaskQuotaIncident({
+      taskID: 'task-B',
+      text: quotaText1,
+      failedMessageID: 'asst-task-B',
+      verifiedEvidence: {
+        model: 'google/antigravity-gemini-3-flash',
+        agent: 'oracle',
+        failedMessageID: 'asst-task-B',
+      },
+      client: { session: { promptAsync, messages: messagesMock, abort } },
+      directory: '/tmp',
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 200,
+    });
+
+    await outcomeAPromise;
+    await outcomeBPromise;
+
+    const genA = board.get('task-A')?.generation ?? 1;
+    const genB = board.get('task-B')?.generation ?? 1;
+
+    // Clear session for task-A only
+    syntheticQuotaCoordinator.clearSession('task-A');
+    expect(
+      syntheticQuotaCoordinator.isIncidentActive('task-A', genA, 'asst-task-A'),
+    ).toBe(false);
+    expect(
+      syntheticQuotaCoordinator.isIncidentActive('task-B', genB, 'asst-task-B'),
+    ).toBe(true);
+
+    // Resolve both
+    resolveTaskA();
+    resolveTaskB();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    // Task A: did not abort, did not mutate or register
+    expect(abort).not.toHaveBeenCalled();
+    expect(revivedTracker.isTracked('task-A', genA)).toBe(false);
+
+    // Task B: settled normally, registered with revivedRunTracker, committed model
+    expect(revivedTracker.isTracked('task-B', genB)).toBe(true);
+    expect(
+      fallbackMgr.prepareNextModel({
+        sessionID: 'task-B',
+        agentName: 'oracle',
+        currentModel: 'google/antigravity-gemini-3.7-flash',
+      })?.model,
+    ).toBe('anthropic/claude-opus-4-5');
+  });
+
+  test('Regression C: dispose with pending transports: late resolve and late reject variants cannot recreate state, abort, commit, or retain leases', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    let resolveTask1: () => void = () => {};
+    let rejectTask2: (err: Error) => void = () => {};
+    const p1 = new Promise<void>((resolve) => {
+      resolveTask1 = resolve;
+    });
+    const p2 = new Promise<void>((_, reject) => {
+      rejectTask2 = reject;
+    });
+    const promptAsync = mock(async (req: any) => {
+      if (req.path?.id === 'task-1') {
+        await p1;
+      } else {
+        await p2;
+      }
+      return {};
+    });
+    const abort = mock(async () => ({}));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-task-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 200,
+    });
+
+    board.registerLaunch({
+      taskID: 'task-1',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      description: 'task 1',
+      background: true,
+    });
+    board.registerLaunch({
+      taskID: 'task-2',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      description: 'task 2',
+      background: true,
+    });
+
+    await syntheticQuotaCoordinator.handleTaskQuotaIncident({
+      taskID: 'task-1',
+      text: quotaText1,
+      failedMessageID: 'asst-1',
+      verifiedEvidence: {
+        model: 'google/antigravity-gemini-3-flash',
+        agent: 'oracle',
+        failedMessageID: 'asst-1',
+      },
+      client: { session: { promptAsync, messages: messagesMock, abort } },
+      directory: '/tmp',
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 200,
+    });
+
+    await syntheticQuotaCoordinator.handleTaskQuotaIncident({
+      taskID: 'task-2',
+      text: quotaText1,
+      failedMessageID: 'asst-2',
+      verifiedEvidence: {
+        model: 'google/antigravity-gemini-3-flash',
+        agent: 'oracle',
+        failedMessageID: 'asst-2',
+      },
+      client: { session: { promptAsync, messages: messagesMock, abort } },
+      directory: '/tmp',
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 200,
+    });
+
+    const gen1 = board.get('task-1')?.generation ?? 1;
+    const gen2 = board.get('task-2')?.generation ?? 1;
+
+    // Dispose coordinator
+    syntheticQuotaCoordinator.dispose();
+
+    // Settle both after disposal
+    resolveTask1();
+    rejectTask2(new Error('network error'));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(abort).not.toHaveBeenCalled();
+    expect(
+      syntheticQuotaCoordinator.isIncidentActive('task-1', gen1, 'asst-1'),
+    ).toBe(false);
+    expect(
+      syntheticQuotaCoordinator.isIncidentActive('task-2', gen2, 'asst-2'),
+    ).toBe(false);
+    expect(revivedTracker.isTracked('task-1', gen1)).toBe(false);
+    expect(revivedTracker.isTracked('task-2', gen2)).toBe(false);
+  });
+
+  test('Regression D: duplicate quarantined completion through BOTH synchronous tool-output and injected-completion paths renders running placeholder and keeps job running uncertain', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    let promptStarted = (): void => {};
+    const started = new Promise<void>((resolve) => {
+      promptStarted = resolve;
+    });
+    const promptAsync = mock(async () => {
+      promptStarted();
+      return new Promise(() => {}); // never resolves
+    });
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-dup-quarantine-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 25,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      syntheticQuotaCoordinator,
+      sessionClient: { promptAsync, messages: messagesMock },
+    });
+
+    // 1. Initial tool execution triggers quota incident and continuation
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-quar-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+    const output1 = {
+      output: [
+        'task_id: ses-child-quar-1',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+    const completion1 = hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-quar-1' },
+      output1,
+    );
+    await started;
+    await completion1;
+
+    // Elapse past quarantine deadline
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    const job = board.get('ses-child-quar-1');
+    expect(job?.state).toBe('running');
+    expect(job?.statusUncertain).toBe(true);
+
+    // 2. Synchronous tool duplicate observation of quarantined incident
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-quar-dup-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+    const outputDupSync = {
+      output: [
+        'task_id: ses-child-quar-1',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-quar-dup-1' },
+      outputDupSync,
+    );
+    // Must render running placeholder and NOT terminal error
+    expect(outputDupSync.output).toContain('state="running"');
+    expect(outputDupSync.output).not.toContain('state="error"');
+
+    // 3. Injected completion duplicate observation of quarantined incident
+    const syntheticPart = {
+      type: 'text',
+      synthetic: true,
+      text: [
+        '<task id="ses-child-quar-1" state="completed">',
+        '<summary>Background task completed: Run oracle</summary>',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+        '</task>',
+      ].join('\n'),
+    };
+    await hook['experimental.chat.messages.transform']({}, {
+      messages: [
+        {
+          info: {
+            role: 'user',
+            agent: 'orchestrator',
+            sessionID: 'parent-1',
+          },
+          parts: [syntheticPart],
+        },
+      ],
+    } as any);
+    // Must render running placeholder and NOT terminal error
+    expect(syntheticPart.text).toContain('state="running"');
+    expect(syntheticPart.text).not.toContain('state="error"');
+
+    // Exactly one promptAsync call total
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    // Board state remains running + statusUncertain
+    expect(board.get('ses-child-quar-1')?.state).toBe('running');
+    expect(board.get('ses-child-quar-1')?.statusUncertain).toBe(true);
+  });
+
+  test('late prompt accept after hard quarantine is ignored locally without model commit, tracker registration, or abort', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    let resolvePrompt: () => void = () => {};
+    const promptDeferred = new Promise<void>((resolve) => {
+      resolvePrompt = resolve;
+    });
+    let promptStarted = (): void => {};
+    const started = new Promise<void>((resolve) => {
+      promptStarted = resolve;
+    });
+    const promptAsync = mock(async () => {
+      promptStarted();
+      await promptDeferred;
+      return {};
+    });
+    const abort = mock(async () => ({}));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-late-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 25,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      syntheticQuotaCoordinator,
+      sessionClient: { promptAsync, messages: messagesMock, abort },
+    });
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-late-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+    const output = {
+      output: [
+        'task_id: ses-child-late-1',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+    const completion = hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-late-1' },
+      output,
+    );
+    await started;
+    await completion;
+
+    // Caller returned within bound with running placeholder
+    expect(output.output).toContain('state="running"');
+    expect(board.get('ses-child-late-1')?.state).toBe('running');
+
+    // Wait past quarantine deadline (25ms)
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    expect(board.get('ses-child-late-1')?.statusUncertain).toBe(true);
+
+    // Late resolution occurs post-quarantine
+    resolvePrompt();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Abort is NOT called
+    expect(abort).not.toHaveBeenCalled();
+
+    // Tracker is NOT registered
+    expect(revivedTracker.isTracked('ses-child-late-1', 1)).toBe(false);
+
+    // Fallback model was NOT committed
+    expect(
+      fallbackMgr.prepareNextModel({
+        sessionID: 'ses-child-late-1',
+        agentName: 'oracle',
+        currentModel: 'google/antigravity-gemini-3-flash',
+      })?.model,
+    ).toBe('google/antigravity-gemini-3.7-flash');
+
+    // Board job remains running and statusUncertain
+    const currentJob = board.get('ses-child-late-1');
+    expect(currentJob?.state).toBe('running');
+    expect(currentJob?.statusUncertain).toBe(true);
+  });
+
+  test('late prompt reject after hard quarantine does not overwrite quarantine disposition or terminalize uncertain job', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    let rejectPrompt: (err: Error) => void = () => {};
+    const promptDeferred = new Promise<void>((_, reject) => {
+      rejectPrompt = reject;
+    });
+    let promptStarted = (): void => {};
+    const started = new Promise<void>((resolve) => {
+      promptStarted = resolve;
+    });
+    const promptAsync = mock(async () => {
+      promptStarted();
+      await promptDeferred;
+      return {};
+    });
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-late-err-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 25,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      syntheticQuotaCoordinator,
+      sessionClient: { promptAsync, messages: messagesMock },
+    });
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-late-err-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+    const output = {
+      output: [
+        'task_id: ses-child-late-err-1',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+    const completion = hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-late-err-1' },
+      output,
+    );
+    await started;
+    await completion;
+
+    // Caller returned with running placeholder
+    expect(output.output).toContain('state="running"');
+    expect(board.get('ses-child-late-err-1')?.state).toBe('running');
+
+    // Wait past quarantine deadline (25ms)
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    expect(board.get('ses-child-late-err-1')?.statusUncertain).toBe(true);
+
+    // Late prompt rejection occurs post-quarantine
+    rejectPrompt(new Error('Connection terminated by host'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Remains running and statusUncertain (NOT terminalized to error)
+    const currentJob = board.get('ses-child-late-err-1');
+    expect(currentJob?.state).toBe('running');
+    expect(currentJob?.statusUncertain).toBe(true);
+
+    // Fallback model was unconsumed
+    expect(
+      fallbackMgr.prepareNextModel({
+        sessionID: 'ses-child-late-err-1',
+        agentName: 'oracle',
+        currentModel: 'google/antigravity-gemini-3-flash',
+      })?.model,
+    ).toBe('google/antigravity-gemini-3.7-flash');
+
+    // Quarantine disposition remains intact (duplicate observation does not dispatch again)
+    const duplicatePart = {
+      type: 'text',
+      synthetic: true,
+      text: [
+        '<task id="ses-child-late-err-1" state="completed">',
+        '<summary>Background task completed: Run oracle</summary>',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+        '</task>',
+      ].join('\n'),
+    };
+    await hook['experimental.chat.messages.transform']({}, {
+      messages: [
+        {
+          info: {
+            role: 'user',
+            agent: 'orchestrator',
+            sessionID: 'parent-1',
+          },
+          parts: [duplicatePart],
+        },
+      ],
+    } as any);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('late prompt accept before quarantine deadline commits once and registers tracker', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    let resolvePrompt: () => void = () => {};
+    const promptDeferred = new Promise<void>((resolve) => {
+      resolvePrompt = resolve;
+    });
+    let promptStarted = (): void => {};
+    const started = new Promise<void>((resolve) => {
+      promptStarted = resolve;
+    });
+    const promptAsync = mock(async () => {
+      promptStarted();
+      await promptDeferred;
+      return {};
+    });
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-late-valid-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 200,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      syntheticQuotaCoordinator,
+      sessionClient: { promptAsync, messages: messagesMock },
+    });
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-late-valid-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+    const output = {
+      output: [
+        'task_id: ses-child-late-valid-1',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+    const completion = hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-late-valid-1' },
+      output,
+    );
+    await started;
+    await completion;
+
+    // Caller returned within bound with running placeholder
+    expect(output.output).toContain('state="running"');
+    expect(board.get('ses-child-late-valid-1')?.state).toBe('running');
+
+    // Prompt resolves before quarantine deadline
+    resolvePrompt();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Tracker is registered and model ladder is committed
+    expect(revivedTracker.isTracked('ses-child-late-valid-1', 1)).toBe(true);
+    expect(
+      fallbackMgr.prepareNextModel({
+        sessionID: 'ses-child-late-valid-1',
+        agentName: 'oracle',
+        currentModel: 'google/antigravity-gemini-3.7-flash',
+      })?.model,
+    ).toBe('anthropic/claude-opus-4-5');
+    expect(board.get('ses-child-late-valid-1')?.state).toBe('running');
+    expect(board.get('ses-child-late-valid-1')?.statusUncertain).toBe(false);
+  });
+
+  test('late prompt reject before quarantine deadline terminalizes to error on board', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    let rejectPrompt: (err: Error) => void = () => {};
+    const promptDeferred = new Promise<void>((_, reject) => {
+      rejectPrompt = reject;
+    });
+    let promptStarted = (): void => {};
+    const started = new Promise<void>((resolve) => {
+      promptStarted = resolve;
+    });
+    const promptAsync = mock(async () => {
+      promptStarted();
+      await promptDeferred;
+      return {};
+    });
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-late-pre-err-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 200,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      syntheticQuotaCoordinator,
+      sessionClient: { promptAsync, messages: messagesMock },
+    });
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-late-pre-err-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+    const output = {
+      output: [
+        'task_id: ses-child-late-pre-err-1',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+    const completion = hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-late-pre-err-1' },
+      output,
+    );
+    await started;
+    await completion;
+
+    // Caller returned with running placeholder
+    expect(output.output).toContain('state="running"');
+    expect(board.get('ses-child-late-pre-err-1')?.state).toBe('running');
+
+    // Late prompt rejection occurs before quarantine deadline
+    rejectPrompt(new Error('Connection terminated by host'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Terminalizes to error on board
+    expect(board.get('ses-child-late-pre-err-1')?.state).toBe('error');
+    // Fallback model was unconsumed because transport rejected
+    expect(
+      fallbackMgr.prepareNextModel({
+        sessionID: 'ses-child-late-pre-err-1',
+        agentName: 'oracle',
+        currentModel: 'google/antigravity-gemini-3-flash',
+      })?.model,
+    ).toBe('google/antigravity-gemini-3.7-flash');
+  });
+
+  test('same-key recreation keeps the successor quarantine deadline effective after the old transport settles', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    const deferred: Array<() => void> = [];
+    const promptAsync = mock(
+      () =>
+        new Promise<Record<string, never>>((resolve) => {
+          deferred.push(() => resolve({}));
+        }),
+    );
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const coordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 1,
+      hardTransportTimeoutMs: 30,
+    });
+    board.registerLaunch({
+      taskID: 'same-key-child',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      description: 'same-key recreation',
+      background: true,
+    });
+    const incident = {
+      taskID: 'same-key-child',
+      text: quotaText1,
+      failedMessageID: 'same-message',
+      verifiedEvidence: {
+        model: 'google/antigravity-gemini-3-flash',
+        agent: 'oracle',
+        failedMessageID: 'same-message',
+      },
+      client: { session: { promptAsync } },
+      directory: '/tmp',
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+    };
+
+    await coordinator.handleTaskQuotaIncident(incident);
+    coordinator.clearSession('same-key-child');
+    await coordinator.handleTaskQuotaIncident(incident);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+
+    deferred[0]?.();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(board.get('same-key-child')?.statusUncertain).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    expect(board.get('same-key-child')).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
+      lastStatusError: 'Continuation transport quarantine deadline exceeded',
+    });
+    expect(
+      coordinator.isIncidentActive('same-key-child', 1, 'same-message'),
+    ).toBe(true);
+    expect(
+      fallbackMgr.prepareNextModel({
+        sessionID: 'same-key-child',
+        agentName: 'oracle',
+        currentModel: 'google/antigravity-gemini-3-flash',
+      })?.model,
+    ).toBe('google/antigravity-gemini-3.7-flash');
+
+    coordinator.clearSession('same-key-child');
+    expect(
+      coordinator.isIncidentActive('same-key-child', 1, 'same-message'),
+    ).toBe(false);
+    const cancellationLease = board.acquireCancellationLease(
+      'same-key-child',
+      1,
+    );
+    expect(cancellationLease).toBeDefined();
+    if (cancellationLease) board.releaseLease(cancellationLease);
+  });
+
+  test('transport acceptance after board ownership is dropped returns aborted rather than launched', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    let resolvePrompt = (): void => {};
+    const promptDeferred = new Promise<void>((resolve) => {
+      resolvePrompt = resolve;
+    });
+    const promptAsync = mock(async () => {
+      await promptDeferred;
+      return {};
+    });
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const coordinator = createSyntheticQuotaCoordinator({
+      callerWaitTimeoutMs: 100,
+      hardTransportTimeoutMs: 200,
+    });
+    board.registerLaunch({
+      taskID: 'dropped-owner-child',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      description: 'drop ownership race',
+      background: true,
+    });
+
+    const outcomePromise = coordinator.handleTaskQuotaIncident({
+      taskID: 'dropped-owner-child',
+      text: quotaText1,
+      failedMessageID: 'dropped-owner-message',
+      verifiedEvidence: {
+        model: 'google/antigravity-gemini-3-flash',
+        agent: 'oracle',
+        failedMessageID: 'dropped-owner-message',
+      },
+      client: { session: { promptAsync } },
+      directory: '/tmp',
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    board.drop('dropped-owner-child');
+    resolvePrompt();
+
+    await expect(outcomePromise).resolves.toMatchObject({
+      handled: true,
+      status: 'aborted',
+      failedMessageID: 'dropped-owner-message',
+    });
+    expect(board.get('dropped-owner-child')).toBeUndefined();
+    expect(
+      fallbackMgr.prepareNextModel({
+        sessionID: 'dropped-owner-child',
         agentName: 'oracle',
         currentModel: 'google/antigravity-gemini-3-flash',
       })?.model,

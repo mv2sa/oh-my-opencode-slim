@@ -11,6 +11,7 @@ import type { ForegroundFallbackManager } from '../foreground-fallback';
 import {
   type AntigravityMessageEvidence,
   isAntigravitySyntheticQuotaMessage,
+  isSyntheticQuotaContinuationActiveStatus,
   type SyntheticQuotaCoordinator,
 } from '../foreground-fallback/synthetic-quota';
 
@@ -254,10 +255,7 @@ export function createRevivedRunTracker(options: {
           pendingAgent:
             typeof lastInfo.agent === 'string' ? lastInfo.agent : undefined,
         });
-      if (
-        outcome.status === 'launched' ||
-        outcome.status === 'already_active'
-      ) {
+      if (isSyntheticQuotaContinuationActiveStatus(outcome.status)) {
         run.baselineMessageID = outcome.failedMessageID ?? failedMessageID;
         return false;
       }
