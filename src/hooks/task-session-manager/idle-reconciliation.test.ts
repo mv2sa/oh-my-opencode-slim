@@ -6,7 +6,10 @@ async function flushChildIdleReconcile(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 5));
 }
 
-function createHarness(options?: { stopConfirmationGraceMs?: number }) {
+function createHarness(options?: {
+  stopConfirmationGraceMs?: number;
+  isParentActivityBlocking?: () => boolean;
+}) {
   const board = new BackgroundJobBoard();
   const terminalListener = mock(() => {});
   board.addTerminalStateListener(terminalListener);
@@ -17,6 +20,7 @@ function createHarness(options?: { stopConfirmationGraceMs?: number }) {
     reconcileInjectedTerminalJobs: mock(() => {}),
     idleReconcileDelayMs: 0,
     stopConfirmationGraceMs: options?.stopConfirmationGraceMs ?? 0,
+    isParentActivityBlocking: options?.isParentActivityBlocking,
     hasInputWait: () => false,
     getIdleSessionToken: () => Symbol('idle'),
     isCurrentIdleSessionToken: () => true,
@@ -114,6 +118,36 @@ describe('idle reconciliation stop confirmation', () => {
     await observeIdle(reconciler, 20, generation);
     expect(board.get('child-1')).toMatchObject({ state: 'running' });
     expect(board.get('child-1')?.stopConfirmationStartedAt).toBe(21);
+    expect(terminalListener).not.toHaveBeenCalled();
+  });
+
+  test('parent activity blocks and resets child stop confirmation', async () => {
+    let parentBusy = false;
+    const { board, reconciler, terminalListener } = createHarness({
+      isParentActivityBlocking: () => parentBusy,
+    });
+    const generation = board.get('child-1')?.generation ?? 1;
+
+    await observeIdle(reconciler, 10, generation);
+    expect(board.get('child-1')?.stopConfirmationStartedAt).toBe(11);
+
+    parentBusy = true;
+    await observeIdle(reconciler, 20, generation);
+    await observeIdle(reconciler, 30, generation);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      stopConfirmationStartedAt: undefined,
+      lastStatusError:
+        'Parent session is active; terminal task delivery is pending.',
+    });
+    expect(terminalListener).not.toHaveBeenCalled();
+
+    parentBusy = false;
+    await observeIdle(reconciler, 40, generation);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      stopConfirmationStartedAt: 41,
+    });
     expect(terminalListener).not.toHaveBeenCalled();
   });
 });

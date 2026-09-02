@@ -172,6 +172,8 @@ export function createTaskSessionManagerHook(
     idleReconcileDelayMs?: number;
     /** Test seam only; production uses the runtime reconciliation delay. */
     runtimeStatusReconcileDelayMs?: number;
+    /** Confirmed-idle grace; production supplies the configured value. */
+    stopConfirmationMs?: number;
     revivedRunTracker?: RevivedRunTracker;
   },
 ) {
@@ -210,6 +212,84 @@ export function createTaskSessionManagerHook(
   >();
   /** Managed sessions with a deferred inline 401/410 awaiting fallback outcome. */
   const deferredInlineErrors = new Set<string>();
+  type ParentActivity = {
+    active: boolean;
+    revision: number;
+    observedAt?: number;
+  };
+  const parentActivity = new Map<string, ParentActivity>();
+
+  const updateParentActivity = (
+    parentSessionID: string,
+    active: boolean,
+    observedAt?: number,
+  ): boolean => {
+    const existing = parentActivity.get(parentSessionID);
+    if (
+      existing?.observedAt !== undefined &&
+      observedAt !== undefined &&
+      observedAt < existing.observedAt
+    ) {
+      return false;
+    }
+    parentActivity.set(parentSessionID, {
+      active,
+      revision: (existing?.revision ?? 0) + 1,
+      observedAt: observedAt ?? existing?.observedAt,
+    });
+    return true;
+  };
+
+  const isParentActivityBlocking = (parentSessionID: string): boolean =>
+    parentActivity.get(parentSessionID)?.active === true;
+
+  const clearParentActivityIfUnchanged = (
+    parentSessionID: string,
+    expectedRevision: number,
+  ): void => {
+    const existing = parentActivity.get(parentSessionID);
+    if (!existing?.active || existing.revision !== expectedRevision) return;
+    parentActivity.set(parentSessionID, {
+      ...existing,
+      active: false,
+      revision: existing.revision + 1,
+    });
+  };
+
+  const parentOwnsTrackedJobs = (parentSessionID: string): boolean =>
+    backgroundJobBoard.list(parentSessionID).length > 0;
+
+  const eventActivityAt = (properties: {
+    activityAt?: number;
+    timestamp?: number;
+    time?: { updated?: number };
+    info?: {
+      activityAt?: number;
+      timestamp?: number;
+      time?: { updated?: number };
+    };
+  }): number | undefined => {
+    const candidates = [
+      properties.activityAt,
+      properties.timestamp,
+      properties.time?.updated,
+      properties.info?.activityAt,
+      properties.info?.timestamp,
+      properties.info?.time?.updated,
+    ];
+    return candidates.find(
+      (value): value is number =>
+        typeof value === 'number' && Number.isFinite(value),
+    );
+  };
+
+  const clearChildStopConfirmations = (parentSessionID: string): void => {
+    for (const job of backgroundJobBoard.list(parentSessionID)) {
+      if (job.state === 'running') {
+        backgroundJobBoard.clearStopConfirmation(job.taskID, job.generation);
+      }
+    }
+  };
 
   // Forward refs for circular deps — set after corresponding managers exist.
   // These are captured by closure in createIdleReconciler and only called
@@ -237,6 +317,8 @@ export function createTaskSessionManagerHook(
     },
     idleReconcileDelayMs:
       options.idleReconcileDelayMs ?? IDLE_RECONCILE_DELAY_MS,
+    stopConfirmationGraceMs: options.stopConfirmationMs,
+    isParentActivityBlocking,
     isFallbackInProgress: options.isFallbackInProgress,
     hasInputWait: (s) => hasInputWait(s),
     getIdleSessionToken: (s) => getIdleSessionToken(s),
@@ -248,6 +330,15 @@ export function createTaskSessionManagerHook(
     input: _ctx,
     backgroundJobBoard,
     delayMs: options.runtimeStatusReconcileDelayMs,
+    stopConfirmationGraceMs: options.stopConfirmationMs,
+    getParentActivity: (parentSessionID) => {
+      const activity = parentActivity.get(parentSessionID);
+      return activity
+        ? { active: activity.active, revision: activity.revision }
+        : undefined;
+    },
+    clearParentActivityIfUnchanged,
+    isParentFallbackInProgress: options.isFallbackInProgress,
     taskContextTracker,
   });
 
@@ -300,6 +391,16 @@ export function createTaskSessionManagerHook(
       taskContextTracker.clearSession(sessionId);
       taskContextTracker.prune(backgroundJobBoard);
       pendingCallTracker.clearSession(sessionId);
+      if (
+        options.isFallbackInProgress?.(sessionId) &&
+        parentOwnsTrackedJobs(sessionId)
+      ) {
+        if (updateParentActivity(sessionId, true)) {
+          clearChildStopConfirmations(sessionId);
+        }
+      } else {
+        parentActivity.delete(sessionId);
+      }
     });
   }
 
@@ -493,16 +594,75 @@ export function createTaskSessionManagerHook(
       event: {
         type: string;
         properties?: {
-          info?: { id?: string; parentID?: string; agent?: string };
+          info?: {
+            id?: string;
+            parentID?: string;
+            agent?: string;
+            activityAt?: number;
+            timestamp?: number;
+            time?: { updated?: number };
+          };
           id?: string;
           requestID?: string;
           sessionID?: string;
+          activityAt?: number;
+          timestamp?: number;
+          time?: { updated?: number };
           status?: { type?: string };
           error?: { name?: string };
           part?: unknown;
         };
       };
     }): Promise<void> => {
+      const eventSessionID =
+        input.event.properties?.info?.id ?? input.event.properties?.sessionID;
+      const eventStatus = input.event.properties?.status?.type;
+      const ownsTrackedJobs = eventSessionID
+        ? parentOwnsTrackedJobs(eventSessionID)
+        : false;
+      const activityObservedAt = input.event.properties
+        ? eventActivityAt(input.event.properties)
+        : undefined;
+      if (
+        eventSessionID &&
+        ownsTrackedJobs &&
+        input.event.type === 'session.status' &&
+        (eventStatus === 'busy' || eventStatus === 'retry')
+      ) {
+        if (updateParentActivity(eventSessionID, true, activityObservedAt)) {
+          clearChildStopConfirmations(eventSessionID);
+        }
+      } else if (
+        eventSessionID &&
+        ownsTrackedJobs &&
+        input.event.type === 'session.error' &&
+        (options.isFallbackInProgress?.(eventSessionID) ||
+          options.willAttemptFallback?.(eventSessionID))
+      ) {
+        if (updateParentActivity(eventSessionID, true, activityObservedAt)) {
+          clearChildStopConfirmations(eventSessionID);
+        }
+      } else if (
+        eventSessionID &&
+        (input.event.type === 'session.idle' ||
+          (input.event.type === 'session.status' && eventStatus === 'idle') ||
+          input.event.type === 'session.error' ||
+          input.event.type === 'session.deleted')
+      ) {
+        if (
+          input.event.type === 'session.deleted' &&
+          options.isFallbackInProgress?.(eventSessionID)
+        ) {
+          if (updateParentActivity(eventSessionID, true, activityObservedAt)) {
+            clearChildStopConfirmations(eventSessionID);
+          }
+        } else if (input.event.type === 'session.deleted') {
+          parentActivity.delete(eventSessionID);
+        } else if (ownsTrackedJobs) {
+          updateParentActivity(eventSessionID, false, activityObservedAt);
+        }
+      }
+
       if (input.event.type === 'session.deleted') {
         const sessionID =
           input.event.properties?.info?.id ?? input.event.properties?.sessionID;
@@ -518,6 +678,7 @@ export function createTaskSessionManagerHook(
       }
 
       if (input.event.type === 'server.instance.disposed') {
+        parentActivity.clear();
         runtimeStatusReconciler.dispose();
       }
       return handleEvent(input, {

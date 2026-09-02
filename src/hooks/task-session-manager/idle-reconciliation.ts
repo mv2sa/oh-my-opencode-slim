@@ -2,8 +2,8 @@ import type { BackgroundJobStore, ContextFile } from '../../utils';
 import { log } from '../../utils/logger';
 import type { RevivedRunTracker } from './revived-run-tracker';
 import {
+  DEFAULT_STOP_CONFIRMATION_MS,
   observeNonBusyRuntime,
-  STOP_CONFIRMATION_GRACE_MS,
 } from './stop-confirmation';
 
 export function createIdleReconciler(options: {
@@ -13,6 +13,7 @@ export function createIdleReconciler(options: {
   onErrorTerminalize?: (sessionID: string) => void;
   idleReconcileDelayMs: number;
   stopConfirmationGraceMs?: number;
+  isParentActivityBlocking?: (parentSessionID: string) => boolean;
   isFallbackInProgress?: (sessionID: string) => boolean;
   hasInputWait: (sessionID: string) => boolean;
   getIdleSessionToken: (sessionID: string) => symbol;
@@ -94,9 +95,14 @@ export function createIdleReconciler(options: {
         taskID: sessionID,
         observedAt: idleObservedAt,
         generation: observedGeneration,
-        graceMs: options.stopConfirmationGraceMs ?? STOP_CONFIRMATION_GRACE_MS,
-        lastStatusError:
-          'Runtime session is idle; task termination is unconfirmed.',
+        graceMs:
+          options.stopConfirmationGraceMs ?? DEFAULT_STOP_CONFIRMATION_MS,
+        lastStatusError: options.isParentActivityBlocking?.(job.parentSessionID)
+          ? 'Parent session is active; terminal task delivery is pending.'
+          : 'Runtime session is idle; task termination is unconfirmed.',
+        confirmationBlocked: options.isParentActivityBlocking?.(
+          job.parentSessionID,
+        ),
         taskContextTracker: options.taskContextTracker,
       });
       if (updated?.state === 'stopped') {

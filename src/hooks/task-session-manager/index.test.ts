@@ -110,6 +110,7 @@ type HookOptions = {
   sessionClient?: Record<string, unknown>;
   idleReconcileDelayMs?: number;
   runtimeStatusReconcileDelayMs?: number;
+  stopConfirmationMs?: number;
   isFallbackInProgress?: (sessionID: string) => boolean;
   willAttemptFallback?: (sessionID: string) => boolean;
   coordinator?: SessionLifecycle;
@@ -144,6 +145,7 @@ function createHook(options?: HookOptions) {
       coordinator: options?.coordinator,
       idleReconcileDelayMs: options?.idleReconcileDelayMs,
       runtimeStatusReconcileDelayMs: options?.runtimeStatusReconcileDelayMs,
+      stopConfirmationMs: options?.stopConfirmationMs,
     },
   );
 
@@ -5029,6 +5031,407 @@ describe('task-session-manager hook', () => {
     });
   });
 
+  test('parent busy blocks false stop until canonical completion arrives', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-busy-parent',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'finish while parent is busy',
+    });
+    const terminalStates: string[] = [];
+    board.addTerminalStateListener((taskID) => {
+      terminalStates.push(board.get(taskID)?.state ?? 'missing');
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      shouldManageSession: (id) => id === 'parent-1',
+      idleReconcileDelayMs: 0,
+      stopConfirmationMs: 0,
+      runtimeStatusReconcileDelayMs: 60_000,
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'parent-1', status: { type: 'busy' } },
+      },
+    });
+    for (const _ of [0, 1]) {
+      await hook.event({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'child-busy-parent' },
+        },
+      });
+      await flushChildIdleReconcile();
+    }
+
+    expect(board.get('child-busy-parent')).toMatchObject({
+      state: 'running',
+      lastStatusError:
+        'Parent session is active; terminal task delivery is pending.',
+    });
+    expect(
+      board.get('child-busy-parent')?.stopConfirmationStartedAt,
+    ).toBeUndefined();
+    expect(terminalStates).toEqual([]);
+
+    const completionPart = {
+      type: 'text',
+      id: 'busy-parent-completion',
+      synthetic: true,
+      text: [
+        '<task id="child-busy-parent" state="completed">',
+        '<summary>Background task completed: finish while parent is busy</summary>',
+        '<task_result>',
+        'delivered after the parent turn',
+        '</task_result>',
+        '</task>',
+      ].join('\n'),
+    };
+    await hook.event({
+      event: {
+        type: 'message.part.updated',
+        properties: { part: completionPart },
+      },
+    });
+    const messages = {
+      messages: [
+        {
+          info: {
+            role: 'user',
+            agent: 'orchestrator',
+            sessionID: 'parent-1',
+          },
+          parts: [completionPart],
+        },
+      ],
+    };
+    await transformMessages(hook, messages as never);
+
+    expect(board.get('child-busy-parent')).toMatchObject({
+      state: 'completed',
+      terminalUnreconciled: true,
+      resultSummary: 'delivered after the parent turn',
+    });
+    expect(terminalStates).toEqual(['completed']);
+  });
+
+  test('tracks busy parent by child ownership rather than current agent mode', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-mode-switch',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      shouldManageSession: () => false,
+      idleReconcileDelayMs: 0,
+      stopConfirmationMs: 0,
+      runtimeStatusReconcileDelayMs: 60_000,
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'parent-1', status: { type: 'busy' } },
+      },
+    });
+    await hook.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: 'child-mode-switch' },
+      },
+    });
+    await flushChildIdleReconcile();
+
+    expect(board.get('child-mode-switch')).toMatchObject({
+      state: 'running',
+      lastStatusError:
+        'Parent session is active; terminal task delivery is pending.',
+    });
+    expect(
+      board.get('child-mode-switch')?.stopConfirmationStartedAt,
+    ).toBeUndefined();
+  });
+
+  test('parent retry resets the clock and parent idle starts fresh grace', async () => {
+    const board = new BackgroundJobBoard();
+    const job = board.registerLaunch({
+      taskID: 'child-parent-retry',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    board.noteStopConfirmation(job.taskID, 1, job.generation);
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      idleReconcileDelayMs: 0,
+      stopConfirmationMs: 0,
+      runtimeStatusReconcileDelayMs: 60_000,
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'parent-1', status: { type: 'retry' } },
+      },
+    });
+    expect(board.get(job.taskID)?.stopConfirmationStartedAt).toBeUndefined();
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'parent-1', status: { type: 'idle' } },
+      },
+    });
+    await hook.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: job.taskID },
+      },
+    });
+    await flushChildIdleReconcile();
+
+    expect(board.get(job.taskID)).toMatchObject({ state: 'running' });
+    expect(board.get(job.taskID)?.stopConfirmationStartedAt).toBeDefined();
+  });
+
+  test.each(['session.idle', 'session.error', 'session.deleted'] as const)(
+    '%s releases a tracked parent barrier',
+    async (releaseEvent) => {
+      const board = new BackgroundJobBoard();
+      const job = board.registerLaunch({
+        taskID: `child-${releaseEvent}`,
+        parentSessionID: 'parent-1',
+        agent: 'fixer',
+      });
+      const { hook } = createHook({
+        backgroundJobBoard: board,
+        idleReconcileDelayMs: 0,
+        stopConfirmationMs: 0,
+        runtimeStatusReconcileDelayMs: 60_000,
+      });
+      await hook.event({
+        event: {
+          type: 'session.status',
+          properties: {
+            sessionID: 'parent-1',
+            status: { type: 'busy' },
+          },
+        },
+      });
+      await hook.event({
+        event: { type: releaseEvent, properties: { sessionID: 'parent-1' } },
+      });
+      await hook.event({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: job.taskID },
+        },
+      });
+      await flushChildIdleReconcile();
+
+      expect(board.get(job.taskID)).toMatchObject({ state: 'running' });
+      expect(board.get(job.taskID)?.stopConfirmationStartedAt).toBeDefined();
+    },
+  );
+
+  test('stale busy event cannot override newer parent idle', async () => {
+    const board = new BackgroundJobBoard();
+    const job = board.registerLaunch({
+      taskID: 'child-stale-busy',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      idleReconcileDelayMs: 0,
+      stopConfirmationMs: 0,
+      runtimeStatusReconcileDelayMs: 60_000,
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'parent-1',
+          activityAt: 300,
+          status: { type: 'idle' },
+        },
+      },
+    });
+    await hook.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: job.taskID },
+      },
+    });
+    await flushChildIdleReconcile();
+    const confirmationStartedAt = board.get(
+      job.taskID,
+    )?.stopConfirmationStartedAt;
+    expect(confirmationStartedAt).toBeDefined();
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'parent-1',
+          activityAt: 200,
+          status: { type: 'busy' },
+        },
+      },
+    });
+
+    expect(board.get(job.taskID)).toMatchObject({ state: 'running' });
+    expect(board.get(job.taskID)?.stopConfirmationStartedAt).toBe(
+      confirmationStartedAt,
+    );
+  });
+
+  test('fallback-owned parent error keeps terminal-delivery barrier active', async () => {
+    const board = new BackgroundJobBoard();
+    const job = board.registerLaunch({
+      taskID: 'child-parent-fallback',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      idleReconcileDelayMs: 0,
+      stopConfirmationMs: 0,
+      runtimeStatusReconcileDelayMs: 60_000,
+      willAttemptFallback: (sessionID) => sessionID === 'parent-1',
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'parent-1' },
+      },
+    });
+    await hook.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: job.taskID },
+      },
+    });
+    await flushChildIdleReconcile();
+
+    expect(board.get(job.taskID)).toMatchObject({
+      state: 'running',
+      lastStatusError:
+        'Parent session is active; terminal task delivery is pending.',
+    });
+    expect(board.get(job.taskID)?.stopConfirmationStartedAt).toBeUndefined();
+  });
+
+  test('fallback deletion retains barrier through lifecycle callback and status omission', async () => {
+    const coordinator = new SessionLifecycle(() => {});
+    const board = new BackgroundJobBoard();
+    const job = board.registerLaunch({
+      taskID: 'child-parent-fallback-delete',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    let fallbackActive = true;
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      coordinator,
+      sessionStatus: { [job.taskID]: { type: 'idle' } },
+      idleReconcileDelayMs: 0,
+      stopConfirmationMs: 100,
+      runtimeStatusReconcileDelayMs: 0,
+      isFallbackInProgress: (sessionID) =>
+        sessionID === 'parent-1' && fallbackActive,
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'parent-1', status: { type: 'busy' } },
+      },
+    });
+    await hook.event({
+      event: {
+        type: 'session.deleted',
+        properties: { sessionID: 'parent-1' },
+      },
+    });
+    coordinator.dispatchSessionDeleted('parent-1');
+
+    for (const _ of [0, 1]) {
+      await hook.event({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: job.taskID },
+        },
+      });
+      await flushChildIdleReconcile();
+    }
+    expect(board.get(job.taskID)).toMatchObject({
+      state: 'running',
+      lastStatusError:
+        'Parent session is active; terminal task delivery is pending.',
+    });
+    expect(board.get(job.taskID)?.stopConfirmationStartedAt).toBeUndefined();
+
+    fallbackActive = false;
+    await hook.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: job.taskID },
+      },
+    });
+    await flushChildIdleReconcile();
+    expect(board.get(job.taskID)).toMatchObject({ state: 'running' });
+    expect(board.get(job.taskID)?.stopConfirmationStartedAt).toBeDefined();
+
+    await new Promise((resolve) => setTimeout(resolve, 110));
+    await hook.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: job.taskID },
+      },
+    });
+    await flushChildIdleReconcile();
+    expect(board.get(job.taskID)).toMatchObject({ state: 'stopped' });
+  });
+
+  test('disposal clears parent activity and pending idle mutation', async () => {
+    const board = new BackgroundJobBoard();
+    const job = board.registerLaunch({
+      taskID: 'child-disposed-parent',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      idleReconcileDelayMs: 20,
+      stopConfirmationMs: 0,
+      runtimeStatusReconcileDelayMs: 60_000,
+    });
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'parent-1', status: { type: 'busy' } },
+      },
+    });
+    await hook.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: job.taskID },
+      },
+    });
+    await hook.event({ event: { type: 'server.instance.disposed' } });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(board.get(job.taskID)).toMatchObject({ state: 'running' });
+    expect(board.get(job.taskID)?.stopConfirmationStartedAt).toBeUndefined();
+  });
+
   test('ignores an idle observation after the child has relaunched', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({
@@ -5909,7 +6312,9 @@ describe('task-session-manager hook', () => {
       },
     });
     const hostOrigin = [
-      ...getBackgroundJobLifecycleLedger(board).syntheticTerminalOccurrences.values(),
+      ...getBackgroundJobLifecycleLedger(
+        board,
+      ).syntheticTerminalOccurrences.values(),
     ][0];
     if (!hostOrigin) throw new Error('host origin was not recorded');
 

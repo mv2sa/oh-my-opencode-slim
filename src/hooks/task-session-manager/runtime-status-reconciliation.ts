@@ -6,11 +6,16 @@ import {
 } from '../../utils';
 import { log } from '../../utils/logger';
 import {
+  DEFAULT_STOP_CONFIRMATION_MS,
   observeNonBusyRuntime,
-  STOP_CONFIRMATION_GRACE_MS,
 } from './stop-confirmation';
 
 export const RUNTIME_STATUS_RECONCILE_DELAY_MS = 5_000;
+
+export type ParentActivityObservation = {
+  active: boolean;
+  revision: number;
+};
 
 export function createRuntimeStatusReconciler(options: {
   input: PluginInput;
@@ -18,6 +23,14 @@ export function createRuntimeStatusReconciler(options: {
   delayMs?: number;
   statusTimeoutMs?: number;
   stopConfirmationGraceMs?: number;
+  getParentActivity?: (
+    parentSessionID: string,
+  ) => ParentActivityObservation | undefined;
+  clearParentActivityIfUnchanged?: (
+    parentSessionID: string,
+    expectedRevision: number,
+  ) => void;
+  isParentFallbackInProgress?: (parentSessionID: string) => boolean;
   taskContextTracker: {
     pendingManagedTaskIds: Set<string>;
     contextFilesForPrompt(taskId: string): ContextFile[];
@@ -56,6 +69,16 @@ export function createRuntimeStatusReconciler(options: {
       .filter((job) => job.state === 'running');
     if (running.length === 0) return;
 
+    const parentRevisionsAtRequest = new Map<string, number | undefined>();
+    for (const job of running) {
+      if (!parentRevisionsAtRequest.has(job.parentSessionID)) {
+        parentRevisionsAtRequest.set(
+          job.parentSessionID,
+          options.getParentActivity?.(job.parentSessionID)?.revision,
+        );
+      }
+    }
+
     const requestStartedAt = Date.now();
     const snapshot = await getRuntimeSessionStatusSnapshot(options.input, {
       timeoutMs: options.statusTimeoutMs,
@@ -63,7 +86,7 @@ export function createRuntimeStatusReconciler(options: {
     if (disposed) return;
     const observedAt = Date.now();
     const graceMs =
-      options.stopConfirmationGraceMs ?? STOP_CONFIRMATION_GRACE_MS;
+      options.stopConfirmationGraceMs ?? DEFAULT_STOP_CONFIRMATION_MS;
     if (snapshot.error) {
       for (const job of running) {
         options.backgroundJobBoard.markStatusUncertain(
@@ -109,17 +132,59 @@ export function createRuntimeStatusReconciler(options: {
         continue;
       }
 
-      const lastStatusError =
-        status === undefined
-          ? 'Runtime status response did not contain a live session state; task termination is unconfirmed.'
-          : 'Runtime session is idle; task termination is unconfirmed.';
+      if (status === undefined) {
+        options.backgroundJobBoard.markStatusUncertain(
+          job.taskID,
+          'Runtime status response did not contain a live session state; task termination is unconfirmed.',
+          job.generation,
+        );
+        continue;
+      }
+
+      const parentStatus = runtimeSessionStatus(
+        snapshot,
+        current.parentSessionID,
+      );
+      const parentActivity = options.getParentActivity?.(
+        current.parentSessionID,
+      );
+      const parentRevisionAtRequest = parentRevisionsAtRequest.get(
+        current.parentSessionID,
+      );
+      const parentActivityChangedDuringRequest =
+        parentActivity !== undefined &&
+        parentActivity.revision !== parentRevisionAtRequest;
+      const snapshotActive =
+        parentStatus === 'busy' || parentStatus === 'retry';
+      const parentFallbackInProgress =
+        options.isParentFallbackInProgress?.(current.parentSessionID) === true;
+      const parentActivityBlocking = parentFallbackInProgress
+        ? true
+        : parentActivityChangedDuringRequest
+          ? parentActivity?.active === true
+          : snapshotActive;
+      if (
+        !parentActivityBlocking &&
+        !parentFallbackInProgress &&
+        parentActivity?.active === true &&
+        !parentActivityChangedDuringRequest
+      ) {
+        options.clearParentActivityIfUnchanged?.(
+          current.parentSessionID,
+          parentActivity.revision,
+        );
+      }
+
       const updated = observeNonBusyRuntime({
         backgroundJobBoard: options.backgroundJobBoard,
         taskID: job.taskID,
         observedAt: requestStartedAt,
         generation: job.generation,
         graceMs,
-        lastStatusError,
+        lastStatusError: parentActivityBlocking
+          ? 'Parent session is active; terminal task delivery is pending.'
+          : 'Runtime session is idle; task termination is unconfirmed.',
+        confirmationBlocked: parentActivityBlocking,
         taskContextTracker: options.taskContextTracker,
       });
       if (updated?.state === 'stopped') {

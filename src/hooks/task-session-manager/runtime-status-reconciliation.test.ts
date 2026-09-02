@@ -6,6 +6,13 @@ function createReconciler(
   status: () => Promise<unknown>,
   statusTimeoutMs?: number,
   stopConfirmationGraceMs?: number,
+  parentActivity?: {
+    get: (
+      parentSessionID: string,
+    ) => { active: boolean; revision: number } | undefined;
+    clear?: (parentSessionID: string, expectedRevision: number) => void;
+    fallback?: (parentSessionID: string) => boolean;
+  },
 ) {
   const board = new BackgroundJobBoard();
   const contextFilesForPrompt = mock(() => []);
@@ -18,6 +25,9 @@ function createReconciler(
     backgroundJobBoard: board,
     statusTimeoutMs,
     stopConfirmationGraceMs,
+    getParentActivity: parentActivity?.get,
+    clearParentActivityIfUnchanged: parentActivity?.clear,
+    isParentFallbackInProgress: parentActivity?.fallback,
     taskContextTracker: {
       pendingManagedTaskIds: new Set(['child-1']),
       contextFilesForPrompt,
@@ -77,6 +87,204 @@ describe('runtime status reconciliation', () => {
     expect(board.resolveReusable('parent-1', 'fix-1', 'fixer')).toBeUndefined();
     expect(contextFilesForPrompt).not.toHaveBeenCalled();
     expect(prune).not.toHaveBeenCalled();
+  });
+
+  test('repeated absence never starts or advances stop confirmation', async () => {
+    const { board, reconciler } = createReconciler(
+      async () => ({ data: {} }),
+      undefined,
+      0,
+    );
+
+    await reconciler.reconcile();
+    await reconciler.reconcile();
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
+    });
+    expect(board.get('child-1')?.stopConfirmationStartedAt).toBeUndefined();
+  });
+
+  test.each(['busy', 'retry'] as const)(
+    'parent %s blocks child stop confirmation',
+    async (parentStatus) => {
+      const { board, reconciler } = createReconciler(
+        async () => ({
+          data: {
+            'child-1': { type: 'idle' },
+            'parent-1': { type: parentStatus },
+          },
+        }),
+        undefined,
+        0,
+      );
+      const listener = mock(() => {});
+      board.addTerminalStateListener(listener);
+
+      await reconciler.reconcile();
+      await reconciler.reconcile();
+
+      expect(board.get('child-1')).toMatchObject({
+        state: 'running',
+        lastStatusError:
+          'Parent session is active; terminal task delivery is pending.',
+      });
+      expect(board.get('child-1')?.stopConfirmationStartedAt).toBeUndefined();
+      expect(listener).not.toHaveBeenCalled();
+    },
+  );
+
+  test('parent activity resets the clock and requires fresh idle grace', async () => {
+    let parentStatus: 'busy' | 'idle' = 'idle';
+    const { board, reconciler } = createReconciler(
+      async () => ({
+        data: {
+          'child-1': { type: 'idle' },
+          'parent-1': { type: parentStatus },
+        },
+      }),
+      undefined,
+      0,
+    );
+    const listener = mock(() => {});
+    board.addTerminalStateListener(listener);
+
+    await reconciler.reconcile();
+    expect(board.get('child-1')?.stopConfirmationStartedAt).toBeDefined();
+
+    parentStatus = 'busy';
+    await reconciler.reconcile();
+    expect(board.get('child-1')?.stopConfirmationStartedAt).toBeUndefined();
+
+    parentStatus = 'idle';
+    await reconciler.reconcile();
+    expect(board.get('child-1')).toMatchObject({ state: 'running' });
+    expect(board.get('child-1')?.stopConfirmationStartedAt).toBeDefined();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  test('successful snapshot releases stale local parent activity', async () => {
+    let activity = { active: true, revision: 1 };
+    const clear = mock((_parentSessionID: string, expectedRevision: number) => {
+      if (activity.revision === expectedRevision) {
+        activity = { active: false, revision: activity.revision + 1 };
+      }
+    });
+    const { board, reconciler } = createReconciler(
+      async () => ({ data: { 'child-1': { type: 'idle' } } }),
+      undefined,
+      0,
+      { get: () => activity, clear },
+    );
+
+    await reconciler.reconcile();
+    expect(clear).toHaveBeenCalledWith('parent-1', 1);
+    expect(board.get('child-1')).toMatchObject({ state: 'running' });
+    expect(board.get('child-1')?.stopConfirmationStartedAt).toBeDefined();
+
+    await reconciler.reconcile();
+    expect(board.get('child-1')).toMatchObject({ state: 'stopped' });
+  });
+
+  test('parent activity beginning during status lookup blocks stale snapshot', async () => {
+    const response = deferred<unknown>();
+    let activity = { active: false, revision: 1 };
+    const { board, reconciler } = createReconciler(
+      () => response.promise,
+      undefined,
+      0,
+      { get: () => activity },
+    );
+
+    const reconciliation = reconciler.reconcile();
+    await Promise.resolve();
+    activity = { active: true, revision: 2 };
+    response.resolve({ data: { 'child-1': { type: 'idle' } } });
+    await reconciliation;
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      lastStatusError:
+        'Parent session is active; terminal task delivery is pending.',
+    });
+    expect(board.get('child-1')?.stopConfirmationStartedAt).toBeUndefined();
+  });
+
+  test('new local busy overrides explicit stale parent idle snapshot', async () => {
+    const response = deferred<unknown>();
+    let activity = { active: false, revision: 1 };
+    const { board, reconciler } = createReconciler(
+      () => response.promise,
+      undefined,
+      0,
+      { get: () => activity },
+    );
+
+    const reconciliation = reconciler.reconcile();
+    await Promise.resolve();
+    activity = { active: true, revision: 2 };
+    response.resolve({
+      data: {
+        'child-1': { type: 'idle' },
+        'parent-1': { type: 'idle' },
+      },
+    });
+    await reconciliation;
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      lastStatusError:
+        'Parent session is active; terminal task delivery is pending.',
+    });
+    expect(board.get('child-1')?.stopConfirmationStartedAt).toBeUndefined();
+  });
+
+  test('new local idle overrides explicit stale parent busy snapshot', async () => {
+    const response = deferred<unknown>();
+    let activity = { active: true, revision: 1 };
+    const { board, reconciler } = createReconciler(
+      () => response.promise,
+      undefined,
+      0,
+      { get: () => activity },
+    );
+
+    const reconciliation = reconciler.reconcile();
+    await Promise.resolve();
+    activity = { active: false, revision: 2 };
+    response.resolve({
+      data: {
+        'child-1': { type: 'idle' },
+        'parent-1': { type: 'busy' },
+      },
+    });
+    await reconciliation;
+
+    expect(board.get('child-1')).toMatchObject({ state: 'running' });
+    expect(board.get('child-1')?.stopConfirmationStartedAt).toBeDefined();
+  });
+
+  test('fallback keeps unchanged local parent activity authoritative', async () => {
+    const activity = { active: true, revision: 1 };
+    const clear = mock(() => {});
+    const { board, reconciler } = createReconciler(
+      async () => ({ data: { 'child-1': { type: 'idle' } } }),
+      undefined,
+      0,
+      { get: () => activity, clear, fallback: () => true },
+    );
+
+    await reconciler.reconcile();
+    await reconciler.reconcile();
+
+    expect(clear).not.toHaveBeenCalled();
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      lastStatusError:
+        'Parent session is active; terminal task delivery is pending.',
+    });
+    expect(board.get('child-1')?.stopConfirmationStartedAt).toBeUndefined();
   });
 
   test('does not let idle runtime observation win over a late completion', async () => {

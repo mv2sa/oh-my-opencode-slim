@@ -4,7 +4,8 @@ import type {
   ContextFile,
 } from '../../utils';
 
-export const STOP_CONFIRMATION_GRACE_MS = 5_000;
+/** Default grace after the parent can accept terminal delivery again. */
+export const DEFAULT_STOP_CONFIRMATION_MS = 30_000;
 
 export const STOPPED_WITHOUT_TERMINAL_RESULT =
   'Background session stopped before a terminal task result was received.';
@@ -39,9 +40,9 @@ export function applyConfirmedStop(options: {
 }
 
 /**
- * Idle/absent/non-busy is only a stop candidate. The first observation
- * starts a grace clock; a later observation after the grace confirms
- * the stop. Live busy after the observation wins and leaves the job running.
+ * Host-declared idle is only a stop candidate. The first observation starts a
+ * grace clock; a later observation after the grace confirms the stop. Live
+ * child activity or a parent terminal-delivery barrier leaves the job running.
  */
 export function observeNonBusyRuntime(options: {
   backgroundJobBoard: BackgroundJobStore;
@@ -50,6 +51,7 @@ export function observeNonBusyRuntime(options: {
   generation: number;
   graceMs: number;
   lastStatusError: string;
+  confirmationBlocked?: boolean;
   taskContextTracker: StopConfirmationTracker;
 }): BackgroundJobRecord | undefined {
   const job = options.backgroundJobBoard.get(options.taskID);
@@ -61,6 +63,18 @@ export function observeNonBusyRuntime(options: {
     job.lastLiveBusyAt > options.observedAt
   ) {
     return job;
+  }
+  if (options.confirmationBlocked) {
+    options.backgroundJobBoard.clearStopConfirmation(
+      options.taskID,
+      options.generation,
+    );
+    return options.backgroundJobBoard.markStatusUncertain(
+      options.taskID,
+      options.lastStatusError,
+      options.generation,
+      options.observedAt,
+    );
   }
 
   const observationTime = options.observedAt + 1;

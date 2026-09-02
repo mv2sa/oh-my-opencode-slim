@@ -240,6 +240,31 @@ describe('PluginConfigSchema backgroundJobs', () => {
     if (result.success) {
       expect(result.data.backgroundJobs?.wallClockTimeoutMs).toBe(0);
       expect(result.data.backgroundJobs?.abortGraceMs).toBe(10_000);
+      expect(result.data.backgroundJobs?.stopConfirmationMs).toBe(30_000);
+    }
+  });
+
+  it('accepts bounded stop-confirmation intervals', () => {
+    for (const stopConfirmationMs of [5_000, 30_000, 300_000]) {
+      const result = PluginConfigSchema.safeParse({
+        backgroundJobs: { stopConfirmationMs },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.backgroundJobs?.stopConfirmationMs).toBe(
+          stopConfirmationMs,
+        );
+      }
+    }
+  });
+
+  it('rejects invalid stop-confirmation intervals', () => {
+    for (const stopConfirmationMs of [0, 4_999, 300_001, 5_000.5]) {
+      expect(
+        PluginConfigSchema.safeParse({
+          backgroundJobs: { stopConfirmationMs },
+        }).success,
+      ).toBe(false);
     }
   });
 

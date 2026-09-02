@@ -187,11 +187,12 @@ idle parent with incomplete todos after continuous idle time; it does not depend
 on the local job board.
 
 After a full OpenCode or plugin restart, persisted running background-task
-history is rehydrated into the local job board and immediately reconciled against
-live host session status. A missing or idle child is a stop candidate: after a
-5s confirmation grace it is surfaced as `stopped, unreconciled`, while a busy
-child remains running; status lookup failures remain uncertain rather than being
-treated as completion.
+history is rehydrated into the local job board and immediately reconciled
+against live host session status. A missing child remains uncertain. An
+explicitly idle child becomes a stop candidate only after the parent can accept
+terminal delivery and the configured confirmation interval elapses. A busy
+child remains running, and status lookup failures remain uncertain rather than
+being treated as completion.
 
 Specialist outputs are inputs, not final truth. The orchestrator reconciles them
 against each other and the original user goal.
@@ -463,15 +464,18 @@ checks that single map for every board job still marked `running`, while normal
 session events remain the fast path.
 
 `busy` and `retry` confirm that a job is live and reset any pending stop
-confirmation. An explicit `idle` state or an absent session in an otherwise
-valid map is not immediately terminal: the first observation starts a 5s
-confirmation grace and keeps the job `running, status uncertain`. Repeat
-non-busy evidence after that grace records `stopped, unreconciled` rather than
-`completed`: it means execution ended before a native terminal task result was
-delivered, not that the task succeeded. Stopped sessions are never reusable and
-stay visible to the parent for recovery. A later live `busy` observation can
-revive an unreconciled stopped job. After the parent has been woken and the stop
-acknowledged, stale busy cannot flip the job back to running. Only explicit
+confirmation. Absence from an otherwise valid status map is uncertainty only;
+it never starts or advances the stop clock. An explicit child `idle` state is a
+stop candidate, but positive parent `busy` or `retry` is a terminal-delivery
+barrier: while the parent is active, the child remains running and any pending
+stop clock is cleared. After the parent becomes non-active, a fresh child-idle
+observation starts `backgroundJobs.stopConfirmationMs` (default 30 seconds,
+range 5–300 seconds). Repeat explicit-idle evidence after that interval records
+`stopped, unreconciled` rather than `completed`: execution appears to have ended
+without a native terminal task result. Stopped sessions are never reusable and
+stay visible to the parent for recovery. A later live child `busy` observation
+can revive an unreconciled stopped job. After the parent has been woken and the
+stop acknowledged, stale busy cannot flip the job back to running. Only explicit
 terminal task output proves completion, error, or cancellation.
 
 Malformed status entries and failed status requests are surfaced as `status

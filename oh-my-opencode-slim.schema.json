@@ -1100,6 +1100,13 @@
           "minimum": 1000,
           "maximum": 60000
         },
+        "stopConfirmationMs": {
+          "default": 30000,
+          "description": "Sustained child-idle interval required after the parent can accept terminal delivery before a task is reported stopped (5,000–300,000ms).",
+          "type": "integer",
+          "minimum": 5000,
+          "maximum": 300000
+        },
         "waitForUserGuard": {
           "default": true,
           "description": "When true, intercept wait_for_user calls made while background tasks are still running and the orchestrator wake scheduler is enabled, returning guidance to end the turn instead of blocking on manual input. Default enabled.",

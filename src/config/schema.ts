@@ -212,6 +212,15 @@ export const BackgroundJobsConfigSchema = z.object({
     .describe(
       'Grace period after a wall-clock deadline while OpenCode confirms the child terminal state (1,000–60,000ms).',
     ),
+  stopConfirmationMs: z
+    .number()
+    .int()
+    .min(5_000)
+    .max(300_000)
+    .default(30_000)
+    .describe(
+      'Sustained child-idle interval required after the parent can accept terminal delivery before a task is reported stopped (5,000–300,000ms).',
+    ),
   waitForUserGuard: z
     .boolean()
     .default(true)

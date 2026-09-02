@@ -556,6 +556,28 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     return updated;
   }
 
+  clearStopConfirmation(
+    taskID: string,
+    expectedGeneration?: number,
+  ): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(taskID);
+    if (existing?.state !== 'running') return existing;
+    if (
+      expectedGeneration !== undefined &&
+      existing.generation !== expectedGeneration
+    ) {
+      return existing;
+    }
+    if (existing.stopConfirmationStartedAt === undefined) return existing;
+
+    const updated: BackgroundJobRecord = {
+      ...existing,
+      stopConfirmationStartedAt: undefined,
+    };
+    this.jobs.set(taskID, updated);
+    return updated;
+  }
+
   markStatusUncertain(
     taskID: string,
     lastStatusError: string,

@@ -1065,6 +1065,27 @@ describe('BackgroundJobBoard', () => {
     });
   });
 
+  test('clearStopConfirmation is generation-safe and does not assert child activity', () => {
+    const board = new BackgroundJobBoard();
+    const job = board.registerLaunch({
+      taskID: 'ses_1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      now: 100,
+    });
+    board.noteStopConfirmation('ses_1', 111, job.generation);
+
+    board.clearStopConfirmation('ses_1', job.generation + 1);
+    expect(board.get('ses_1')?.stopConfirmationStartedAt).toBe(111);
+
+    const updated = board.clearStopConfirmation('ses_1', job.generation);
+    expect(updated).toMatchObject({
+      state: 'running',
+      stopConfirmationStartedAt: undefined,
+      lastLiveBusyAt: 100,
+    });
+  });
+
   test('stale busy does not revive a confirmed stopped job after terminal wake', () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({
