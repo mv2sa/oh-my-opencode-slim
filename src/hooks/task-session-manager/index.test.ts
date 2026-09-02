@@ -8,6 +8,8 @@ import {
   getBackgroundJobLifecycleLedger,
   SLIM_INTERNAL_INITIATOR_MARKER,
 } from '../../utils';
+import { CooldownRegistry } from '../foreground-fallback/cooldown-registry';
+import { ForegroundFallbackManager } from '../foreground-fallback/index';
 import {
   createPhaseReminderHook,
   PHASE_REMINDER_METADATA_KEY,
@@ -17,6 +19,7 @@ import {
   BACKGROUND_JOB_BOARD_METADATA_KEY,
   createTaskSessionManagerHook,
 } from './index';
+import { createRevivedRunTracker } from './revived-run-tracker';
 import { resetUserWaitGateForTests } from './user-wait-gate';
 
 // Route getClient back to _ctx.client so existing _ctx.client.session
@@ -115,6 +118,8 @@ type HookOptions = {
   willAttemptFallback?: (sessionID: string) => boolean;
   coordinator?: SessionLifecycle;
   backgroundJobSupervisor?: BackgroundJobSupervisor;
+  fallbackManager?: ForegroundFallbackManager;
+  revivedRunTracker?: ReturnType<typeof createRevivedRunTracker>;
 };
 
 function createHook(options?: HookOptions) {
@@ -146,6 +151,8 @@ function createHook(options?: HookOptions) {
       idleReconcileDelayMs: options?.idleReconcileDelayMs,
       runtimeStatusReconcileDelayMs: options?.runtimeStatusReconcileDelayMs,
       stopConfirmationMs: options?.stopConfirmationMs,
+      fallbackManager: options?.fallbackManager,
+      revivedRunTracker: options?.revivedRunTracker,
     },
   );
 
@@ -7673,5 +7680,775 @@ describe('task-session-manager hook', () => {
       },
     });
     expect(next.hasInputWait('parent-1')).toBe(false);
+  });
+});
+
+describe('task-session-manager Antigravity synthetic quota fallback', () => {
+  const quotaText1 =
+    'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
+  const quotaText2 =
+    'Quota protection: All 2 account(s) are over 90% usage for gemini-flash. Quota resets in 33m. Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.';
+
+  test('synchronous task false completion rewrites to running placeholder and launches continuation', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    const promptAsync = mock(async () => ({}));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: { role: 'user', id: 'user-1' },
+          parts: [{ type: 'text', text: 'solve problem' }],
+        },
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+        ],
+      },
+      true,
+      {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      sessionClient: {
+        promptAsync,
+        messages: messagesMock,
+      },
+    });
+
+    // 1. tool.execute.before creates pending call
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+
+    // 2. tool.execute.after receives false completed status
+    const output = {
+      output: [
+        'task_id: ses-child-1',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-1' },
+      output,
+    );
+
+    // Output is rewritten to byte-stable running placeholder
+    expect(output.output).toContain('state="running"');
+    expect(output.output).toContain('Background task running');
+
+    // Board job is registered as running
+    const job = board.get('ses-child-1');
+    expect(job).toBeDefined();
+    expect(job?.state).toBe('running');
+
+    // Cooldown marked for gemini-3-flash
+    expect(registry.isDead('google/antigravity-gemini-3-flash')).toBe(true);
+
+    // Continuation prompt launched with next model
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      path: { id: 'ses-child-1' },
+      body: {
+        model: {
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3.7-flash',
+        },
+      },
+    });
+
+    // Revived run tracker is tracking this job
+    expect(revivedTracker.isTracked('ses-child-1', job?.generation ?? 1)).toBe(
+      true,
+    );
+  });
+
+  test('synchronous task with exhausted chain rewrites to error status', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    const promptAsync = mock(async () => ({}));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: ['google/antigravity-gemini-3-flash'], // Single model chain
+      },
+      true,
+      {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      sessionClient: {
+        promptAsync,
+        messages: messagesMock,
+      },
+    });
+
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-2' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+
+    const output = {
+      output: [
+        'task_id: ses-child-2',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-2' },
+      output,
+    );
+
+    expect(output.output).toContain('state="error"');
+    expect(output.output).toContain('Background task failed');
+    expect(board.get('ses-child-2')?.state).toBe('error');
+    expect(promptAsync).not.toHaveBeenCalled();
+  });
+
+  test('background task injected completion rewrites part to running placeholder and launches continuation', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    const promptAsync = mock(async () => ({}));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-bg-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        fixer: [
+          'google/antigravity-gemini-3-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      sessionClient: {
+        promptAsync,
+        messages: messagesMock,
+      },
+    });
+
+    // Launch background task
+    board.registerLaunch({
+      taskID: 'ses-bg-1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'fix the bug',
+      background: true,
+    });
+
+    const syntheticPart = {
+      type: 'text',
+      synthetic: true,
+      text: [
+        '<task id="ses-bg-1" state="completed">',
+        '<summary>Background task completed: fix the bug</summary>',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+        '</task>',
+      ].join('\n'),
+    };
+
+    const messages = {
+      messages: [
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 'parent-1' },
+          parts: [syntheticPart],
+        },
+      ],
+    };
+
+    await hook['experimental.chat.messages.transform']({}, messages as any);
+
+    // Injected part rewritten to running placeholder
+    expect(syntheticPart.text).toContain('state="running"');
+    expect(syntheticPart.text).toContain('Background task running');
+
+    // Board job stays running
+    expect(board.get('ses-bg-1')?.state).toBe('running');
+
+    // Cooldown marked
+    expect(registry.isDead('google/antigravity-gemini-3-flash')).toBe(true);
+
+    // Continuation launched
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      path: { id: 'ses-bg-1' },
+      body: {
+        model: {
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+        },
+      },
+    });
+  });
+
+  test('background task injected completion with Template 2 launches continuation', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    const promptAsync = mock(async () => ({}));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-bg-2',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText2 }],
+        },
+      ],
+    }));
+
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        fixer: [
+          'google/antigravity-gemini-3-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      sessionClient: {
+        promptAsync,
+        messages: messagesMock,
+      },
+    });
+
+    board.registerLaunch({
+      taskID: 'ses-bg-2',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'fix the bug',
+      background: true,
+    });
+
+    const syntheticPart = {
+      type: 'text',
+      synthetic: true,
+      text: [
+        '<task id="ses-bg-2" state="completed">',
+        '<summary>Background task completed: fix the bug</summary>',
+        '<task_result>',
+        quotaText2,
+        '</task_result>',
+        '</task>',
+      ].join('\n'),
+    };
+
+    const messages = {
+      messages: [
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 'parent-1' },
+          parts: [syntheticPart],
+        },
+      ],
+    };
+
+    await hook['experimental.chat.messages.transform']({}, messages as any);
+
+    expect(syntheticPart.text).toContain('state="running"');
+    expect(registry.isDead('google/antigravity-gemini-3-flash')).toBe(true);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('duplicate incident ownership: later injected completion adopts launched continuation without advancing ladder twice', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    const promptAsync = mock(async () => ({}));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: { role: 'user', id: 'user-1' },
+          parts: [{ type: 'text', text: 'solve problem' }],
+        },
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-msg-99',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    const revivedTracker = createRevivedRunTracker({
+      input: {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      backgroundJobBoard: board,
+      notificationRetryDelayMs: 0,
+      fallbackManager: fallbackMgr,
+    });
+
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      revivedRunTracker: revivedTracker,
+      sessionClient: {
+        promptAsync,
+        messages: messagesMock,
+      },
+    });
+
+    // 1. Synchronous tool.execute.after discovers the quota failure and launches continuation with gemini-3.7-flash
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-dup-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+
+    const output = {
+      output: [
+        'task_id: ses-child-dup',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-dup-1' },
+      output,
+    );
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      path: { id: 'ses-child-dup' },
+      body: {
+        model: {
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3.7-flash',
+        },
+      },
+    });
+
+    // 2. Later native background synthetic completion arrives for the exact same incident (asst-msg-99)
+    const syntheticPart = {
+      type: 'text',
+      synthetic: true,
+      text: [
+        '<task id="ses-child-dup" state="completed">',
+        '<summary>Background task completed: Run oracle</summary>',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+        '</task>',
+      ].join('\n'),
+    };
+
+    const transformMessages = {
+      messages: [
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 'parent-1' },
+          parts: [syntheticPart],
+        },
+      ],
+    };
+
+    await hook['experimental.chat.messages.transform'](
+      {},
+      transformMessages as any,
+    );
+
+    // PromptAsync is NOT called a second time, and ladder did not skip to claude-opus-4-5
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(syntheticPart.text).toContain('state="running"');
+    expect(registry.isDead('anthropic/claude-opus-4-5')).toBe(false);
+  });
+
+  test('transactional launch failure on SDK error response rolls back and updates board to error', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    const promptAsync = mock(async () => ({
+      error: { message: 'Transport stream rejected by host' },
+    }));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-fail-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+        ],
+      },
+      true,
+      {
+        directory: '/tmp',
+        client: { session: { promptAsync, messages: messagesMock } },
+      } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      sessionClient: {
+        promptAsync,
+        messages: messagesMock,
+      },
+    });
+
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-err-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+
+    const output = {
+      output: [
+        'task_id: ses-child-err-1',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-err-1' },
+      output,
+    );
+
+    // Because prompt transport failed, output is error (not false running)
+    expect(output.output).toContain('state="error"');
+    expect(board.get('ses-child-err-1')?.state).toBe('error');
+    // Selection is two-phase: a transport rejection must not consume a model
+    // that was never accepted by the host.
+    expect(
+      fallbackMgr.prepareNextModel({
+        sessionID: 'ses-child-err-1',
+        agentName: 'oracle',
+        currentModel: 'google/antigravity-gemini-3-flash',
+      })?.model,
+    ).toBe('google/antigravity-gemini-3.7-flash');
+
+    // A later copy of the same native completion must retain the terminal
+    // transport disposition instead of falling through as completed success.
+    const duplicatePart = {
+      type: 'text',
+      synthetic: true,
+      text: [
+        '<task id="ses-child-err-1" state="completed">',
+        '<summary>Background task completed: Run oracle</summary>',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+        '</task>',
+      ].join('\n'),
+    };
+    await hook['experimental.chat.messages.transform']({}, {
+      messages: [
+        {
+          info: {
+            role: 'user',
+            agent: 'orchestrator',
+            sessionID: 'parent-1',
+          },
+          parts: [duplicatePart],
+        },
+      ],
+    } as any);
+    expect(duplicatePart.text).toContain('state="error"');
+    expect(duplicatePart.text).not.toContain('state="completed"');
+    expect(board.get('ses-child-err-1')?.state).toBe('error');
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('disposal invalidates an in-flight continuation and bounds a hanging containment abort', async () => {
+    const board = new BackgroundJobBoard();
+    const registry = new CooldownRegistry();
+    let acceptPrompt = (): void => {};
+    const promptAccepted = new Promise<void>((resolve) => {
+      acceptPrompt = resolve;
+    });
+    let promptStarted = (): void => {};
+    const started = new Promise<void>((resolve) => {
+      promptStarted = resolve;
+    });
+    const promptAsync = mock(async () => {
+      promptStarted();
+      await promptAccepted;
+      return {};
+    });
+    const abort = mock(() => new Promise(() => {}));
+    const messagesMock = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            id: 'asst-dispose-1',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+      ],
+    }));
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+        ],
+      },
+      true,
+      { directory: '/tmp' } as any,
+      1,
+      undefined,
+      registry,
+    );
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      fallbackManager: fallbackMgr,
+      sessionClient: { promptAsync, messages: messagesMock, abort },
+    });
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-dispose-1' },
+      {
+        args: {
+          description: 'Run oracle',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+        },
+      },
+    );
+    const output = {
+      output: [
+        'task_id: ses-child-dispose-1',
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText1,
+        '</task_result>',
+      ].join('\n'),
+    };
+    const completion = hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-dispose-1' },
+      output,
+    );
+    await started;
+    await hook.event({ event: { type: 'server.instance.disposed' } });
+    acceptPrompt();
+
+    const settled = await Promise.race([
+      completion.then(() => true),
+      new Promise<boolean>((resolve) =>
+        setTimeout(() => resolve(false), 1_500),
+      ),
+    ]);
+    expect(settled).toBe(true);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(output.output).toContain('state="error"');
+    expect(board.get('ses-child-dispose-1')?.state).toBe('error');
+    expect(
+      fallbackMgr.prepareNextModel({
+        sessionID: 'ses-child-dispose-1',
+        agentName: 'oracle',
+        currentModel: 'google/antigravity-gemini-3-flash',
+      })?.model,
+    ).toBe('google/antigravity-gemini-3.7-flash');
   });
 });

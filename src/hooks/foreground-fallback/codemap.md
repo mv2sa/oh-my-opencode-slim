@@ -12,6 +12,7 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
 ### Supporting modules
 - `classify-failure.ts` classifies provider errors and assigns cooldown durations (quota, rate-limit, transient, request-fatal, unknown), with a 5h re-probe ceiling and a 7d monthly exemption.
 - `cooldown-registry.ts` persists cross-process model cooldowns in a lock-protected, atomically-replaced JSON file with schema validation/repair.
+- `synthetic-quota.ts` provides positive identity gates (`isAntigravitySyntheticQuotaMessage`, `isAntigravitySyntheticQuotaText`), continuation prompt launcher (`launchContinuationPrompt`), and child evidence verifier (`verifyChildAntigravityEvidence`) for Antigravity HTTP-200/STOP synthetic quota turns.
 
 ## Design
 

@@ -24,6 +24,7 @@ All modules depend on `BackgroundJobBoard` from `src/utils/background-job-board.
 - **PendingTaskCall**: Tracks in-flight task invocations with call ID, parent session ID, agent type, label, and optional resumed task ID.
 - **ContextFile**: Represents read context from child sessions with path, line numbers, and last-read timestamp.
 - **User wait**: Explicit text-only HITL latch armed by `wait_for_user` and released by a distinct real external user message.
+- **Antigravity Synthetic Quota Fallback**: Intercepts HTTP-200/STOP false completions in `tool.execute.after`, `updateFromInjectedCompletion`, and `RevivedRunTracker.probe`, rewrites them to stable running placeholders, continues on the agent's fallback ladder, and delivers the replacement result once.
 
 ## Flow
 

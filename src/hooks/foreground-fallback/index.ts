@@ -27,11 +27,39 @@ import {
 } from '../../utils/session';
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isReplayableUserMessage, partsFromReplayMessage } from '../types';
-import { classifyFailure } from './classify-failure';
+import {
+  classifyFailure,
+  classifyUncapped,
+  type FailureClass,
+  type FailureVerdict,
+} from './classify-failure';
 import {
   type CooldownRegistry,
   getCooldownRegistry,
 } from './cooldown-registry';
+import {
+  ANTIGRAVITY_TEMPLATE_1,
+  ANTIGRAVITY_TEMPLATE_2,
+  type AntigravityMessageEvidence,
+  isAntigravitySyntheticQuotaMessage,
+  isAntigravitySyntheticQuotaText,
+  launchContinuationPrompt,
+  verifyChildAntigravityEvidence,
+} from './synthetic-quota';
+
+export {
+  ANTIGRAVITY_TEMPLATE_1,
+  ANTIGRAVITY_TEMPLATE_2,
+  type AntigravityMessageEvidence,
+  classifyFailure,
+  classifyUncapped,
+  type FailureClass,
+  type FailureVerdict,
+  isAntigravitySyntheticQuotaMessage,
+  isAntigravitySyntheticQuotaText,
+  launchContinuationPrompt,
+  verifyChildAntigravityEvidence,
+};
 
 // ---------------------------------------------------------------------------
 // Retryable error detection
@@ -391,6 +419,110 @@ export class ForegroundFallbackManager {
     return soonest;
   }
 
+  markModelCooldown(model: string, reasonOrText: unknown): void {
+    const verdict = classifyFailure(reasonOrText);
+    if (verdict.cooldownMs > 0) {
+      this.cooldownRegistry.markFailure(model, verdict);
+    }
+  }
+
+  prepareNextModel(options: {
+    sessionID?: string;
+    agentName?: string;
+    currentModel?: string;
+  }): { model: string; variant?: string; commit: () => boolean } | undefined {
+    if (!this.enabled) return undefined;
+    const sessionID = options.sessionID;
+    const agentName =
+      options.agentName ??
+      (sessionID ? this.sessionAgent.get(sessionID) : undefined);
+    let currentModel =
+      options.currentModel ??
+      (sessionID ? this.sessionModel.get(sessionID) : undefined);
+    const chain = this.resolveChain(agentName, currentModel);
+    if (!chain.length) return undefined;
+
+    if (!currentModel && agentName) {
+      currentModel = this.chains[agentName]?.[0];
+    }
+
+    const originalTried = sessionID
+      ? new Set(this.sessionTried.get(sessionID) ?? [])
+      : new Set<string>();
+    const originalModel = sessionID
+      ? this.sessionModel.get(sessionID)
+      : undefined;
+    const originalExhaustion = sessionID
+      ? this.chainExhaustion.get(sessionID)
+      : undefined;
+    const originalRetries = sessionID
+      ? this.sessionRetries.get(sessionID)
+      : undefined;
+    const tried = new Set(originalTried);
+    if (currentModel) tried.add(currentModel);
+    let nextExhaustion = originalExhaustion;
+
+    let nextModel = chain.find(
+      (m) => !tried.has(m) && !this.cooldownRegistry.isDead(m),
+    );
+
+    if (!nextModel) {
+      if (chain.length > 1) {
+        const allCooling = chain.every((m) => this.cooldownRegistry.isDead(m));
+        if (allCooling) {
+          if ((originalExhaustion ?? 0) >= 1) return undefined;
+          nextExhaustion = 1;
+          const snapshot = this.cooldownRegistry.list();
+          const soonest = [...chain].sort(
+            (a, b) =>
+              (snapshot[a]?.deadUntil ?? 0) - (snapshot[b]?.deadUntil ?? 0),
+          )[0];
+          nextModel = soonest;
+        } else {
+          if ((originalExhaustion ?? 0) >= 1) return undefined;
+          nextExhaustion = 1;
+          const stickyFallback = chain[chain.length - 1];
+          nextModel = stickyFallback;
+        }
+      } else {
+        return undefined;
+      }
+    }
+
+    if (nextModel) {
+      const variant =
+        agentName && this.modelVariants[agentName]?.[nextModel]
+          ? this.modelVariants[agentName][nextModel]
+          : undefined;
+      const commit = (): boolean => {
+        if (!sessionID) return true;
+        const currentTried = this.sessionTried.get(sessionID) ?? new Set();
+        if (
+          this.sessionModel.get(sessionID) !== originalModel ||
+          this.chainExhaustion.get(sessionID) !== originalExhaustion ||
+          this.sessionRetries.get(sessionID) !== originalRetries ||
+          currentTried.size !== originalTried.size ||
+          [...currentTried].some((model) => !originalTried.has(model))
+        ) {
+          return false;
+        }
+        tried.add(nextModel);
+        this.sessionTried.set(sessionID, tried);
+        this.sessionModel.set(sessionID, nextModel);
+        this.sessionRetries.delete(sessionID);
+        if (nextExhaustion === undefined) {
+          this.chainExhaustion.delete(sessionID);
+        } else {
+          this.chainExhaustion.set(sessionID, nextExhaustion);
+        }
+        return true;
+      };
+      return { model: nextModel, variant, commit };
+    }
+
+    return undefined;
+  }
+
   constructor(
     /**
      * Ordered fallback chains per agent.
@@ -408,6 +540,7 @@ export class ForegroundFallbackManager {
       string,
       Record<string, string | undefined>
     > = {},
+    private readonly isTaskSession?: (sessionID: string) => boolean,
   ) {
     if (coordinator) {
       coordinator.onSessionDeleted((id) => {
@@ -467,11 +600,134 @@ export class ForegroundFallbackManager {
           messageTime !== null &&
           'completed' in messageTime &&
           typeof messageTime.completed === 'number';
+
+        let isAntigravityQuota = false;
+        let antigravityQuotaText = '';
+
+        if (!info.error && info.role === 'assistant') {
+          const rawParts = Array.isArray(
+            (event.properties as Record<string, unknown>)?.parts,
+          )
+            ? ((event.properties as Record<string, unknown>).parts as unknown[])
+            : Array.isArray(info.parts)
+              ? (info.parts as unknown[])
+              : undefined;
+          let msgText =
+            rawParts
+              ?.filter(
+                (p): p is { type: string; text: string } =>
+                  p !== null &&
+                  typeof p === 'object' &&
+                  ((p as { type?: unknown }).type === 'text' ||
+                    (p as { type?: unknown }).type === 'reasoning') &&
+                  typeof (p as { text?: unknown }).text === 'string',
+              )
+              ?.map((p) => p.text)
+              ?.join('\n\n') ?? '';
+          if (
+            !msgText &&
+            typeof (event.properties as Record<string, unknown>)?.part ===
+              'object' &&
+            (event.properties as Record<string, unknown>)?.part !== null
+          ) {
+            const pt = (event.properties as Record<string, unknown>).part as {
+              text?: unknown;
+            };
+            if (typeof pt.text === 'string') msgText = pt.text;
+          }
+
+          const candidateEvidence: AntigravityMessageEvidence = {
+            role: info.role,
+            providerID: info.providerID,
+            modelID: info.modelID,
+            model: info.model,
+            finish: info.finish ?? info.finishReason,
+            error: info.error,
+            tokens: info.tokens,
+          };
+
+          if (isAntigravitySyntheticQuotaMessage(candidateEvidence, msgText)) {
+            isAntigravityQuota = true;
+            antigravityQuotaText = msgText;
+          } else if (
+            !msgText &&
+            (info.providerID === 'google' ||
+              (typeof info.model === 'object' &&
+                (info.model as Record<string, unknown>)?.providerID ===
+                  'google')) &&
+            (typeof info.modelID === 'string'
+              ? info.modelID.startsWith('antigravity-')
+              : typeof (info.model as Record<string, unknown>)?.modelID ===
+                  'string' &&
+                (
+                  (info.model as Record<string, unknown>).modelID as string
+                ).startsWith('antigravity-')) &&
+            typeof (info.tokens as Record<string, unknown>)?.input ===
+              'number' &&
+            (info.tokens as Record<string, unknown>).input === 0 &&
+            typeof info.finish === 'string' &&
+            info.finish.trim().toLowerCase() === 'stop'
+          ) {
+            try {
+              const sessionClient = getClient(this.input).session;
+              const res = await sessionClient.messages({
+                path: { id: sessionID },
+                query: { directory: this.input.directory },
+              });
+              const data = Array.isArray(res?.data)
+                ? (res.data as unknown[])
+                : [];
+              const last = data.at(-1) as
+                | { parts?: Array<{ type?: string; text?: string }> }
+                | undefined;
+              const fetchedText = (last?.parts ?? [])
+                .filter(
+                  (p) =>
+                    (p.type === 'text' || p.type === 'reasoning') &&
+                    typeof p.text === 'string',
+                )
+                .map((p) => p.text as string)
+                .join('\n\n')
+                .trim();
+              if (
+                isAntigravitySyntheticQuotaMessage(
+                  candidateEvidence,
+                  fetchedText,
+                )
+              ) {
+                isAntigravityQuota = true;
+                antigravityQuotaText = fetchedText;
+              }
+            } catch {
+              // fail open
+            }
+          }
+        }
+
         // Failover-worthy error on an individual message
         if (info.error && isFailoverError(info.error)) {
           this.markCooldown(info.error, sessionID);
           if (this.shouldTriggerFallback(sessionID)) {
             await this.tryFallback(sessionID, info.error);
+          }
+        } else if (isAntigravityQuota) {
+          // Task-owned child incidents are managed by task-session-manager / RevivedRunTracker;
+          // do not launch duplicate from generic foreground message.updated (Point 1).
+          if (this.isTaskSession?.(sessionID)) {
+            break;
+          }
+          const failedModel =
+            this.resolveCurrentModel(sessionID) ??
+            (info.providerID && info.modelID
+              ? `${info.providerID}/${info.modelID}`
+              : undefined);
+          if (failedModel) {
+            this.markModelCooldown(failedModel, antigravityQuotaText);
+          }
+          if (this.shouldTriggerFallback(sessionID)) {
+            await this.tryFallback(sessionID, {
+              message: antigravityQuotaText,
+            });
           }
         } else if (isCompletedSuccessfulAssistant) {
           // Only a completed, successful assistant response proves recovery.

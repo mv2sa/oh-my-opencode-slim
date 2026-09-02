@@ -160,6 +160,39 @@ describe('BackgroundJobBoard', () => {
     ).toBeDefined();
   });
 
+  test('dropping a task invalidates its outstanding continuation lease', () => {
+    const board = new BackgroundJobBoard();
+    const job = board.registerLaunch({
+      taskID: 'ses_drop_lease',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    const lease = board.acquireMessageLease(job.taskID, job.generation);
+    if (!lease) throw new Error('message lease was not acquired');
+    expect(board.validateLease(lease)).toBe(true);
+
+    board.drop(job.taskID);
+
+    expect(board.get(job.taskID)).toBeUndefined();
+    expect(board.validateLease(lease)).toBe(false);
+  });
+
+  test('clearing a parent invalidates child continuation leases', () => {
+    const board = new BackgroundJobBoard();
+    const job = board.registerLaunch({
+      taskID: 'ses_parent_lease',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    const lease = board.acquireMessageLease(job.taskID, job.generation);
+    if (!lease) throw new Error('message lease was not acquired');
+
+    board.clearParent('parent-1');
+
+    expect(board.get(job.taskID)).toBeUndefined();
+    expect(board.validateLease(lease)).toBe(false);
+  });
+
   test('expected generation and cancellation token fence markCancelled', () => {
     const board = new BackgroundJobBoard();
     const first = board.registerLaunch({

@@ -1,11 +1,15 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
+import { CooldownRegistry } from '../foreground-fallback/cooldown-registry';
+import { ForegroundFallbackManager } from '../foreground-fallback/index';
+import { createSyntheticQuotaCoordinator } from '../foreground-fallback/synthetic-quota';
 import { createRevivedRunTracker } from './revived-run-tracker';
 
 function createHarness(
   messages: () => unknown,
   prompt = mock(async () => ({})),
   assertBound = false,
+  fallbackManager?: ForegroundFallbackManager,
 ) {
   const board = new BackgroundJobBoard();
   board.registerLaunch({
@@ -59,6 +63,10 @@ function createHarness(
     notificationRetryDelayMs: 0,
     onSettled: settled,
     pruneContext: pruned,
+    fallbackManager,
+    syntheticQuotaCoordinator: fallbackManager
+      ? createSyntheticQuotaCoordinator()
+      : undefined,
   });
   return {
     board,
@@ -408,5 +416,318 @@ describe('revived run tracker', () => {
     });
     harness.tracker.onTerminal(cancelled);
     expect(harness.tracker.isTracked(next.taskID, next.generation)).toBe(true);
+  });
+
+  test('handles Antigravity synthetic quota turn by launching fallback continuation', async () => {
+    const quotaText =
+      'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
+    const registry = new CooldownRegistry();
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        explorer: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+        ],
+      },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    let probeCount = 0;
+    const harness = createHarness(
+      () => {
+        probeCount++;
+        if (probeCount === 1) {
+          return {
+            data: [
+              { info: { id: 'baseline', role: 'user' }, parts: [] },
+              {
+                info: {
+                  id: 'assistant-quota',
+                  role: 'assistant',
+                  providerID: 'google',
+                  modelID: 'antigravity-gemini-3-flash',
+                  finish: 'stop',
+                  tokens: { input: 0, output: 33 },
+                  time: { completed: 1 },
+                },
+                parts: [{ type: 'text', text: quotaText }],
+              },
+            ],
+          };
+        }
+        return {
+          data: [
+            { info: { id: 'baseline', role: 'user' }, parts: [] },
+            {
+              info: {
+                id: 'assistant-quota',
+                role: 'assistant',
+                providerID: 'google',
+                modelID: 'antigravity-gemini-3-flash',
+                finish: 'stop',
+                tokens: { input: 0, output: 33 },
+                time: { completed: 1 },
+              },
+              parts: [{ type: 'text', text: quotaText }],
+            },
+            {
+              info: {
+                id: 'assistant-success',
+                role: 'assistant',
+                providerID: 'google',
+                modelID: 'antigravity-gemini-3.7-flash',
+                finish: 'stop',
+                tokens: { input: 250, output: 50 },
+                time: { completed: 2 },
+              },
+              parts: [{ type: 'text', text: 'successful explorer analysis' }],
+            },
+          ],
+        };
+      },
+      undefined,
+      false,
+      fallbackMgr,
+    );
+
+    harness.tracker.register({
+      taskID: harness.run.taskID,
+      generation: harness.run.generation,
+      parentSessionID: 'parent',
+      baselineMessageID: 'baseline',
+      description: 'inspect the change',
+    });
+
+    // Probe 1: Sees synthetic quota -> cools down failed model, launches continuation, returns false
+    const probe1Result = await harness.tracker.probe(
+      harness.run.taskID,
+      harness.run.generation,
+    );
+    expect(probe1Result).toBe(false);
+    expect(registry.isDead('google/antigravity-gemini-3-flash')).toBe(true);
+    expect(harness.board.get('ses_child')?.state).toBe('running');
+
+    // PromptAsync was called for the continuation on the child session
+    expect(harness.prompt).toHaveBeenCalledTimes(1);
+    expect(harness.prompt.mock.calls[0]?.[0]).toMatchObject({
+      path: { id: 'ses_child' },
+      body: {
+        model: {
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3.7-flash',
+        },
+      },
+    });
+
+    // Probe 2: Sees replacement success -> marks completed, delivers terminal result to parent once
+    const probe2Result = await harness.tracker.probe(
+      harness.run.taskID,
+      harness.run.generation,
+    );
+    expect(probe2Result).toBe(true);
+    expect(harness.board.get('ses_child')).toMatchObject({
+      state: 'completed',
+      resultSummary: 'successful explorer analysis',
+    });
+    // PromptAsync called again to notify the parent
+    expect(harness.prompt).toHaveBeenCalledTimes(2);
+    expect(harness.prompt.mock.calls[1]?.[0]).toMatchObject({
+      path: { id: 'parent' },
+      body: {
+        agent: 'orchestrator',
+        parts: [{ type: 'text', synthetic: true }],
+      },
+    });
+  });
+
+  test('marks error and notifies parent when chain is exhausted on Antigravity quota', async () => {
+    const quotaText =
+      'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
+    const registry = new CooldownRegistry();
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        explorer: ['google/antigravity-gemini-3-flash'], // Single-model chain
+      },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    const harness = createHarness(
+      () => ({
+        data: [
+          { info: { id: 'baseline', role: 'user' }, parts: [] },
+          {
+            info: {
+              id: 'assistant-quota',
+              role: 'assistant',
+              providerID: 'google',
+              modelID: 'antigravity-gemini-3-flash',
+              finish: 'stop',
+              tokens: { input: 0, output: 33 },
+              time: { completed: 1 },
+            },
+            parts: [{ type: 'text', text: quotaText }],
+          },
+        ],
+      }),
+      undefined,
+      false,
+      fallbackMgr,
+    );
+
+    harness.tracker.register({
+      taskID: harness.run.taskID,
+      generation: harness.run.generation,
+      parentSessionID: 'parent',
+      baselineMessageID: 'baseline',
+      description: 'inspect the change',
+    });
+
+    const probeResult = await harness.tracker.probe(
+      harness.run.taskID,
+      harness.run.generation,
+    );
+    expect(probeResult).toBe(true);
+    expect(harness.board.get('ses_child')).toMatchObject({
+      state: 'error',
+    });
+    expect(harness.prompt).toHaveBeenCalledTimes(1);
+    expect(harness.prompt.mock.calls[0]?.[0]).toMatchObject({
+      path: { id: 'parent' },
+      body: {
+        agent: 'orchestrator',
+        parts: [{ type: 'text', synthetic: true }],
+      },
+    });
+  });
+
+  test('production registration sets baselineMessageID to failed message ID and avoids immediate re-cascade', async () => {
+    const quotaText =
+      'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
+    const registry = new CooldownRegistry();
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        explorer: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+        ],
+      },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    // Initial state: child session has user prompt and failed assistant turn 'failed-msg-1'
+    const harness = createHarness(
+      () => ({
+        data: [
+          { info: { id: 'user-prompt-1', role: 'user' }, parts: [] },
+          {
+            info: {
+              id: 'failed-msg-1',
+              role: 'assistant',
+              providerID: 'google',
+              modelID: 'antigravity-gemini-3-flash',
+              finish: 'stop',
+              tokens: { input: 0, output: 33 },
+              time: { completed: 1 },
+            },
+            parts: [{ type: 'text', text: quotaText }],
+          },
+        ],
+      }),
+      undefined,
+      false,
+      fallbackMgr,
+    );
+
+    // Production registration sets baselineMessageID to exact failed assistant message ID
+    harness.tracker.register({
+      taskID: harness.run.taskID,
+      generation: harness.run.generation,
+      parentSessionID: 'parent',
+      baselineMessageID: 'failed-msg-1',
+      description: 'inspect code',
+    });
+
+    // Probing while continuation is still in flight:
+    // lastIndex is failed-msg-1 which equals baselineIndex -> probe returns false without re-triggering prompt
+    const probeInFlight = await harness.tracker.probe(
+      harness.run.taskID,
+      harness.run.generation,
+    );
+    expect(probeInFlight).toBe(false);
+    expect(harness.prompt).not.toHaveBeenCalled();
+    expect(harness.board.get('ses_child')?.state).toBe('running');
+  });
+
+  test('probe does not prompt continuation if job cancellation was requested', async () => {
+    const quotaText =
+      'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
+    const registry = new CooldownRegistry();
+    const fallbackMgr = new ForegroundFallbackManager(
+      {
+        explorer: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+        ],
+      },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    const harness = createHarness(
+      () => ({
+        data: [
+          { info: { id: 'baseline', role: 'user' }, parts: [] },
+          {
+            info: {
+              id: 'assistant-quota',
+              role: 'assistant',
+              providerID: 'google',
+              modelID: 'antigravity-gemini-3-flash',
+              finish: 'stop',
+              tokens: { input: 0, output: 33 },
+              time: { completed: 1 },
+            },
+            parts: [{ type: 'text', text: quotaText }],
+          },
+        ],
+      }),
+      undefined,
+      false,
+      fallbackMgr,
+    );
+
+    harness.tracker.register({
+      taskID: harness.run.taskID,
+      generation: harness.run.generation,
+      parentSessionID: 'parent',
+      baselineMessageID: 'baseline',
+      description: 'inspect the change',
+    });
+
+    // Mark cancellation requested on board
+    const job = harness.board.get(harness.run.taskID);
+    if (job) job.cancellationRequested = true;
+
+    const probeResult = await harness.tracker.probe(
+      harness.run.taskID,
+      harness.run.generation,
+    );
+    expect(probeResult).toBe(false);
+    expect(harness.prompt).not.toHaveBeenCalled();
   });
 });

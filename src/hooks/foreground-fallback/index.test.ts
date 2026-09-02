@@ -2809,3 +2809,301 @@ describe('ForegroundFallbackManager cooldown chain resolution', () => {
     expect(mocks.promptAsync.mock.calls[0]?.[0].body.variant).toBe('high');
   });
 });
+
+describe('ForegroundFallbackManager - Antigravity synthetic quota', () => {
+  const quotaText1 =
+    'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
+  const quotaText2 =
+    'Quota protection: All 2 account(s) are over 90% usage for gemini-flash. Quota resets in 33m. Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.';
+
+  test('triggers fallback without abort on positive Antigravity synthetic quota in message.updated', async () => {
+    const { mocks } = createMockClient();
+    const registry = new CooldownRegistry();
+    const mgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'ses-antigravity-fg-1',
+          role: 'assistant',
+          agent: 'oracle',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+          finish: 'stop',
+          tokens: { input: 0, output: 33 },
+          time: { completed: Date.now() },
+        },
+        parts: [{ type: 'text', text: quotaText1 }],
+      },
+    });
+
+    // Fallback promptAsync was invoked
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.abort).not.toHaveBeenCalled(); // No abort on complete synthetic turn
+
+    const call = mocks.promptAsync.mock.calls[0] as [any];
+    expect(call[0].body.model).toEqual({
+      providerID: 'google',
+      modelID: 'antigravity-gemini-3.7-flash',
+    });
+
+    // Cooldown was marked for google/antigravity-gemini-3-flash with 110 minutes
+    const record = registry.list()['google/antigravity-gemini-3-flash'];
+    expect(record).toBeDefined();
+    expect(record.hits).toBe(1);
+    expect(registry.isDead('google/antigravity-gemini-3-flash')).toBe(true);
+  });
+
+  test('cascades through multiple Antigravity synthetic quota failures to replacement model', async () => {
+    const { mocks } = createMockClient();
+    const registry = new CooldownRegistry();
+    const mgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    // Turn 1 fails with gemini-3-flash
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'ses-cascade-1',
+          role: 'assistant',
+          agent: 'oracle',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+          finish: 'stop',
+          tokens: { input: 0, output: 33 },
+          time: { completed: Date.now() },
+        },
+        parts: [{ type: 'text', text: quotaText1 }],
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'google',
+      modelID: 'antigravity-gemini-3.7-flash',
+    });
+
+    // Turn 2 also fails with gemini-3.7-flash (Template 2)
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'ses-cascade-1',
+          role: 'assistant',
+          agent: 'oracle',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3.7-flash',
+          finish: 'stop',
+          tokens: { input: 0, output: 33 },
+          time: { completed: Date.now() },
+        },
+        parts: [{ type: 'text', text: quotaText2 }],
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).toEqual({
+      providerID: 'anthropic',
+      modelID: 'claude-opus-4-5',
+    });
+
+    expect(registry.isDead('google/antigravity-gemini-3-flash')).toBe(true);
+    expect(registry.isDead('google/antigravity-gemini-3.7-flash')).toBe(true);
+    expect(registry.isDead('anthropic/claude-opus-4-5')).toBe(false);
+  });
+
+  test('stops and does not loop when chain is exhausted', async () => {
+    const { mocks } = createMockClient();
+    const registry = new CooldownRegistry();
+    const mgr = new ForegroundFallbackManager(
+      {
+        oracle: ['google/antigravity-gemini-3-flash'],
+      },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'ses-single-exhaust',
+          role: 'assistant',
+          agent: 'oracle',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+          finish: 'stop',
+          tokens: { input: 0, output: 33 },
+          time: { completed: Date.now() },
+        },
+        parts: [{ type: 'text', text: quotaText1 }],
+      },
+    });
+
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+    expect(mgr.willAttemptFallback('ses-single-exhaust')).toBe(false);
+  });
+
+  test('fails open and does not trigger fallback on missing identity or non-quota prose', async () => {
+    const { mocks } = createMockClient();
+    const registry = new CooldownRegistry();
+    const mgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+    );
+
+    // Non-zero input tokens
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'ses-fail-open-1',
+          agent: 'oracle',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+          finish: 'stop',
+          tokens: { input: 120, output: 33 },
+          time: { completed: Date.now() },
+        },
+        parts: [{ type: 'text', text: quotaText1 }],
+      },
+    });
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+
+    // Finish is tool-calls, not stop
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'ses-fail-open-2',
+          agent: 'oracle',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+          finish: 'tool-calls',
+          tokens: { input: 0, output: 33 },
+          time: { completed: Date.now() },
+        },
+        parts: [{ type: 'text', text: quotaText1 }],
+      },
+    });
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+
+    // Non-antigravity model
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'ses-fail-open-3',
+          agent: 'oracle',
+          providerID: 'google',
+          modelID: 'gemini-2.5-pro',
+          finish: 'stop',
+          tokens: { input: 0, output: 33 },
+          time: { completed: Date.now() },
+        },
+        parts: [{ type: 'text', text: quotaText1 }],
+      },
+    });
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+
+    // Generic quota prose (not exact template)
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'ses-fail-open-4',
+          agent: 'oracle',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+          finish: 'stop',
+          tokens: { input: 0, output: 33 },
+          time: { completed: Date.now() },
+        },
+        parts: [
+          { type: 'text', text: 'You exceeded your Gemini quota limit.' },
+        ],
+      },
+    });
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+  });
+
+  test('task-owned child incidents do not launch from generic foreground message.updated', async () => {
+    const { mocks } = createMockClient();
+    const registry = new CooldownRegistry();
+    const taskOwnedSessions = new Set(['ses-child-task-1']);
+    const mgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/test' } as any,
+      1,
+      undefined,
+      registry,
+      {},
+      (sessionID) => taskOwnedSessions.has(sessionID),
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'ses-child-task-1',
+          role: 'assistant',
+          agent: 'oracle',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+          finish: 'stop',
+          tokens: { input: 0, output: 33 },
+          time: { completed: Date.now() },
+        },
+        parts: [{ type: 'text', text: quotaText1 }],
+      },
+    });
+
+    // FG manager skips task-owned child session — task-session-manager owns it!
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+  });
+});

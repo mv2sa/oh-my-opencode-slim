@@ -45,7 +45,7 @@ from `index.ts`) that returns the hook points OpenCode invokes.
 | Lifecycle/event | task-session-manager, `createCacheMonitorHook`, `createOrchestratorWakeScheduler` | `event` |
 | Runtime commands | `createDeepworkCommandHook`, `createReflectCommandHook`, `createLoopCommandHook` | `command.execute.before` |
 | Skill visibility | `createFilterAvailableSkillsHook` | message transform |
-| Model fallback | `ForegroundFallbackManager` | event-driven (message.updated/session.error/session.status) |
+| Model fallback | `ForegroundFallbackManager` | event-driven (message.updated/session.error/session.status, Antigravity synthetic quota) |
 
 ## Flow
 

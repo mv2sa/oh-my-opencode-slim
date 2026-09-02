@@ -16,12 +16,19 @@ import {
   parseTaskIdFromTaskOutput,
   parseTaskLaunchOutput,
   parseTaskStatusOutput,
+  renderRunningTaskPlaceholder,
 } from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
 import { SESSION_ID_PATTERN } from '../../utils/session';
+import type { ForegroundFallbackManager } from '../foreground-fallback';
+import {
+  isAntigravitySyntheticQuotaText,
+  type SyntheticQuotaCoordinator,
+} from '../foreground-fallback/synthetic-quota';
 import { isMissingRememberedSessionError } from './board-injection';
 import type { PendingTaskCall } from './pending-call-tracker';
+import type { RevivedRunTracker } from './revived-run-tracker';
 import { normalizeLateCancelledTaskOutput } from './status-utils';
 import { extractReadFiles } from './task-context-tracker';
 
@@ -251,6 +258,10 @@ export async function handleToolExecuteAfter(
       prune(board: { taskIDs(): Set<string> }): void;
     };
     backgroundJobSupervisor?: BackgroundJobSupervisor;
+    client?: unknown;
+    fallbackManager?: ForegroundFallbackManager;
+    revivedRunTracker?: RevivedRunTracker;
+    syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
     /** Record direct task cleanup even when the store is a thin facade. */
     recordLifecycleSuppression?: (taskID: string) => void;
     /** Clear a deletion guard when a new native task output proves a run exists. */
@@ -340,6 +351,48 @@ export async function handleToolExecuteAfter(
 
     const status = parseTaskStatusOutput(output.output);
     if (status) {
+      if (
+        status.state === 'completed' &&
+        status.result &&
+        isAntigravitySyntheticQuotaText(status.result) &&
+        deps.syntheticQuotaCoordinator
+      ) {
+        const record = registerTaskOutputLaunch(
+          status.taskID,
+          pending,
+          exactCallConfirmed,
+          deps,
+        );
+        if (record) {
+          deps.clearRehydrateTombstone?.(status.taskID);
+          const outcome =
+            await deps.syntheticQuotaCoordinator.handleTaskQuotaIncident({
+              taskID: status.taskID,
+              text: status.result,
+              client: deps.client,
+              directory: deps.directory,
+              backgroundJobBoard: deps.backgroundJobBoard,
+              fallbackManager: deps.fallbackManager,
+              revivedRunTracker: deps.revivedRunTracker,
+              pendingParentSessionId: pending.parentSessionId,
+              pendingLabel: pending.label,
+              pendingAgent: pending.agentType,
+            });
+          if (outcome.handled) {
+            if (
+              outcome.status === 'launched' ||
+              outcome.status === 'already_active'
+            ) {
+              output.output = renderRunningTaskPlaceholder(status.taskID);
+              deps.taskContextTracker.pendingManagedTaskIds.add(status.taskID);
+              return;
+            }
+            output.output = `<task id="${status.taskID}" state="error">\n<summary>Background task failed: ${pending.label}</summary>\n<task_error>\n${status.result}\n</task_error>\n</task>`;
+            return;
+          }
+        }
+      }
+
       const record = registerTaskOutputLaunch(
         status.taskID,
         pending,

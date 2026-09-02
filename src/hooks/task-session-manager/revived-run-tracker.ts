@@ -7,6 +7,12 @@ import type {
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
 import { getClient } from '../../utils/opencode-client';
+import type { ForegroundFallbackManager } from '../foreground-fallback';
+import {
+  type AntigravityMessageEvidence,
+  isAntigravitySyntheticQuotaMessage,
+  type SyntheticQuotaCoordinator,
+} from '../foreground-fallback/synthetic-quota';
 
 const DEFAULT_NOTIFICATION_RETRIES = 3;
 const DEFAULT_RETRY_DELAY_MS = 1_000;
@@ -68,6 +74,8 @@ export function createRevivedRunTracker(options: {
   onSettled?: (taskID: string) => void;
   contextFilesForPrompt?: (taskID: string) => ContextFile[];
   pruneContext?: () => void;
+  fallbackManager?: ForegroundFallbackManager;
+  syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
 }): RevivedRunTracker {
   const runs = new Map<string, RevivedRun>();
   const maxNotificationRetries =
@@ -195,6 +203,69 @@ export function createRevivedRunTracker(options: {
       .map((part) => part.text as string)
       .join('\n\n')
       .trim();
+
+    const lastInfo = last.info as Record<string, unknown>;
+    const modelObj =
+      lastInfo.model && typeof lastInfo.model === 'object'
+        ? (lastInfo.model as Record<string, unknown>)
+        : undefined;
+    const providerID =
+      typeof lastInfo.providerID === 'string'
+        ? lastInfo.providerID
+        : typeof modelObj?.providerID === 'string'
+          ? modelObj.providerID
+          : undefined;
+    const modelID =
+      typeof lastInfo.modelID === 'string'
+        ? lastInfo.modelID
+        : typeof modelObj?.modelID === 'string'
+          ? modelObj.modelID
+          : undefined;
+    const evidence: AntigravityMessageEvidence = {
+      role: lastInfo.role,
+      providerID,
+      modelID,
+      finish: lastInfo.finish ?? lastInfo.finishReason,
+      error: lastInfo.error,
+      tokens: lastInfo.tokens,
+    };
+
+    if (isAntigravitySyntheticQuotaMessage(evidence, text)) {
+      const failedMessageID =
+        typeof last.info.id === 'string' ? last.info.id : undefined;
+      if (!failedMessageID || !options.syntheticQuotaCoordinator) return false;
+      const outcome =
+        await options.syntheticQuotaCoordinator.handleTaskQuotaIncident({
+          taskID: run.taskID,
+          text,
+          failedMessageID,
+          verifiedEvidence: {
+            model: `${providerID}/${modelID}`,
+            agent:
+              typeof lastInfo.agent === 'string' ? lastInfo.agent : undefined,
+            failedMessageID,
+          },
+          client: getClient(options.input),
+          directory: options.input.directory,
+          backgroundJobBoard: options.backgroundJobBoard,
+          fallbackManager: options.fallbackManager,
+          pendingParentSessionId: run.parentSessionID,
+          pendingLabel: run.description,
+          pendingAgent:
+            typeof lastInfo.agent === 'string' ? lastInfo.agent : undefined,
+        });
+      if (
+        outcome.status === 'launched' ||
+        outcome.status === 'already_active'
+      ) {
+        run.baselineMessageID = outcome.failedMessageID ?? failedMessageID;
+        return false;
+      }
+      if (!outcome.handled) return false;
+      const updated = options.backgroundJobBoard.get(run.taskID);
+      return updated?.generation === run.generation && finish(run, updated);
+    }
+
     const updated = options.backgroundJobBoard.updateStatus({
       taskID: run.taskID,
       expectedGeneration: run.generation,
@@ -332,6 +403,7 @@ export function createRevivedRunTracker(options: {
     baselineMessageID?: string;
     description: string;
   }): void {
+    if (disposed) return;
     const old = runs.get(input.taskID);
     if (old?.notification.retryTimer) clearTimeout(old.notification.retryTimer);
     runs.set(input.taskID, {

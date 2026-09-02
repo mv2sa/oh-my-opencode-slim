@@ -14,6 +14,11 @@ import {
   recordBackgroundJobSuppression,
 } from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
+import type { ForegroundFallbackManager } from '../foreground-fallback';
+import {
+  createSyntheticQuotaCoordinator,
+  type SyntheticQuotaCoordinator,
+} from '../foreground-fallback/synthetic-quota';
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
@@ -175,6 +180,8 @@ export function createTaskSessionManagerHook(
     /** Confirmed-idle grace; production supplies the configured value. */
     stopConfirmationMs?: number;
     revivedRunTracker?: RevivedRunTracker;
+    fallbackManager?: ForegroundFallbackManager;
+    syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
   },
 ) {
   const backgroundJobBoard =
@@ -204,6 +211,8 @@ export function createTaskSessionManagerHook(
     releaseLease: (lease) => backgroundJobBoard.releaseLease(lease),
   });
   const taskContextTracker = createTaskContextTracker();
+  const syntheticQuotaCoordinator =
+    options.syntheticQuotaCoordinator ?? createSyntheticQuotaCoordinator();
 
   const terminalJobsInjectedByParent = new Map<string, InjectedTerminalJobs>();
   const pendingInjectedTerminalJobsByParent = new Map<
@@ -388,6 +397,7 @@ export function createTaskSessionManagerHook(
       pendingInjectedTerminalJobsByParent.delete(sessionId);
       injectionState.retainedBoardSnapshots.delete(sessionId);
       injectionState.retainedTailBoards.delete(sessionId);
+      syntheticQuotaCoordinator.clearSession(sessionId);
       taskContextTracker.clearSession(sessionId);
       taskContextTracker.prune(backgroundJobBoard);
       pendingCallTracker.clearSession(sessionId);
@@ -425,6 +435,11 @@ export function createTaskSessionManagerHook(
     taskContextTracker,
     retainedBoardSnapshots: new Map(),
     retainedTailBoards: new Map(),
+    client: _ctx.client,
+    directory: _ctx.directory,
+    fallbackManager: options.fallbackManager,
+    revivedRunTracker: options.revivedRunTracker,
+    syntheticQuotaCoordinator,
   };
 
   return {
@@ -516,6 +531,10 @@ export function createTaskSessionManagerHook(
     ): Promise<void> => {
       await handleToolExecuteAfter(input, output, {
         directory: _ctx.directory,
+        client: _ctx.client,
+        fallbackManager: options.fallbackManager,
+        revivedRunTracker: options.revivedRunTracker,
+        syntheticQuotaCoordinator,
         backgroundJobBoard,
         backgroundJobSupervisor: options.backgroundJobSupervisor,
         recordLifecycleSuppression: (taskID) =>
@@ -570,7 +589,7 @@ export function createTaskSessionManagerHook(
         }
 
         for (const [partIndex, part] of message.parts.entries()) {
-          updateFromInjectedCompletion(
+          await updateFromInjectedCompletion(
             injectionState,
             part,
             message,
@@ -678,6 +697,7 @@ export function createTaskSessionManagerHook(
       }
 
       if (input.event.type === 'server.instance.disposed') {
+        syntheticQuotaCoordinator.dispose();
         parentActivity.clear();
         runtimeStatusReconciler.dispose();
       }

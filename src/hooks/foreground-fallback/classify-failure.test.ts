@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'bun:test';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { classifyFailure, classifyUncapped } from './classify-failure';
+import { CooldownRegistry } from './cooldown-registry';
+import {
+  isAntigravitySyntheticQuotaMessage,
+  isAntigravitySyntheticQuotaText,
+} from './synthetic-quota';
 
 const HOUR = 60 * 60 * 1000;
 
@@ -292,5 +300,190 @@ describe('classifyFailure', () => {
     // Non-quota classes are unaffected by the ceiling.
     expect(classifyFailure({ statusCode: 503 }).cooldownMs).toBe(30_000);
     expect(classifyFailure({ statusCode: 400 }).cooldownMs).toBe(0);
+  });
+});
+
+describe('isAntigravitySyntheticQuotaText', () => {
+  test('accepts exact Template 1 with various reset intervals and families', () => {
+    const valid = [
+      'All 1 account(s) rate-limited for gemini-2.5-pro. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.',
+      'All 3 account(s) rate-limited for gemini-3-flash. Quota resets in 33m. Add more accounts with `opencode auth login` or wait and retry.',
+      'All 1 account(s) rate-limited for claude-sonnet. Quota resets in 2d 4h. Add more accounts with `opencode auth login` or wait and retry.',
+      'All 2 account(s) rate-limited for gemini-flash. Quota resets in 5s. Add more accounts with `opencode auth login` or wait and retry.',
+    ];
+    for (const text of valid) {
+      expect(isAntigravitySyntheticQuotaText(text)).toBe(true);
+      expect(isAntigravitySyntheticQuotaText(`  ${text}  \n`)).toBe(true);
+    }
+  });
+
+  test('accepts exact Template 2 with various percentages and reset intervals', () => {
+    const valid = [
+      'Quota protection: All 1 account(s) are over 90% usage for gemini-2.5-pro. Quota resets in 1h 50m. Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.',
+      'Quota protection: All 2 account(s) are over 85.5% usage for gemini-flash. Quota resets in 33m. Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.',
+      'Quota protection: All 1 account(s) are over 100% usage for claude. Quota resets in 2d 4h. Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.',
+    ];
+    for (const text of valid) {
+      expect(isAntigravitySyntheticQuotaText(text)).toBe(true);
+      expect(isAntigravitySyntheticQuotaText(`\n${text}\n`)).toBe(true);
+    }
+  });
+
+  test('rejects prefix, suffix, quotes, and near-miss variants', () => {
+    const invalid = [
+      'Error: All 1 account(s) rate-limited for gemini-2.5-pro. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.',
+      'All 1 account(s) rate-limited for gemini-2.5-pro. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry. Please help.',
+      '"All 1 account(s) rate-limited for gemini-2.5-pro. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry."',
+      '> Quota protection: All 1 account(s) are over 90% usage for gemini-2.5-pro. Quota resets in 1h 50m. Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.',
+      'All 1 account(s) rate-limited for gemini-2.5-pro. Quota resets in 1h 50m.',
+      'Quota protection: All 1 account(s) are over 90% usage.',
+      'Individual quota reached. Please upgrade your subscription.',
+      'Rate limit exceeded. Quota resets in 10 minutes.',
+      'You have exceeded your Gemini API quota.',
+      '',
+    ];
+    for (const text of invalid) {
+      expect(isAntigravitySyntheticQuotaText(text)).toBe(false);
+    }
+  });
+});
+
+describe('isAntigravitySyntheticQuotaMessage', () => {
+  const baseEvidence = {
+    role: 'assistant',
+    providerID: 'google',
+    modelID: 'antigravity-gemini-3-flash',
+    finish: 'stop',
+    tokens: { input: 0, output: 33 },
+  };
+  const validText =
+    'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
+
+  test('accepts when all positive identity gate criteria match', () => {
+    expect(isAntigravitySyntheticQuotaMessage(baseEvidence, validText)).toBe(
+      true,
+    );
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        {
+          ...baseEvidence,
+          finish: 'STOP',
+          model: 'google/antigravity-gemini-3.7-flash',
+        },
+        validText,
+      ),
+    ).toBe(true);
+  });
+
+  test('fails open when any positive identity evidence is missing or invalid', () => {
+    // Role not assistant
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        { ...baseEvidence, role: 'user' },
+        validText,
+      ),
+    ).toBe(false);
+
+    // Assistant has explicit error
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        { ...baseEvidence, error: { message: 'some error' } },
+        validText,
+      ),
+    ).toBe(false);
+
+    // Provider not google
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        { ...baseEvidence, providerID: 'anthropic' },
+        validText,
+      ),
+    ).toBe(false);
+
+    // Model not antigravity-*
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        { ...baseEvidence, modelID: 'gemini-2.5-pro' },
+        validText,
+      ),
+    ).toBe(false);
+
+    // Finish not stop
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        { ...baseEvidence, finish: 'tool-calls' },
+        validText,
+      ),
+    ).toBe(false);
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        { ...baseEvidence, finish: 'length' },
+        validText,
+      ),
+    ).toBe(false);
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        { ...baseEvidence, finish: undefined },
+        validText,
+      ),
+    ).toBe(false);
+
+    // Input tokens missing or > 0
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        { ...baseEvidence, tokens: { input: 1 } },
+        validText,
+      ),
+    ).toBe(false);
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        { ...baseEvidence, tokens: undefined },
+        validText,
+      ),
+    ).toBe(false);
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        { ...baseEvidence, tokens: { input: '0' as any } },
+        validText,
+      ),
+    ).toBe(false);
+
+    // Non-matching text
+    expect(
+      isAntigravitySyntheticQuotaMessage(
+        baseEvidence,
+        'Quota limit reached. Please wait.',
+      ),
+    ).toBe(false);
+  });
+
+  test('classifies decimal soft quota percentages and persists cooldown in registry', () => {
+    const decimalQuota =
+      'Quota protection: All 1 account(s) are over 85.5% usage for gemini-flash. Quota resets in 33m. Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.';
+    expect(isAntigravitySyntheticQuotaText(decimalQuota)).toBe(true);
+
+    const verdict = classifyFailure(decimalQuota);
+    expect(verdict.class).toBe('quota');
+    expect(verdict.cooldownMs).toBe(33 * 60 * 1000);
+
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'omos-cooldown-test-'),
+    );
+    try {
+      const cooldownFile = path.join(tmpDir, 'cooldown.json');
+      const registry = new CooldownRegistry(cooldownFile);
+      const now = Date.now();
+      registry.markFailure('google/antigravity-gemini-3-flash', verdict, now);
+
+      const record = registry.list()['google/antigravity-gemini-3-flash'];
+      expect(record).toBeDefined();
+      expect(record?.deadUntil).toBe(now + 33 * 60 * 1000);
+      expect(record?.hits).toBe(1);
+      expect(registry.isDead('google/antigravity-gemini-3-flash', now)).toBe(
+        true,
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { RuntimeConfig } from './config/runtime';
 import { CooldownRegistry } from './hooks/foreground-fallback/cooldown-registry';
@@ -468,6 +468,92 @@ describe('persistent cooldown plugin hooks', () => {
       modelID: 'fallback',
     });
     expect(input.variant).toBeUndefined();
+    await hooks.dispose?.();
+  });
+
+  test('plugin handles Antigravity synthetic quota false completion in foreground event', async () => {
+    let promptBody: unknown;
+    const promptAsync = mock(async (args: unknown) => {
+      promptBody = args;
+      return {};
+    });
+    const messages = mock(async () => ({
+      data: [
+        {
+          info: { role: 'user', id: 'u1' },
+          parts: [{ type: 'text', text: 'analyze code' }],
+        },
+      ],
+    }));
+
+    const client = {
+      app: { log: async () => ({}) },
+      session: {
+        abort: mock(async () => ({})),
+        promptAsync,
+        messages,
+      },
+      tui: { showToast: mock(async () => ({})) },
+    };
+
+    await writeFile(
+      `${configDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        autoUpdate: false,
+        preset: 'quality',
+        presets: {
+          quality: {
+            oracle: {
+              model: [
+                'google/antigravity-gemini-3-flash',
+                'google/antigravity-gemini-3.7-flash',
+              ],
+              skills: [],
+              mcps: [],
+            },
+          },
+        },
+      }),
+    );
+
+    const hooks = await plugin({
+      client,
+      directory: configDir,
+      worktree: configDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+
+    const host: Record<string, unknown> = { agent: {} };
+    await hooks.config?.(host);
+
+    const quotaText =
+      'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
+
+    await hooks.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: 'ses-integrated-fg',
+            role: 'assistant',
+            agent: 'oracle',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText }],
+        },
+      },
+    });
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect((promptBody as any)?.body?.model).toEqual({
+      providerID: 'google',
+      modelID: 'antigravity-gemini-3.7-flash',
+    });
+
     await hooks.dispose?.();
   });
 });

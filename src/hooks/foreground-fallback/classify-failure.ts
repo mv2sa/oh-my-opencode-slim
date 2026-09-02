@@ -1,3 +1,5 @@
+import { isAntigravitySyntheticQuotaText } from './synthetic-quota';
+
 export type FailureClass =
   | 'quota'
   | 'rate-limit'
@@ -201,7 +203,8 @@ export function classifyUncapped(
   // than HTTP/JSON rate-limit responses. Its reset uses compact durations
   // (`1h 50m`), so the generic long-form parser below cannot recognize it.
   if (
-    /all \d+ account\(s\) rate-limited|quota protection:.*over \d+% usage|individual quota reached/i.test(
+    isAntigravitySyntheticQuotaText(text) ||
+    /all \d+ account\(s\) rate-limited|quota protection:.*over \d+(?:\.\d+)?% usage|individual quota reached/i.test(
       text,
     )
   ) {

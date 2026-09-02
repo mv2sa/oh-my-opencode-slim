@@ -526,6 +526,18 @@ respawn a pane on late busy events.
 wall-clock-only: no no-progress/plateau policy, foreground fallback, model swap,
 session deletion retry, or worker-death guarantee is implied.
 
+### Antigravity Synthetic Quota Fallback
+
+When Antigravity auth returns quota exhaustion via HTTP 200/STOP with 0 input tokens,
+the plugin identifies the failure via a positive gate (model `google/antigravity-*`,
+input tokens exactly 0, finish `stop`, no assistant error, and exact anchored template match).
+Rather than establishing the quota text as canonical task completion, the plugin:
+- marks a durable cooldown for the failed model matching the parsed reset interval (capped at 5 hours),
+- rewrites false completion task outputs/injected completions to the byte-stable running placeholder,
+- continues execution on the affected agent's configured model ladder via non-aborting continuation prompts,
+- tracks the replacement run through `RevivedRunTracker` so the real replacement result is delivered once to the parent orchestrator,
+- surfaces terminal error state if the fallback chain is exhausted or recovery cannot start.
+
 ---
 
 ## Startup Behavior

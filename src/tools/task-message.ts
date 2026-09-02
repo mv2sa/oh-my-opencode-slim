@@ -179,6 +179,9 @@ function assertMessageLease(
   lease: NonNullable<ReturnType<BackgroundJobStore['acquireMessageLease']>>,
   requested: string,
 ): void {
+  if (!backgroundJobBoard.get(lease.taskID)) {
+    throw new Error(`Task ${requested} is no longer tracked`);
+  }
   if (lease.kind !== 'message' || !backgroundJobBoard.validateLease(lease)) {
     throw new Error(
       `Task ${requested} message lease is no longer valid; refusing stale message`,

@@ -32,6 +32,7 @@ import {
   SessionLifecycle,
 } from './hooks';
 import { getCooldownRegistry } from './hooks/foreground-fallback/cooldown-registry';
+import { createSyntheticQuotaCoordinator } from './hooks/foreground-fallback/synthetic-quota';
 import { processImageAttachments } from './hooks/image-hook';
 import { createRevivedRunTracker } from './hooks/task-session-manager/revived-run-tracker';
 import type { ToolLoopGuardHook } from './hooks/tool-loop-guard/hook';
@@ -309,45 +310,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
       backgroundJobSupervisor.onTerminal(record);
     });
-    revivedRunTracker = createRevivedRunTracker({
-      input: ctx,
-      backgroundJobBoard: backgroundJobCoordinator,
-      backgroundJobSupervisor,
-      onRegister: (taskID) => markRevivedRunPending(taskID),
-      onSettled: (taskID) => markRevivedRunSettled(taskID),
-      contextFilesForPrompt: (taskID) => getRevivedContextFiles(taskID),
-      pruneContext: () => pruneRevivedContext(),
-    });
-    backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
-      revivedRunTracker.onTerminal(record);
-    });
-
-    // Initialize MultiplexerSessionManager to handle OpenCode's built-in
-    // Task tool sessions
-    multiplexerSessionManager = new MultiplexerSessionManager(
-      ctx,
-      multiplexerConfig,
-      backgroundJobCoordinator,
-    );
-    backgroundJobCoordinator.addTerminalStateListener((taskID) => {
-      void multiplexerSessionManager.closeSessionFromCoordinator(taskID);
-    });
-    backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
-      if (record.deadlineExceededAt === undefined) return;
-      void multiplexerSessionManager.closeSessionPermanentlyFromCoordinator(
-        record.taskID,
-      );
-    });
-
     sessionLifecycle = new SessionLifecycle(log);
-
-    // Initialize auto-update checker hook
-    autoUpdateChecker = createAutoUpdateCheckerHook(ctx, {
-      autoUpdate: runtime.autoUpdate,
-      companion: runtime.companion,
-    });
-
-    chatHeadersHook = createChatHeadersHook(ctx);
 
     // Initialize foreground fallback manager for runtime model switching.
     // Agents without a chain (e.g. councillor, owned by CouncilManager) are
@@ -373,7 +336,49 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           ),
         ]),
       ),
+      (sessionID) => backgroundJobBoard.get(sessionID) !== undefined,
     );
+
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator();
+    revivedRunTracker = createRevivedRunTracker({
+      input: ctx,
+      backgroundJobBoard: backgroundJobCoordinator,
+      backgroundJobSupervisor,
+      onRegister: (taskID) => markRevivedRunPending(taskID),
+      onSettled: (taskID) => markRevivedRunSettled(taskID),
+      contextFilesForPrompt: (taskID) => getRevivedContextFiles(taskID),
+      pruneContext: () => pruneRevivedContext(),
+      fallbackManager: foregroundFallback,
+      syntheticQuotaCoordinator,
+    });
+    backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
+      revivedRunTracker.onTerminal(record);
+    });
+
+    // Initialize MultiplexerSessionManager to handle OpenCode's built-in
+    // Task tool sessions
+    multiplexerSessionManager = new MultiplexerSessionManager(
+      ctx,
+      multiplexerConfig,
+      backgroundJobCoordinator,
+    );
+    backgroundJobCoordinator.addTerminalStateListener((taskID) => {
+      void multiplexerSessionManager.closeSessionFromCoordinator(taskID);
+    });
+    backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
+      if (record.deadlineExceededAt === undefined) return;
+      void multiplexerSessionManager.closeSessionPermanentlyFromCoordinator(
+        record.taskID,
+      );
+    });
+
+    // Initialize auto-update checker hook
+    autoUpdateChecker = createAutoUpdateCheckerHook(ctx, {
+      autoUpdate: runtime.autoUpdate,
+      companion: runtime.companion,
+    });
+
+    chatHeadersHook = createChatHeadersHook(ctx);
 
     deepworkCommandHook = createDeepworkCommandHook();
     reflectCommandHook = createReflectCommandHook();
@@ -398,6 +403,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         foregroundFallback.willAttemptFallback(sessionID),
       coordinator: sessionLifecycle,
       revivedRunTracker,
+      fallbackManager: foregroundFallback,
+      syntheticQuotaCoordinator,
     });
     markRevivedRunPending = taskSessionManagerHook.markRevivedRunPending;
     markRevivedRunSettled = taskSessionManagerHook.clearRevivedRunPending;

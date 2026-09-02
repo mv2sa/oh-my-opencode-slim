@@ -37,8 +37,14 @@ import {
   isVolatileTaggedMessage,
   stripTaggedContent,
 } from '../cache-safe-injection';
+import type { ForegroundFallbackManager } from '../foreground-fallback';
+import {
+  isAntigravitySyntheticQuotaText,
+  type SyntheticQuotaCoordinator,
+} from '../foreground-fallback/synthetic-quota';
 import type { MessagePart, MessageWithParts } from '../types';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
+import type { RevivedRunTracker } from './revived-run-tracker';
 import {
   extractTaskSummary,
   formatCancelledTaskStatusOutput,
@@ -120,10 +126,7 @@ type SyntheticTerminalOccurrenceLookup =
       reason: string;
     };
 
-type SyntheticTerminalProvenanceKind =
-  | 'explicit'
-  | 'host-message'
-  | 'legacy';
+type SyntheticTerminalProvenanceKind = 'explicit' | 'host-message' | 'legacy';
 
 const HOST_MESSAGE_OCCURRENCE_PREFIX = 'host-message:';
 
@@ -170,6 +173,11 @@ export interface InjectionState {
    * onward - the field bust in dumps 000086->000087).
    */
   retainedTailBoards: Map<string, Map<string, RetainedTailBoard>>;
+  client?: unknown;
+  directory?: string;
+  fallbackManager?: ForegroundFallbackManager;
+  revivedRunTracker?: RevivedRunTracker;
+  syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -428,7 +436,10 @@ function findSyntheticTerminalOccurrence(
           origin.generationAtObservation === currentGeneration,
       )
       .map(([, origin]) => origin);
-    if (candidates.length === 1 && candidates[0].occurrenceID === occurrenceID) {
+    if (
+      candidates.length === 1 &&
+      candidates[0].occurrenceID === occurrenceID
+    ) {
       return { kind: 'matched', origin: candidates[0] };
     }
     if (candidates.length > 1) {
@@ -688,13 +699,13 @@ export function stabilizeRunningTaskParts(messages: unknown[]): void {
   }
 }
 
-export function updateFromInjectedCompletion(
+export async function updateFromInjectedCompletion(
   state: InjectionState,
   part: MessagePart,
   message: MessageWithParts,
   _messageIndex: number,
   partIndex: number,
-): BackgroundJobRecord | undefined {
+): Promise<BackgroundJobRecord | undefined> {
   if (part.type !== 'text' || typeof part.text !== 'string') {
     return undefined;
   }
@@ -889,6 +900,74 @@ export function updateFromInjectedCompletion(
       });
     }
     return existing;
+  }
+
+  if (
+    isCompleted &&
+    status.result &&
+    isAntigravitySyntheticQuotaText(status.result) &&
+    state.syntheticQuotaCoordinator
+  ) {
+    const outcome =
+      await state.syntheticQuotaCoordinator.handleTaskQuotaIncident({
+        taskID: status.taskID,
+        text: status.result,
+        client: state.client,
+        directory: state.directory ?? '',
+        backgroundJobBoard: state.backgroundJobBoard,
+        fallbackManager: state.fallbackManager,
+        revivedRunTracker: state.revivedRunTracker,
+      });
+    if (outcome.handled) {
+      if (
+        outcome.status === 'launched' ||
+        outcome.status === 'already_active'
+      ) {
+        part.text = renderRunningTaskPlaceholder(status.taskID);
+        rememberProcessedSyntheticTerminal(
+          state,
+          status.taskID,
+          occurrenceId,
+          provenanceKind,
+          origin,
+          existing?.generation,
+        );
+        rememberProcessedInjectedCompletion(
+          state,
+          status.taskID,
+          occurrenceId,
+          provenanceKind,
+          {
+            taskID: status.taskID,
+            generation: existing?.generation ?? 0,
+            lifecycleEpoch: state.getLifecycleEpoch?.() ?? 0,
+          },
+        );
+        return existing;
+      }
+
+      part.text = `<task id="${status.taskID}" state="error">\n<summary>Background task failed: ${existing?.description ?? status.taskID}</summary>\n<task_error>\n${status.result}\n</task_error>\n</task>`;
+      rememberProcessedSyntheticTerminal(
+        state,
+        status.taskID,
+        occurrenceId,
+        provenanceKind,
+        origin,
+        existing?.generation,
+      );
+      rememberProcessedInjectedCompletion(
+        state,
+        status.taskID,
+        occurrenceId,
+        provenanceKind,
+        {
+          taskID: status.taskID,
+          generation: existing?.generation ?? 0,
+          lifecycleEpoch: state.getLifecycleEpoch?.() ?? 0,
+        },
+      );
+      return state.backgroundJobBoard.get(status.taskID) ?? existing;
+    }
   }
 
   if (isCompleted && status.state !== 'completed') return undefined;
