@@ -1,0 +1,1125 @@
+import { createHash } from 'node:crypto';
+import { z } from 'zod';
+import {
+  EvidenceFreshnessSchema,
+  EvidenceStatusSchema,
+  GoalStatusSchema,
+  OutcomeVerdictSchema,
+  RuleEnforcementStatusSchema,
+  RuleTypeSchema,
+} from './schema';
+
+export const OUTCOME_RECORD_SCHEMA = 'omos_outcome_record' as const;
+export const OUTCOME_RECORD_VERSION = 1 as const;
+export const MAX_OUTCOME_RECORD_BYTES = 100 * 1024;
+
+const Id = z
+  .string()
+  .trim()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9_.:@-]+$/);
+const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+const ShortText = z.string().trim().min(1).max(256);
+const Text = z.string().trim().min(1).max(512);
+const Summary = z.string().trim().min(1).max(1024);
+const Timestamp = z.number().int().nonnegative();
+const Revision = z.number().int().positive();
+
+export const OutcomeSessionIdSchema = Id.refine(
+  (value) => value !== '.' && !value.includes('..'),
+  'Session ID contains a path traversal pattern',
+);
+
+export const OutcomePhaseSchema = z.enum([
+  'active',
+  'checkpointing',
+  'reviewing',
+  'waiting_user',
+  'waiting_external',
+  'action_required',
+  'accepted',
+  'failed',
+  'corrupted',
+]);
+export type OutcomePhase = z.infer<typeof OutcomePhaseSchema>;
+
+export const OutcomeCheckpointKindSchema = z.enum([
+  'kickoff',
+  'decision',
+  'exception',
+  'final',
+]);
+export type OutcomeCheckpointKind = z.infer<typeof OutcomeCheckpointKindSchema>;
+
+export const OutcomeClaimStateSchema = z.enum([
+  'claimed',
+  'dispatching',
+  'running',
+  'result_available',
+  'review_accepted',
+  'review_rejected',
+  'review_invalid',
+  'review_uncertain',
+  'retired',
+]);
+export type OutcomeClaimState = z.infer<typeof OutcomeClaimStateSchema>;
+
+export const OutcomeGoalSchema = z
+  .object({
+    id: Id,
+    description: Text,
+    status: GoalStatusSchema,
+    notes: Text.optional(),
+  })
+  .strict();
+export type OutcomeGoal = z.infer<typeof OutcomeGoalSchema>;
+
+export const OutcomeRuleSchema = z
+  .object({
+    id: Id,
+    sourcePath: Text,
+    category: Id,
+    summary: Text,
+    ruleType: RuleTypeSchema,
+    enforcementStatus: RuleEnforcementStatusSchema,
+    evidenceAttestationIds: z.array(Id).max(16),
+    notes: Text.optional(),
+  })
+  .strict();
+export type OutcomeRule = z.infer<typeof OutcomeRuleSchema>;
+
+export const OutcomeExceptionSchema = z
+  .object({
+    ruleId: Id,
+    justification: Text,
+    scope: ShortText,
+    authorizationId: Id,
+  })
+  .strict();
+export type OutcomeException = z.infer<typeof OutcomeExceptionSchema>;
+
+export const OutcomeContractSchema = z
+  .object({
+    classification: z.literal('non_trivial'),
+    objective: Text,
+    deliverables: z.array(Text).min(1).max(16),
+    goals: z.array(OutcomeGoalSchema).min(1).max(32),
+    inScope: z.array(ShortText).min(1).max(32),
+    outOfScope: z.array(ShortText).max(32),
+    constraints: z.array(Text).max(32),
+    safetyBoundaries: z.array(Text).max(16),
+    handoffRequirements: z.array(Text).min(1).max(16),
+    sourceMessageIds: z.array(Id).min(1).max(32),
+    rules: z.array(OutcomeRuleSchema).max(64),
+    exceptions: z.array(OutcomeExceptionSchema).max(32),
+  })
+  .strict()
+  .superRefine((contract, ctx) => {
+    addDuplicateIssues(contract.goals, 'id', ['goals'], ctx);
+    addDuplicateIssues(contract.rules, 'id', ['rules'], ctx);
+    addDuplicateIssues(contract.exceptions, 'ruleId', ['exceptions'], ctx);
+    addDuplicateStringIssues(
+      contract.sourceMessageIds,
+      ['sourceMessageIds'],
+      ctx,
+    );
+
+    const rules = new Map(contract.rules.map((rule) => [rule.id, rule]));
+    const exceptions = new Set(contract.exceptions.map((item) => item.ruleId));
+    for (const [index, exception] of contract.exceptions.entries()) {
+      const rule = rules.get(exception.ruleId);
+      if (rule?.enforcementStatus !== 'waived') {
+        issue(
+          ctx,
+          ['exceptions', index, 'ruleId'],
+          'Exception must target a waived rule',
+        );
+      }
+    }
+    for (const [index, rule] of contract.rules.entries()) {
+      if (rule.enforcementStatus === 'waived' && !exceptions.has(rule.id)) {
+        issue(
+          ctx,
+          ['rules', index],
+          'Waived rule requires exactly one exception',
+        );
+      }
+    }
+  });
+export type OutcomeContract = z.infer<typeof OutcomeContractSchema>;
+
+export const OutcomeToolObservationSchema = z
+  .object({
+    id: Id,
+    kind: z.literal('controller_observed'),
+    callId: Id,
+    toolName: Id,
+    argumentDigest: Digest,
+    startedEpoch: Id,
+    startedAt: Timestamp,
+    completionObserved: z.boolean(),
+    outputDigest: Digest.optional(),
+    completedEpoch: Id.optional(),
+    completedAt: Timestamp.optional(),
+  })
+  .strict()
+  .superRefine((observation, ctx) => {
+    const completionFields = [
+      observation.outputDigest,
+      observation.completedEpoch,
+      observation.completedAt,
+    ];
+    if (observation.completionObserved) {
+      if (completionFields.some((value) => value === undefined)) {
+        issue(
+          ctx,
+          ['completionObserved'],
+          'Completed observation requires output digest, epoch, and time',
+        );
+      }
+      if (
+        observation.completedAt !== undefined &&
+        observation.completedAt < observation.startedAt
+      ) {
+        issue(ctx, ['completedAt'], 'Completion cannot precede start');
+      }
+      if (observation.completedEpoch !== observation.startedEpoch) {
+        issue(
+          ctx,
+          ['completedEpoch'],
+          'A generic completion must belong to its start epoch',
+        );
+      }
+    } else if (completionFields.some((value) => value !== undefined)) {
+      issue(
+        ctx,
+        ['completionObserved'],
+        'Incomplete observation cannot carry completion fields',
+      );
+    }
+  });
+export type OutcomeToolObservation = z.infer<
+  typeof OutcomeToolObservationSchema
+>;
+
+export const OutcomeEvidenceAttestationSchema = z
+  .object({
+    id: Id,
+    kind: z.literal('orchestrator_attestation'),
+    description: Text,
+    assertedStatus: EvidenceStatusSchema,
+    assertedFreshness: EvidenceFreshnessSchema,
+    candidateFingerprint: Digest,
+    linkedObservationId: Id.optional(),
+    payloadDigest: Digest,
+    createdRevision: Revision,
+    createdAt: Timestamp,
+  })
+  .strict();
+export type OutcomeEvidenceAttestation = z.infer<
+  typeof OutcomeEvidenceAttestationSchema
+>;
+
+export const OutcomeEvidenceEntrySchema = z.discriminatedUnion('kind', [
+  OutcomeToolObservationSchema,
+  OutcomeEvidenceAttestationSchema,
+]);
+export type OutcomeEvidenceEntry = z.infer<typeof OutcomeEvidenceEntrySchema>;
+
+export const OutcomeUserMessageReceiptSchema = z
+  .object({
+    id: Id,
+    messageId: Id,
+    contentDigest: Digest,
+    observedEpoch: Id,
+    observedAt: Timestamp,
+  })
+  .strict();
+export type OutcomeUserMessageReceipt = z.infer<
+  typeof OutcomeUserMessageReceiptSchema
+>;
+
+export const OutcomeDecisionReceiptSchema = z
+  .object({
+    id: Id,
+    decisionNeeded: Text,
+    options: z.array(ShortText).min(1).max(16),
+    blocking: z.boolean(),
+    impact: Text.optional(),
+    chosenOption: ShortText.optional(),
+    sourceUserMessageReceiptId: Id.optional(),
+    decidedAt: Timestamp.optional(),
+  })
+  .strict()
+  .superRefine((decision, ctx) => {
+    const resolved = decision.chosenOption !== undefined;
+    if (
+      resolved !== (decision.sourceUserMessageReceiptId !== undefined) ||
+      resolved !== (decision.decidedAt !== undefined)
+    ) {
+      issue(
+        ctx,
+        ['chosenOption'],
+        'Resolved decision requires source receipt and decidedAt',
+      );
+    }
+    if (
+      decision.chosenOption !== undefined &&
+      !decision.options.includes(decision.chosenOption)
+    ) {
+      issue(
+        ctx,
+        ['chosenOption'],
+        'Chosen option must be one of the offered options',
+      );
+    }
+  });
+export type OutcomeDecisionReceipt = z.infer<
+  typeof OutcomeDecisionReceiptSchema
+>;
+
+export const OutcomeAuthorizationReceiptSchema = z
+  .object({
+    id: Id,
+    kind: z.enum(['repository_waiver', 'user_decision']),
+    reference: ShortText,
+    payloadDigest: Digest,
+    decisionId: Id.optional(),
+    observedAt: Timestamp,
+  })
+  .strict()
+  .superRefine((authorization, ctx) => {
+    if (
+      (authorization.kind === 'user_decision') !==
+      (authorization.decisionId !== undefined)
+    ) {
+      issue(
+        ctx,
+        ['decisionId'],
+        'User authorization requires a decision ID; repository waiver forbids it',
+      );
+    }
+  });
+export type OutcomeAuthorizationReceipt = z.infer<
+  typeof OutcomeAuthorizationReceiptSchema
+>;
+
+export const OutcomeReceiptsSchema = z
+  .object({
+    evidence: z.array(OutcomeEvidenceEntrySchema).max(64),
+    userMessages: z.array(OutcomeUserMessageReceiptSchema).max(32),
+    decisions: z.array(OutcomeDecisionReceiptSchema).max(32),
+    authorizations: z.array(OutcomeAuthorizationReceiptSchema).max(32),
+  })
+  .strict();
+export type OutcomeReceipts = z.infer<typeof OutcomeReceiptsSchema>;
+
+export const OutcomeManagerReviewSummarySchema = z
+  .object({
+    reviewId: Id,
+    checkpointId: Id,
+    claimGeneration: z.number().int().positive(),
+    checkpointKind: OutcomeCheckpointKindSchema,
+    contractDigest: Digest,
+    outcomeRevision: Revision,
+    verdict: OutcomeVerdictSchema,
+    managerTaskId: Id,
+    managerGeneration: z.number().int().positive(),
+    resultDigest: Digest,
+    reviewDigest: Digest,
+    candidateFingerprint: Digest.optional(),
+    summary: Summary,
+    evaluatedAt: Timestamp,
+  })
+  .strict();
+export type OutcomeManagerReviewSummary = z.infer<
+  typeof OutcomeManagerReviewSummarySchema
+>;
+
+export const OutcomeCheckpointClaimSchema = z
+  .object({
+    outcomeId: Id,
+    rootSessionId: OutcomeSessionIdSchema,
+    checkpointId: Id,
+    kind: OutcomeCheckpointKindSchema,
+    reason: Text,
+    claimGeneration: z.number().int().positive(),
+    claimTokenDigest: Digest,
+    checkpointFingerprint: Digest,
+    contractDigest: Digest,
+    outcomeRevision: Revision,
+    serverEpoch: Id,
+    claimedAt: Timestamp,
+    expiresAt: Timestamp,
+    candidateFingerprint: Digest.optional(),
+    includedDecisionIds: z.array(Id).max(32),
+    includedExceptionRuleIds: z.array(Id).max(32),
+    includedEvidenceAttestationIds: z.array(Id).max(64),
+    state: OutcomeClaimStateSchema,
+    dispatchCallId: Id.optional(),
+    managerTaskId: Id.optional(),
+    managerGeneration: z.number().int().positive().optional(),
+    resultDigest: Digest.optional(),
+    reviewDigest: Digest.optional(),
+    recoveryNote: Text.optional(),
+  })
+  .strict()
+  .superRefine((claim, ctx) => {
+    addDuplicateStringIssues(
+      claim.includedDecisionIds,
+      ['includedDecisionIds'],
+      ctx,
+    );
+    addDuplicateStringIssues(
+      claim.includedExceptionRuleIds,
+      ['includedExceptionRuleIds'],
+      ctx,
+    );
+    addDuplicateStringIssues(
+      claim.includedEvidenceAttestationIds,
+      ['includedEvidenceAttestationIds'],
+      ctx,
+    );
+    if (claim.expiresAt < claim.claimedAt)
+      issue(ctx, ['expiresAt'], 'Expiry cannot precede claim');
+    if (claim.kind === 'final' && !claim.candidateFingerprint) {
+      issue(
+        ctx,
+        ['candidateFingerprint'],
+        'Final checkpoint requires candidate fingerprint',
+      );
+    }
+
+    const hasManager = claim.managerTaskId !== undefined;
+    if (hasManager !== (claim.managerGeneration !== undefined)) {
+      issue(
+        ctx,
+        ['managerTaskId'],
+        'Manager task ID and generation must appear together',
+      );
+    }
+    if (claim.state === 'claimed') {
+      if (
+        claim.dispatchCallId ||
+        hasManager ||
+        claim.resultDigest ||
+        claim.reviewDigest
+      ) {
+        issue(
+          ctx,
+          ['state'],
+          'Claimed checkpoint cannot contain dispatch or result fields',
+        );
+      }
+    } else if (claim.state === 'dispatching') {
+      if (
+        !claim.dispatchCallId ||
+        hasManager ||
+        claim.resultDigest ||
+        claim.reviewDigest
+      ) {
+        issue(
+          ctx,
+          ['state'],
+          'Dispatching checkpoint requires only dispatchCallId',
+        );
+      }
+    } else if (claim.state === 'review_uncertain') {
+      if (!claim.dispatchCallId || !claim.recoveryNote) {
+        issue(
+          ctx,
+          ['state'],
+          'Uncertain checkpoint requires dispatch identity and recovery note',
+        );
+      }
+    } else if (claim.state === 'retired') {
+      if (!claim.recoveryNote) {
+        issue(
+          ctx,
+          ['recoveryNote'],
+          'Retired checkpoint requires a recovery note',
+        );
+      }
+    } else {
+      if (!claim.dispatchCallId || !hasManager) {
+        issue(
+          ctx,
+          ['state'],
+          'Post-dispatch checkpoint requires dispatch and Manager identity',
+        );
+      }
+      if (claim.state === 'result_available' && !claim.resultDigest) {
+        issue(ctx, ['resultDigest'], 'Available result requires result digest');
+      }
+      if (
+        ['review_accepted', 'review_rejected', 'review_invalid'].includes(
+          claim.state,
+        ) &&
+        !claim.reviewDigest
+      ) {
+        issue(
+          ctx,
+          ['reviewDigest'],
+          'Reviewed checkpoint requires review digest',
+        );
+      }
+    }
+  });
+export type OutcomeCheckpointClaim = z.infer<
+  typeof OutcomeCheckpointClaimSchema
+>;
+
+export const OutcomePendingOperationSchema = z
+  .object({
+    id: Id,
+    callId: Id,
+    toolName: Id,
+    argumentDigest: Digest,
+    serverEpoch: Id,
+    status: z.enum([
+      'running',
+      'completed',
+      'failed',
+      'interrupted',
+      'acknowledged',
+    ]),
+    startedAt: Timestamp,
+    updatedAt: Timestamp,
+    error: Text.optional(),
+  })
+  .strict()
+  .refine((operation) => operation.updatedAt >= operation.startedAt, {
+    message: 'Operation update cannot precede start',
+    path: ['updatedAt'],
+  });
+export type OutcomePendingOperation = z.infer<
+  typeof OutcomePendingOperationSchema
+>;
+
+export const OutcomeWaitConditionSchema = z
+  .object({
+    kind: z.enum([
+      'user_decision',
+      'external_handoff',
+      'subagent_run',
+      'evidence_collection',
+    ]),
+    referenceId: Id,
+    reason: Text,
+    createdAt: Timestamp,
+  })
+  .strict();
+export type OutcomeWaitCondition = z.infer<typeof OutcomeWaitConditionSchema>;
+
+export const OutcomeActionRequiredSchema = z
+  .object({
+    id: Id,
+    code: z.enum([
+      'stale_claim',
+      'interrupted_operation',
+      'review_uncertain',
+      'corrupt_state',
+      'manual_intervention',
+    ]),
+    referenceId: Id,
+    reason: Text,
+    createdAt: Timestamp,
+    resolvedAt: Timestamp.optional(),
+  })
+  .strict()
+  .refine(
+    (action) =>
+      action.resolvedAt === undefined || action.resolvedAt >= action.createdAt,
+    {
+      message: 'Action resolution cannot precede creation',
+      path: ['resolvedAt'],
+    },
+  );
+export type OutcomeActionRequired = z.infer<typeof OutcomeActionRequiredSchema>;
+
+export const OutcomeEvidenceAssuranceSchema = z.enum([
+  'orchestrator_attestation',
+  'mixed',
+  'controller_verified',
+]);
+
+export const OutcomeFinalCertificateSchema = z
+  .object({
+    outcomeId: Id,
+    acceptedRevision: Revision,
+    contractDigest: Digest,
+    candidateFingerprint: Digest,
+    acceptedCheckpointId: Id,
+    acceptedClaimGeneration: z.number().int().positive(),
+    finalCheckpointFingerprint: Digest,
+    managerTaskId: Id,
+    managerGeneration: z.number().int().positive(),
+    managerReviewId: Id,
+    managerReviewDigest: Digest,
+    receiptDigests: z.array(Digest).max(64),
+    evidenceAssurance: OutcomeEvidenceAssuranceSchema,
+    acceptedAt: Timestamp,
+    serverEpoch: Id,
+    summary: Summary,
+  })
+  .strict();
+export type OutcomeFinalCertificate = z.infer<
+  typeof OutcomeFinalCertificateSchema
+>;
+
+const OutcomeRecordBaseSchema = z
+  .object({
+    schema: z.literal(OUTCOME_RECORD_SCHEMA),
+    schemaVersion: z.literal(OUTCOME_RECORD_VERSION),
+    outcomeId: Id,
+    rootSessionId: OutcomeSessionIdSchema,
+    serverEpoch: Id,
+    revision: Revision,
+    nextClaimGeneration: Revision,
+    contractDigest: Digest,
+    createdAt: Timestamp,
+    updatedAt: Timestamp,
+    phase: OutcomePhaseSchema,
+    contract: OutcomeContractSchema,
+    receipts: OutcomeReceiptsSchema,
+    reviewSummaries: z.array(OutcomeManagerReviewSummarySchema).max(32),
+    checkpoint: OutcomeCheckpointClaimSchema.optional(),
+    waitCondition: OutcomeWaitConditionSchema.optional(),
+    operations: z.array(OutcomePendingOperationSchema).max(32),
+    actionsRequired: z.array(OutcomeActionRequiredSchema).max(16),
+    finalCertificate: OutcomeFinalCertificateSchema.optional(),
+  })
+  .strict();
+
+type OutcomeRecordBase = z.infer<typeof OutcomeRecordBaseSchema>;
+
+export const OutcomeRecordSchema = OutcomeRecordBaseSchema.superRefine(
+  (record, ctx) => validateRecordRelations(record, ctx),
+);
+export type OutcomeRecord = z.infer<typeof OutcomeRecordSchema>;
+
+export function canonicalDigest(domain: string, value: unknown): string {
+  const jsonCompatible = JSON.parse(JSON.stringify(value)) as unknown;
+  return `sha256:${createHash('sha256')
+    .update(`${domain}\0${stableJson(jsonCompatible)}`, 'utf8')
+    .digest('hex')}`;
+}
+
+export function computeOutcomeContractDigest(
+  contract: OutcomeContract,
+): string {
+  return canonicalDigest(
+    'omos/outcome-contract/v1',
+    OutcomeContractSchema.parse(contract),
+  );
+}
+
+export function computeOutcomeCheckpointFingerprint(
+  claim: Pick<
+    OutcomeCheckpointClaim,
+    | 'outcomeId'
+    | 'rootSessionId'
+    | 'checkpointId'
+    | 'kind'
+    | 'reason'
+    | 'claimGeneration'
+    | 'claimTokenDigest'
+    | 'contractDigest'
+    | 'outcomeRevision'
+    | 'serverEpoch'
+    | 'claimedAt'
+    | 'expiresAt'
+    | 'candidateFingerprint'
+    | 'includedDecisionIds'
+    | 'includedExceptionRuleIds'
+    | 'includedEvidenceAttestationIds'
+  >,
+): string {
+  return canonicalDigest('omos/outcome-checkpoint/v1', {
+    outcomeId: claim.outcomeId,
+    rootSessionId: claim.rootSessionId,
+    checkpointId: claim.checkpointId,
+    kind: claim.kind,
+    reason: claim.reason,
+    claimGeneration: claim.claimGeneration,
+    claimTokenDigest: claim.claimTokenDigest,
+    contractDigest: claim.contractDigest,
+    outcomeRevision: claim.outcomeRevision,
+    serverEpoch: claim.serverEpoch,
+    claimedAt: claim.claimedAt,
+    expiresAt: claim.expiresAt,
+    ...(claim.candidateFingerprint
+      ? { candidateFingerprint: claim.candidateFingerprint }
+      : {}),
+    includedDecisionIds: claim.includedDecisionIds,
+    includedExceptionRuleIds: claim.includedExceptionRuleIds,
+    includedEvidenceAttestationIds: claim.includedEvidenceAttestationIds,
+  });
+}
+
+export function parseOutcomeRecord(value: unknown): OutcomeRecord {
+  const record = OutcomeRecordSchema.parse(value);
+  if (record.contractDigest !== computeOutcomeContractDigest(record.contract)) {
+    throw new Error('Outcome record contract digest mismatch');
+  }
+  return record;
+}
+
+export function serializeOutcomeRecord(record: OutcomeRecord): string {
+  const parsed = parseOutcomeRecord(record);
+  const serialized = `${JSON.stringify(parsed, null, 2)}\n`;
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_OUTCOME_RECORD_BYTES) {
+    throw new Error(`Outcome record exceeds ${MAX_OUTCOME_RECORD_BYTES} bytes`);
+  }
+  return serialized;
+}
+
+function validateRecordRelations(
+  record: OutcomeRecordBase,
+  ctx: z.RefinementCtx,
+): void {
+  if (record.contractDigest !== computeOutcomeContractDigest(record.contract)) {
+    issue(
+      ctx,
+      ['contractDigest'],
+      'Contract digest does not match canonical contract',
+    );
+  }
+  if (record.updatedAt < record.createdAt)
+    issue(ctx, ['updatedAt'], 'Update cannot precede creation');
+
+  addDuplicateIssues(
+    record.receipts.evidence,
+    'id',
+    ['receipts', 'evidence'],
+    ctx,
+  );
+  addDuplicateIssues(
+    record.receipts.userMessages,
+    'id',
+    ['receipts', 'userMessages'],
+    ctx,
+  );
+  addDuplicateIssues(
+    record.receipts.decisions,
+    'id',
+    ['receipts', 'decisions'],
+    ctx,
+  );
+  addDuplicateIssues(
+    record.receipts.authorizations,
+    'id',
+    ['receipts', 'authorizations'],
+    ctx,
+  );
+  addDuplicateIssues(
+    record.reviewSummaries,
+    'reviewId',
+    ['reviewSummaries'],
+    ctx,
+  );
+  addDuplicateIssues(record.operations, 'id', ['operations'], ctx);
+  addDuplicateIssues(record.actionsRequired, 'id', ['actionsRequired'], ctx);
+
+  const observations = new Set(
+    record.receipts.evidence
+      .filter((entry) => entry.kind === 'controller_observed')
+      .map((entry) => entry.id),
+  );
+  const attestations = new Map(
+    record.receipts.evidence
+      .filter((entry) => entry.kind === 'orchestrator_attestation')
+      .map((entry) => [entry.id, entry]),
+  );
+  for (const [index, entry] of record.receipts.evidence.entries()) {
+    if (entry.kind !== 'orchestrator_attestation') continue;
+    if (entry.createdRevision > record.revision) {
+      issue(
+        ctx,
+        ['receipts', 'evidence', index, 'createdRevision'],
+        'Attestation revision is in the future',
+      );
+    }
+    if (
+      entry.linkedObservationId &&
+      !observations.has(entry.linkedObservationId)
+    ) {
+      issue(
+        ctx,
+        ['receipts', 'evidence', index, 'linkedObservationId'],
+        'Attestation references missing observation',
+      );
+    }
+  }
+
+  const decisions = new Map(
+    record.receipts.decisions.map((entry) => [entry.id, entry]),
+  );
+  const userMessages = new Set(
+    record.receipts.userMessages.map((entry) => entry.id),
+  );
+  for (const [index, decision] of record.receipts.decisions.entries()) {
+    if (
+      decision.sourceUserMessageReceiptId &&
+      !userMessages.has(decision.sourceUserMessageReceiptId)
+    ) {
+      issue(
+        ctx,
+        ['receipts', 'decisions', index, 'sourceUserMessageReceiptId'],
+        'Decision references missing user message',
+      );
+    }
+  }
+  const authorizations = new Map(
+    record.receipts.authorizations.map((entry) => [entry.id, entry]),
+  );
+  for (const [
+    index,
+    authorization,
+  ] of record.receipts.authorizations.entries()) {
+    if (authorization.decisionId) {
+      const decision = decisions.get(authorization.decisionId);
+      if (!decision?.chosenOption || !decision.sourceUserMessageReceiptId) {
+        issue(
+          ctx,
+          ['receipts', 'authorizations', index, 'decisionId'],
+          'User authorization requires a resolved, user-backed decision',
+        );
+      }
+    }
+  }
+  const rules = new Map(
+    record.contract.rules.map((entry) => [entry.id, entry]),
+  );
+  for (const [index, rule] of record.contract.rules.entries()) {
+    addDuplicateStringIssues(
+      rule.evidenceAttestationIds,
+      ['contract', 'rules', index, 'evidenceAttestationIds'],
+      ctx,
+    );
+    for (const id of rule.evidenceAttestationIds) {
+      if (!attestations.has(id))
+        issue(
+          ctx,
+          ['contract', 'rules', index],
+          'Rule references missing attestation',
+        );
+    }
+  }
+  for (const [index, exception] of record.contract.exceptions.entries()) {
+    const authorization = authorizations.get(exception.authorizationId);
+    if (!authorization)
+      issue(
+        ctx,
+        ['contract', 'exceptions', index, 'authorizationId'],
+        'Exception references missing authorization',
+      );
+    if (authorization?.kind === 'user_decision' && !authorization.decisionId) {
+      issue(
+        ctx,
+        ['contract', 'exceptions', index],
+        'User exception authorization is unresolved',
+      );
+    }
+    if (rules.get(exception.ruleId)?.enforcementStatus !== 'waived') {
+      issue(
+        ctx,
+        ['contract', 'exceptions', index],
+        'Exception target is not waived',
+      );
+    }
+  }
+
+  const checkpoint = record.checkpoint;
+  if (checkpoint) {
+    if (checkpoint.outcomeId !== record.outcomeId)
+      issue(ctx, ['checkpoint', 'outcomeId'], 'Checkpoint outcome mismatch');
+    if (checkpoint.rootSessionId !== record.rootSessionId)
+      issue(ctx, ['checkpoint', 'rootSessionId'], 'Checkpoint root mismatch');
+    if (checkpoint.contractDigest !== record.contractDigest)
+      issue(
+        ctx,
+        ['checkpoint', 'contractDigest'],
+        'Checkpoint contract mismatch',
+      );
+    if (checkpoint.outcomeRevision >= record.revision)
+      issue(
+        ctx,
+        ['checkpoint', 'outcomeRevision'],
+        'Checkpoint snapshot must precede envelope revision',
+      );
+    if (
+      checkpoint.checkpointFingerprint !==
+      computeOutcomeCheckpointFingerprint(checkpoint)
+    ) {
+      issue(
+        ctx,
+        ['checkpoint', 'checkpointFingerprint'],
+        'Checkpoint fingerprint mismatch',
+      );
+    }
+    validateReferences(
+      checkpoint.includedDecisionIds,
+      decisions,
+      ['checkpoint', 'includedDecisionIds'],
+      ctx,
+    );
+    for (const id of checkpoint.includedEvidenceAttestationIds) {
+      const attestation = attestations.get(id);
+      if (
+        attestation?.kind === 'orchestrator_attestation' &&
+        attestation.createdRevision > checkpoint.outcomeRevision
+      ) {
+        issue(
+          ctx,
+          ['checkpoint', 'includedEvidenceAttestationIds'],
+          'Checkpoint cannot include evidence created after its snapshot',
+        );
+      }
+    }
+    validateReferences(
+      checkpoint.includedEvidenceAttestationIds,
+      attestations,
+      ['checkpoint', 'includedEvidenceAttestationIds'],
+      ctx,
+    );
+    const exceptions = new Set(
+      record.contract.exceptions.map((entry) => entry.ruleId),
+    );
+    for (const [index, id] of checkpoint.includedExceptionRuleIds.entries()) {
+      if (!exceptions.has(id))
+        issue(
+          ctx,
+          ['checkpoint', 'includedExceptionRuleIds', index],
+          'Checkpoint references missing exception',
+        );
+    }
+  }
+
+  const accepted = record.phase === 'accepted';
+  if (accepted !== (record.finalCertificate !== undefined)) {
+    issue(
+      ctx,
+      ['phase'],
+      'Accepted phase and final certificate must appear together',
+    );
+  }
+  if (accepted) validateAcceptedRecord(record, ctx);
+}
+
+function validateAcceptedRecord(
+  record: OutcomeRecord,
+  ctx: z.RefinementCtx,
+): void {
+  const certificate = record.finalCertificate;
+  const checkpoint = record.checkpoint;
+  if (
+    !certificate ||
+    !checkpoint ||
+    checkpoint.kind !== 'final' ||
+    checkpoint.state !== 'review_accepted'
+  ) {
+    issue(
+      ctx,
+      ['checkpoint'],
+      'Acceptance requires an accepted final checkpoint',
+    );
+    return;
+  }
+  const review = record.reviewSummaries.find(
+    (entry) =>
+      entry.checkpointId === checkpoint.checkpointId &&
+      entry.claimGeneration === checkpoint.claimGeneration,
+  );
+  if (review?.verdict !== 'ACCEPT') {
+    issue(
+      ctx,
+      ['reviewSummaries'],
+      'Acceptance requires a matching Manager ACCEPT review',
+    );
+    return;
+  }
+  if (
+    review.checkpointKind !== 'final' ||
+    review.contractDigest !== checkpoint.contractDigest ||
+    review.outcomeRevision !== checkpoint.outcomeRevision ||
+    review.candidateFingerprint !== checkpoint.candidateFingerprint ||
+    review.reviewDigest !== checkpoint.reviewDigest ||
+    review.resultDigest !== checkpoint.resultDigest
+  ) {
+    issue(
+      ctx,
+      ['reviewSummaries'],
+      'Manager ACCEPT review does not match the final checkpoint',
+    );
+  }
+  for (const [index, goal] of record.contract.goals.entries()) {
+    if (goal.status !== 'satisfied') {
+      issue(
+        ctx,
+        ['contract', 'goals', index, 'status'],
+        'Accepted outcome requires every current goal to be satisfied',
+      );
+    }
+  }
+  for (const [index, rule] of record.contract.rules.entries()) {
+    if (['violated', 'pending'].includes(rule.enforcementStatus)) {
+      issue(
+        ctx,
+        ['contract', 'rules', index, 'enforcementStatus'],
+        'Accepted outcome cannot contain violated or pending rules',
+      );
+    }
+  }
+  const expected = {
+    outcomeId: record.outcomeId,
+    acceptedRevision: record.revision,
+    contractDigest: record.contractDigest,
+    candidateFingerprint: checkpoint.candidateFingerprint,
+    acceptedCheckpointId: checkpoint.checkpointId,
+    acceptedClaimGeneration: checkpoint.claimGeneration,
+    finalCheckpointFingerprint: checkpoint.checkpointFingerprint,
+    managerTaskId: checkpoint.managerTaskId,
+    managerGeneration: checkpoint.managerGeneration,
+    managerReviewId: review.reviewId,
+    managerReviewDigest: review.reviewDigest,
+    serverEpoch: record.serverEpoch,
+  };
+  for (const [key, value] of Object.entries(expected)) {
+    if (certificate[key as keyof typeof certificate] !== value) {
+      issue(
+        ctx,
+        ['finalCertificate', key],
+        `Certificate ${key} does not match accepted record`,
+      );
+    }
+  }
+  const attestationDigests = checkpoint.includedEvidenceAttestationIds
+    .map((id) => record.receipts.evidence.find((entry) => entry.id === id))
+    .filter(
+      (entry): entry is OutcomeEvidenceAttestation =>
+        entry?.kind === 'orchestrator_attestation',
+    )
+    .map((entry) => entry.payloadDigest)
+    .sort();
+  const includedAttestations = new Map(
+    checkpoint.includedEvidenceAttestationIds.map((id) => [
+      id,
+      record.receipts.evidence.find((entry) => entry.id === id),
+    ]),
+  );
+  for (const [id, entry] of includedAttestations) {
+    if (
+      entry?.kind !== 'orchestrator_attestation' ||
+      entry.assertedStatus !== 'passed' ||
+      entry.assertedFreshness !== 'fresh' ||
+      entry.candidateFingerprint !== checkpoint.candidateFingerprint
+    ) {
+      issue(
+        ctx,
+        ['checkpoint', 'includedEvidenceAttestationIds'],
+        `Final attestation '${id}' is not passed, fresh, and candidate-bound`,
+      );
+    }
+  }
+  for (const [index, rule] of record.contract.rules.entries()) {
+    if (
+      rule.ruleType === 'machine_enforced' &&
+      rule.enforcementStatus === 'satisfied' &&
+      !rule.evidenceAttestationIds.some((id) => includedAttestations.has(id))
+    ) {
+      issue(
+        ctx,
+        ['contract', 'rules', index, 'evidenceAttestationIds'],
+        'Satisfied machine-enforced rule lacks included final evidence',
+      );
+    }
+  }
+  const certificateDigests = [...certificate.receiptDigests].sort();
+  if (
+    new Set(certificateDigests).size !== certificateDigests.length ||
+    stableJson(certificateDigests) !== stableJson(attestationDigests)
+  ) {
+    issue(
+      ctx,
+      ['finalCertificate', 'receiptDigests'],
+      'Certificate receipt digests do not match checkpoint attestations',
+    );
+  }
+  if (certificate.evidenceAssurance !== 'orchestrator_attestation') {
+    issue(
+      ctx,
+      ['finalCertificate', 'evidenceAssurance'],
+      'Version 1 certificates support orchestrator-attestation assurance only',
+    );
+  }
+  if (record.waitCondition)
+    issue(ctx, ['waitCondition'], 'Accepted outcome cannot be waiting');
+  if (record.actionsRequired.some((entry) => entry.resolvedAt === undefined))
+    issue(ctx, ['actionsRequired'], 'Accepted outcome has unresolved action');
+  if (
+    record.operations.some(
+      (entry) => !['completed', 'acknowledged'].includes(entry.status),
+    )
+  )
+    issue(ctx, ['operations'], 'Accepted outcome has unresolved operation');
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function issue(
+  ctx: z.RefinementCtx,
+  path: PropertyKey[],
+  message: string,
+): void {
+  ctx.addIssue({ code: z.ZodIssueCode.custom, path, message });
+}
+
+function addDuplicateIssues<T extends Record<string, unknown>>(
+  values: T[],
+  key: keyof T,
+  path: PropertyKey[],
+  ctx: z.RefinementCtx,
+): void {
+  const seen = new Set<unknown>();
+  for (const [index, value] of values.entries()) {
+    if (seen.has(value[key]))
+      issue(ctx, [...path, index, key as string], `Duplicate ${String(key)}`);
+    seen.add(value[key]);
+  }
+}
+
+function addDuplicateStringIssues(
+  values: string[],
+  path: PropertyKey[],
+  ctx: z.RefinementCtx,
+): void {
+  const seen = new Set<string>();
+  for (const [index, value] of values.entries()) {
+    if (seen.has(value)) issue(ctx, [...path, index], 'Duplicate reference');
+    seen.add(value);
+  }
+}
+
+function validateReferences<T>(
+  ids: string[],
+  records: Map<string, T>,
+  path: PropertyKey[],
+  ctx: z.RefinementCtx,
+): void {
+  for (const [index, id] of ids.entries()) {
+    if (!records.has(id))
+      issue(ctx, [...path, index], 'Reference does not exist');
+  }
+}
