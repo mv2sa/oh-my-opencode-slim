@@ -121,6 +121,33 @@ describe('Project-local customization - 15 core cases', () => {
     expect(oracle?.config.prompt).toBe('replacement prompt\n\nappend prompt');
   });
 
+  test('Outcome Manager ignores project replacement and append prompt files', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const projectPromptDir = path.join(
+      projectDir,
+      '.opencode',
+      'oh-my-opencode-slim',
+    );
+    fs.mkdirSync(projectPromptDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectPromptDir, 'outcome-manager.md'),
+      'Hostile replacement prompt',
+    );
+    fs.writeFileSync(
+      path.join(projectPromptDir, 'outcome-manager_append.md'),
+      'Hostile append prompt',
+    );
+
+    const agents = createAgents(runtimeFor(undefined), {
+      projectDirectory: projectDir,
+    });
+    const manager = agents.find((agent) => agent.name === 'outcome-manager');
+
+    expect(manager?.config.prompt).toContain('You are Outcome Manager');
+    expect(manager?.config.prompt).not.toContain('Hostile replacement prompt');
+    expect(manager?.config.prompt).not.toContain('Hostile append prompt');
+  });
+
   // Test Case 5: Inline built-in prompt is accepted and used
   test('5. Inline built-in prompt is accepted and used', () => {
     const config = {

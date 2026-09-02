@@ -284,6 +284,119 @@ describe('plugin tool registration', () => {
   });
 });
 
+describe('Outcome Manager host config boundary', () => {
+  let originalEnv: typeof process.env;
+  let configDir: string;
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    configDir = await mkdtemp('/tmp/omos-outcome-manager-host-');
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_CONFIG_HOME: configDir,
+      XDG_DATA_HOME: `${configDir}/data`,
+      XDG_CACHE_HOME: `${configDir}/cache`,
+      OPENCODE_LOG_DIR: `${configDir}/logs`,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await writeFile(
+      `${configDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        autoUpdate: false,
+        agents: {
+          'outcome-manager': {
+            displayName: 'auditor',
+          },
+        },
+      }),
+    );
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(configDir, { recursive: true, force: true });
+  });
+
+  test('final config merge protects canonical and display-alias registrations', async () => {
+    const noop = async () => ({});
+    const hooks = await plugin({
+      client: createPluginClient(noop),
+      directory: configDir,
+      worktree: configDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+    const hostile = {
+      prompt: 'Hostile host prompt',
+      description: 'Hostile host description',
+      mode: 'primary',
+      hidden: false,
+      permission: {
+        '*': 'allow',
+        bash: 'allow',
+        edit: 'allow',
+        task: 'allow',
+        skill: { '*': 'allow' },
+      },
+      mcps: ['*', 'context7'],
+      unknownFutureAuthority: 'allow',
+      model: 'host/manager-model',
+      variant: 'host-variant',
+      temperature: 0.4,
+      options: { textVerbosity: 'low' },
+    };
+    const host: Record<string, unknown> = {
+      agent: {
+        'outcome-manager': { ...hostile },
+        auditor: { ...hostile, model: 'host/alias-model' },
+        oracle: {
+          prompt: 'Host Oracle prompt',
+          permission: { bash: 'allow' },
+          unknownFutureAuthority: 'preserved',
+        },
+      },
+    };
+
+    await hooks.config?.(host);
+
+    const configured = host.agent as Record<string, Record<string, unknown>>;
+    for (const [name, expectedModel] of [
+      ['outcome-manager', 'host/manager-model'],
+      ['auditor', 'host/alias-model'],
+    ] as const) {
+      const manager = configured[name];
+      expect(manager.prompt).toContain('You are Outcome Manager');
+      expect(manager.prompt).not.toContain('Hostile host prompt');
+      expect(manager.description).toContain('Read-only outcome manager');
+      expect(manager.mode).toBe('subagent');
+      expect(manager.mcps).toEqual([]);
+      expect(manager.unknownFutureAuthority).toBeUndefined();
+      expect(manager.model).toBe(expectedModel);
+      expect(manager.variant).toBe('host-variant');
+      expect(manager.temperature).toBe(0.4);
+      expect(manager.options).toEqual({ textVerbosity: 'low' });
+
+      const permission = manager.permission as Record<string, unknown>;
+      expect(permission['*']).toBe('deny');
+      expect(permission.bash).toBe('deny');
+      expect(permission.edit).toBe('deny');
+      expect(permission.task).toBe('deny');
+      expect(permission.question).toBe('deny');
+      expect(permission.wait_for_user).toBe('deny');
+      expect(permission.skill).toEqual({ '*': 'deny' });
+    }
+
+    expect(configured['outcome-manager'].hidden).toBe(true);
+    expect(configured.auditor.hidden).toBeUndefined();
+    expect(configured.oracle).toMatchObject({
+      prompt: 'Host Oracle prompt',
+      permission: { bash: 'allow' },
+      unknownFutureAuthority: 'preserved',
+    });
+    await hooks.dispose?.();
+  });
+});
+
 describe('persistent cooldown plugin hooks', () => {
   let originalEnv: typeof process.env;
   let configDir: string;

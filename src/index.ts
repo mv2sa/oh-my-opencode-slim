@@ -101,6 +101,22 @@ async function appLog(
   }
 }
 
+function mergeProtectedOutcomeManagerConfig(
+  pluginAgent: Record<string, unknown>,
+  hostAgent: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  if (!hostAgent) return { ...pluginAgent };
+
+  const allowedHostOverrides: Record<string, unknown> = {};
+  for (const key of ['model', 'variant', 'temperature', 'options'] as const) {
+    if (hostAgent[key] !== undefined) {
+      allowedHostOverrides[key] = hostAgent[key];
+    }
+  }
+
+  return { ...pluginAgent, ...allowedHostOverrides };
+}
+
 // Debounce: only show image-skipped toast once per 60 seconds per project
 const lastImageSkippedToastByDir = new Map<string, number>();
 const IMAGE_SKIPPED_DEBOUNCE_MS = 60_000;
@@ -718,11 +734,14 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             }
           }
           if (existing) {
-            // Shallow merge: plugin defaults first, user overrides win
-            (opencodeConfig.agent as Record<string, unknown>)[name] = {
-              ...pluginAgent,
-              ...existing,
-            };
+            const internalName = resolveRuntimeAgentName(runtime, name);
+            // Outcome Manager's authority boundary is immutable at the final
+            // host merge. Only model-tuning fields may come from opencode.json.
+            // Every other agent keeps the normal user-wins shallow merge.
+            (opencodeConfig.agent as Record<string, unknown>)[name] =
+              internalName === 'outcome-manager'
+                ? mergeProtectedOutcomeManagerConfig(pluginAgent, existing)
+                : { ...pluginAgent, ...existing };
           } else {
             (opencodeConfig.agent as Record<string, unknown>)[name] = {
               ...pluginAgent,

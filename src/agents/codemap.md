@@ -21,6 +21,7 @@ Each agent is a **prompt-driven specialist** with a factory function that create
 | **observer** | `createObserverAgent()` | Visual analysis specialist (images, PDFs, diagrams) | Read-only (read, glob, grep, ast_grep_search) | DEFAULT_MODELS.observer |
 | **council** | `createCouncilAgent()` | Multi-LLM consensus synthesis from councillor responses | Read-only | DEFAULT_MODELS.council |
 | **councillor** | `createCouncillorAgent()` | Read-only council advisor; registered dynamically per preset seat as `councillor-<name>` by `buildCouncillorAgents()` (`council-agents.ts`) | Read-only (read, glob, grep, ast_grep_search) | Inherited from council preset |
+| **outcome-manager** | `createOutcomeManagerAgent()` | Read-only outcome manager and governance reviewer | Read-only (read, glob, grep, ast_grep_search, lsp, list, codesearch) | DEFAULT_MODELS['outcome-manager'] |
 
 ### Configuration System
 
@@ -166,6 +167,7 @@ The orchestrator's system prompt contains dynamic routing rules that reference a
 - **@designer**: UI/UX design and polish
 - **@fixer**: Bounded implementation tasks
 - **@observer**: Visual/media analysis
+- **@outcome-manager**: Outcome governance, contract review, and acceptance verification
 - **@council**: Multi-model consensus synthesis (orchestrator dispatches councillors directly in flatten mode)
 
 These rules are filtered based on disabled agents and injected into the orchestrator's prompt at startup.
@@ -183,6 +185,7 @@ These rules are filtered based on disabled agents and injected into the orchestr
 - `council.ts` - Multi-LLM council agent
 - `councillor.ts` - Read-only council advisor (internal)
 - `council-agents.ts` - Dynamic `councillor-<name>` agent builders from council presets
+- `outcome-manager.ts` - Read-only outcome manager and governance reviewer
 - `task-rejection.ts` - Task-rejection instruction appended to specialist prompts
 - `permissions.ts` - Permission factory for read-only agents
 

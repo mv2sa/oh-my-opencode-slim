@@ -13,6 +13,7 @@ export const SUBAGENT_NAMES = [
   'observer',
   'council',
   'councillor',
+  'outcome-manager',
 ] as const;
 
 export const ALL_AGENT_NAMES = ['orchestrator', ...SUBAGENT_NAMES] as const;
@@ -38,6 +39,7 @@ export const DEFAULT_MODELS: Record<AgentName, string | undefined> = {
   observer: undefined,
   council: undefined,
   councillor: undefined,
+  'outcome-manager': undefined,
 };
 
 // Polling configuration

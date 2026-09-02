@@ -29,6 +29,7 @@ import {
   createOrchestratorAgent,
   resolvePrompt,
 } from './orchestrator';
+import { createOutcomeManagerAgent } from './outcome-manager';
 import { appendTaskRejectionInstruction } from './task-rejection';
 
 export type { AgentDefinition } from './orchestrator';
@@ -189,10 +190,11 @@ function applyOverrides(
   if (override.displayName) {
     agent.displayName = override.displayName;
   }
-  if (override.description) {
+  if (override.description && agent.name !== 'outcome-manager') {
     agent.description = override.description;
   }
-  if (override.permission) {
+  // Outcome manager enforces an immutable read-only / no-authority security boundary.
+  if (override.permission && agent.name !== 'outcome-manager') {
     agent.config.permission = override.permission;
   }
 }
@@ -344,6 +346,7 @@ const SUBAGENT_FACTORIES: Record<SubagentName, AgentFactory> = {
   observer: createObserverAgent,
   council: createCouncilAgent,
   councillor: createCouncillorAgent,
+  'outcome-manager': createOutcomeManagerAgent,
 };
 
 // Public API
@@ -400,6 +403,14 @@ export function createAgents(
     .map(([name, factory]) => {
       // Get base agent definition using the subagent factory with undefined prompts
       const agent = factory(getModelForAgent(name), undefined, undefined);
+
+      // Outcome manager prompt is canonical and immutable; ignore file/inline overrides.
+      if (name === 'outcome-manager') {
+        agent.config.prompt = appendTaskRejectionInstruction(
+          agent.config.prompt ?? '',
+        );
+        return agent;
+      }
 
       const customPrompts = loadAgentPrompt(name, {
         preset: runtime.preset,
@@ -495,7 +506,11 @@ export function createAgents(
     if (override) {
       applyOverrides(agent, override);
     }
-    applyDefaultPermissions(agent, override?.skills, runtime.disabledSkills);
+    applyDefaultPermissions(
+      agent,
+      agent.name === 'outcome-manager' ? [] : override?.skills,
+      runtime.disabledSkills,
+    );
     return agent;
   });
 
@@ -592,6 +607,7 @@ export function createAgents(
 
   // 3b. Append custom orchestrator hints from built-in and custom agent overrides.
   const extraOrchestratorPromptsList = [...builtInSubAgents, ...customSubAgents]
+    .filter((agent) => agent.name !== 'outcome-manager')
     .map((agent) => {
       const override = getOverrideFromAgents(mergedAgents, agent.name);
       return override?.orchestratorPrompt;

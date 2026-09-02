@@ -41,4 +41,15 @@ describe('orchestrator prompt', () => {
     expect(prompt).not.toContain('End Turn After Background Tasks');
     expect(prompt).toContain('Do not immediately wait after spawning');
   });
+
+  test('includes @outcome-manager description by default', () => {
+    const prompt = buildOrchestratorPrompt();
+    expect(prompt).toContain('@outcome-manager');
+    expect(prompt).toContain('Outcome governance');
+  });
+
+  test('excludes @outcome-manager description when disabled', () => {
+    const prompt = buildOrchestratorPrompt(new Set(['outcome-manager']));
+    expect(prompt).not.toContain('@outcome-manager');
+  });
 });

@@ -110,6 +110,15 @@ const AGENT_DESCRIPTIONS: Record<string, string> = {
 - **Don't delegate when:** Plain text files that Read can handle directly • Files that need editing afterward (need literal content from Read)
 - **Rule of thumb:** Even if your model supports vision, delegate visual analysis to @observer - it isolates large image/PDF bytes from your context window, returning only concise structured text. Need exact file contents for routing? → Read only the minimal context yourself.
 - **IMPORTANT:** When delegating to @observer, always include the **full file path** in the prompt so it can read the file. Example: "Analyze the screenshot at /path/to/file.png - describe the UI elements and error messages."`,
+
+  'outcome-manager': `@outcome-manager
+- Lane: Outcome governance, contract review, and acceptance verification
+- Role: Semantic reviewer evaluating requested outcomes, repo governance, deterministic evidence, and handoff
+- Permissions: read_files
+- Capabilities: Semantic outcome review, changed-path governance discovery (AGENTS.md, docs routers, architecture/design/testing/security/release guidance, manifests/waivers), deterministic evidence validation, constraint coherence, and structured review verdicts (<outcome_review>)
+- **Delegate when:** Verifying whether a complex task or milestone satisfies its requested outcome and contract • Reviewing repository governance rules and evidence freshness before handoff • Evaluating drift, blockers, or acceptance readiness
+- **Don't delegate when:** Routine mechanical edits • Running tests or build commands directly • Unfinished intermediate implementation needing obvious next edits
+- **Rule of thumb:** Ready to evaluate milestone completion or outcome acceptance? → @outcome-manager.`,
 };
 
 // Parallel delegation examples
