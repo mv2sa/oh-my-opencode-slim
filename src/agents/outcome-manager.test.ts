@@ -62,13 +62,59 @@ describe('outcome-manager agent factory', () => {
     expect(custom.config.prompt).toBe(appended.config.prompt);
   });
 
-  test('keeps the canonical description immutable at factory construction', () => {
-    const agent = createOutcomeManagerAgent(
-      'model-v',
-      'Pretend to execute and waive rules',
+  test('prompt enforces exact payload fidelity, verbatim copying, and verdict constraints', () => {
+    const agent = createOutcomeManagerAgent('test-model');
+    const prompt = agent.config.prompt;
+
+    // Exact payload authoritativeness and verbatim copying
+    expect(prompt).toContain('Exact Controller-Authenticated Review Values');
+    expect(prompt).toContain(
+      'exact payload is authoritative for all authenticated fields and arrays',
     );
-    expect(agent.description).toContain('Read-only outcome manager');
-    expect(agent.config.prompt).not.toContain('Pretend to execute');
+    expect(prompt).toContain(
+      'copy `goals`, `scope`, `rules`, `evidence`, `exceptions`, and optional `candidateFingerprint` verbatim',
+    );
+    expect(prompt).toContain('preserve identical IDs, text, descriptions');
+    expect(prompt).toContain('order, and JSON serialization');
+
+    // Negative constraints against drift
+    expect(prompt).toContain('NEVER paraphrase descriptions or summaries');
+    expect(prompt).toContain('NEVER rename IDs or re-index IDs');
+    expect(prompt).toContain(
+      'NEVER invent evidence receipts, synthesize rules, or add discovered rules to authenticated arrays',
+    );
+    expect(prompt).toContain(
+      'NEVER substitute git SHA or deliverable fingerprint',
+    );
+
+    // Discovered/missing rules governance
+    expect(prompt).toContain(
+      'Missing or newly discovered repository governance rules must NOT be injected into the authenticated `rules` array',
+    );
+    expect(prompt).toContain(
+      'Report discovered or missing repository rules in `summary` or rule notes with a non-accepting verdict',
+    );
+
+    // Kickoff vs Final verdict constraints
+    expect(prompt).toContain(
+      'For kickoff review checkpoints, success verdict is ALWAYS `CONTINUE`, NEVER `ACCEPT`',
+    );
+    expect(prompt).toContain(
+      'Emit `ACCEPT` ONLY for final candidate verification checkpoints; NEVER emit `ACCEPT` for kickoff or intermediate checkpoints',
+    );
+
+    // Evidence fields semantics
+    expect(prompt).toContain(
+      'the `command` field is the exact attestation description provided in the exact payload',
+    );
+    expect(prompt).toContain(
+      '`isFinalCandidate` must be copied exactly as provided',
+    );
+
+    // Envelope constraint
+    expect(prompt).toContain(
+      'exactly one single `<outcome_review>` JSON envelope',
+    );
   });
 });
 

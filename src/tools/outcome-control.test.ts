@@ -5,8 +5,10 @@ import * as path from 'node:path';
 import { OutcomeController } from '../outcome/controller';
 import {
   canonicalDigest,
+  computeOutcomeContractDigest,
   type OutcomeContract,
   OutcomeContractSchema,
+  type OutcomeReview,
 } from '../outcome/controller-schema';
 import { createOutcomeControlTool } from './outcome-control';
 
@@ -33,6 +35,46 @@ function sampleContract(): OutcomeContract {
     rules: [],
     exceptions: [],
   });
+}
+
+function validKickoffReview(
+  contract: OutcomeContract,
+  verdict: OutcomeReview['verdict'] = 'CONTINUE',
+  summary?: string,
+): OutcomeReview {
+  return {
+    summary:
+      summary ??
+      (verdict === 'CONTINUE'
+        ? 'Kickoff approved to continue execution'
+        : 'Kickoff attempts exhausted: contract drift detected'),
+    verdict,
+    goals: contract.goals.map(({ id, description, status }) => ({
+      id,
+      description,
+      status,
+    })),
+    scope: {
+      inScope: contract.inScope,
+      outOfScope: contract.outOfScope,
+    },
+    rules: [],
+    evidence: [],
+    constraintCoherence: {
+      ordering: ['rules before deliverables'],
+      coherent: true,
+    },
+    exceptions: [],
+    handoff: {
+      ready: false,
+      summary: 'Not yet ready',
+      verificationSteps: [],
+    },
+    lifecycle: {
+      stage: 'execution',
+      receiptAgreement: true,
+    },
+  };
 }
 
 describe('outcome_control tool', () => {
@@ -141,11 +183,31 @@ describe('outcome_control tool', () => {
     expect(String(beginOutput)).not.toContain('claimToken');
   });
 
-  test('checkpoint and submit_evidence actions work as expected', async () => {
-    let mockTime = 1000;
+  test('checkpoint and submit_evidence actions work as expected after authenticating kickoff', async () => {
+    const mockTime = 1000;
+    const contract = sampleContract();
+    const boardRecord = {
+      taskID: 'mgr_task_kickoff',
+      parentSessionID: 'ses_root',
+      agent: 'outcome-manager',
+      generation: 1,
+      state: 'completed' as const,
+    };
+    const reviewPayload = validKickoffReview(contract, 'CONTINUE');
+    const childResult = {
+      text: `<outcome_review>\n${JSON.stringify(reviewPayload, null, 2)}\n</outcome_review>`,
+      empty: false,
+      terminal: true,
+    };
+
     const timeController = new OutcomeController({
       storeDirectory: tempDir,
       clock: () => mockTime,
+      getManagerTaskRecord: (id) =>
+        id === 'mgr_task_kickoff' ? boardRecord : undefined,
+      readChildSessionResult: async (id) =>
+        id === 'mgr_task_kickoff' ? childResult : undefined,
+      consumeManagerTask: () => true,
     });
     const timedTool = createOutcomeControlTool({
       controller: timeController,
@@ -153,24 +215,37 @@ describe('outcome_control tool', () => {
     }).outcome_control;
 
     // Begin first
-    await timedTool.execute({ action: 'begin', contract: sampleContract() }, {
+    await timedTool.execute({ action: 'begin', contract }, {
       sessionID: 'ses_root',
       agent: 'orchestrator',
     } as never);
+    const kickoffCheckpointId =
+      timeController.getStatus('ses_root').checkpoint?.checkpointId;
 
-    // Advance time past expiry
-    mockTime += 700_000;
+    // Authenticate kickoff review before opening non-kickoff checkpoints
+    timeController.validateAndMarkDispatching(
+      'ses_root',
+      'call_kickoff',
+      timeController.getPendingNudge('ses_root')?.instruction ?? '',
+    );
+    timeController.bindManagerTask(
+      'ses_root',
+      'call_kickoff',
+      'mgr_task_kickoff',
+      1,
+    );
 
-    // Expire kickoff checkpoint to allow second checkpoint
-    await timedTool.execute(
+    const recOutput = await timedTool.execute(
       {
-        action: 'expire_checkpoint',
-        checkpointId:
-          timeController.getStatus('ses_root').checkpoint?.checkpointId,
-        reason: 'Expired for testing',
+        action: 'reconcile_review',
+        checkpointId: kickoffCheckpointId,
+        managerTaskId: 'mgr_task_kickoff',
       },
       { sessionID: 'ses_root', agent: 'orchestrator' } as never,
     );
+    const recParsed = JSON.parse(String(recOutput));
+    expect(recParsed.verdict).toBe('CONTINUE');
+    expect(recParsed.phase).toBe('active');
 
     const candidateFingerprint = hash('git_sha_123');
     const chkOutput = await timedTool.execute(
@@ -200,6 +275,228 @@ describe('outcome_control tool', () => {
     const evParsed = JSON.parse(String(evOutput));
     expect(evParsed.assurance).toBe('orchestrator_attestation');
     expect(evParsed.attestationId).toBeDefined();
+  });
+
+  test('non-kickoff checkpoint fails when kickoff has not been authenticated', async () => {
+    let mockTime = 1000;
+    const timeController = new OutcomeController({
+      storeDirectory: tempDir,
+      clock: () => mockTime,
+    });
+    const timedTool = createOutcomeControlTool({
+      controller: timeController,
+      shouldManageSession: (id) => managedMap.has(id),
+    }).outcome_control;
+
+    const contract = sampleContract();
+    await timedTool.execute({ action: 'begin', contract }, {
+      sessionID: 'ses_root',
+      agent: 'orchestrator',
+    } as never);
+
+    mockTime += 700_000;
+    const kickoffId =
+      timeController.getStatus('ses_root').checkpoint?.checkpointId;
+    await timedTool.execute(
+      {
+        action: 'expire_checkpoint',
+        checkpointId: kickoffId,
+        reason: 'Expired kickoff without authentication',
+      },
+      { sessionID: 'ses_root', agent: 'orchestrator' } as never,
+    );
+
+    await expect(
+      timedTool.execute(
+        {
+          action: 'checkpoint',
+          kind: 'decision',
+          reason: 'Premature decision checkpoint',
+        },
+        { sessionID: 'ses_root', agent: 'orchestrator' } as never,
+      ),
+    ).rejects.toThrow(
+      'Kickoff review must be authenticated before opening non-kickoff checkpoint',
+    );
+  });
+
+  test('surfaces stable tool errors when kickoff attempts are exhausted', async () => {
+    let mockTime = 1000;
+    const contract = sampleContract();
+    const childResult = {
+      text: `<outcome_review>\n${JSON.stringify(validKickoffReview(contract, 'CORRECT_DRIFT'), null, 2)}\n</outcome_review>`,
+      empty: false,
+      terminal: true,
+    };
+
+    const timeController = new OutcomeController({
+      storeDirectory: tempDir,
+      clock: () => mockTime,
+      getManagerTaskRecord: (id) => ({
+        taskID: id,
+        parentSessionID: 'ses_root',
+        agent: 'outcome-manager',
+        generation: 1,
+        state: 'completed' as const,
+      }),
+      readChildSessionResult: async () => childResult,
+      consumeManagerTask: () => true,
+    });
+    const timedTool = createOutcomeControlTool({
+      controller: timeController,
+      shouldManageSession: (id) => managedMap.has(id),
+    }).outcome_control;
+
+    // Begin (attempt 1)
+    await timedTool.execute({ action: 'begin', contract }, {
+      sessionID: 'ses_root',
+      agent: 'orchestrator',
+    } as never);
+    const chk1 = timeController.getStatus('ses_root').checkpoint?.checkpointId;
+
+    // Attempt 1 fails with CORRECT_DRIFT
+    timeController.validateAndMarkDispatching(
+      'ses_root',
+      'call_k1',
+      timeController.getPendingNudge('ses_root')?.instruction ?? '',
+    );
+    timeController.bindManagerTask('ses_root', 'call_k1', 'mgr_kickoff_1', 1);
+    await timedTool.execute(
+      {
+        action: 'reconcile_review',
+        checkpointId: chk1,
+        managerTaskId: 'mgr_kickoff_1',
+      },
+      { sessionID: 'ses_root', agent: 'orchestrator' } as never,
+    );
+
+    // Resolve the required action before opening retry kickoff
+    const statusAfterFail1 = timeController.getStatus('ses_root');
+    const actionToResolve = statusAfterFail1.actionsRequired[0];
+    mockTime += 10;
+    timeController.observeUserTurn(
+      'ses_root',
+      'msg_retry_user',
+      'Please retry kickoff review',
+    );
+    const userReceipt = timeController
+      .readRecord('ses_root')
+      .data.receipts.userMessages.at(-1);
+
+    await timedTool.execute(
+      {
+        action: 'resolve_action',
+        actionId: actionToResolve.id,
+        reason: 'User provided retry direction',
+        sourceUserMessageReceiptId: userReceipt?.id,
+      },
+      { sessionID: 'ses_root', agent: 'orchestrator' } as never,
+    );
+
+    // Attempt 2: retry kickoff checkpoint
+    const retryChkRes = await timedTool.execute(
+      {
+        action: 'checkpoint',
+        kind: 'kickoff',
+        reason: 'Retry kickoff after correction',
+      },
+      { sessionID: 'ses_root', agent: 'orchestrator' } as never,
+    );
+    const chk2 = JSON.parse(String(retryChkRes)).checkpointId;
+
+    // Attempt 2 fails with CORRECT_DRIFT -> exhaustion!
+    timeController.validateAndMarkDispatching(
+      'ses_root',
+      'call_k2',
+      timeController.getPendingNudge('ses_root')?.instruction ?? '',
+    );
+    timeController.bindManagerTask('ses_root', 'call_k2', 'mgr_kickoff_2', 1);
+    await timedTool.execute(
+      {
+        action: 'reconcile_review',
+        checkpointId: chk2,
+        managerTaskId: 'mgr_kickoff_2',
+      },
+      { sessionID: 'ses_root', agent: 'orchestrator' } as never,
+    );
+
+    expect(timeController.getStatus('ses_root').kickoffGate?.state).toBe(
+      'exhausted',
+    );
+
+    // Attempting checkpoint on exhausted outcome throws stable error
+    await expect(
+      timedTool.execute(
+        {
+          action: 'checkpoint',
+          kind: 'decision',
+          reason: 'Cannot open after exhaustion',
+        },
+        { sessionID: 'ses_root', agent: 'orchestrator' } as never,
+      ),
+    ).rejects.toThrow('Kickoff attempts exhausted');
+  });
+
+  test('surfaces stable tool errors when retrospective kickoff is blocked on legacy records', async () => {
+    // Write a legacy record fixture with review activity but no kickoff -> normalizes to legacy_late_missing
+    const c = sampleContract();
+    const cDigest = computeOutcomeContractDigest(c);
+    const v1Fixture = {
+      schema: 'omos_outcome_record',
+      schemaVersion: 1,
+      outcomeId: 'out_legacy_blocked',
+      rootSessionId: 'ses_root',
+      serverEpoch: 'epoch_legacy',
+      revision: 10,
+      nextClaimGeneration: 2,
+      contractDigest: cDigest,
+      createdAt: 1000,
+      updatedAt: 2000,
+      phase: 'active',
+      contract: c,
+      receipts: {
+        evidence: [],
+        userMessages: [],
+        decisions: [],
+        authorizations: [],
+      },
+      reviewSummaries: [
+        {
+          reviewId: 'rev_progress_1',
+          checkpointId: 'chk_progress_1',
+          claimGeneration: 1,
+          checkpointKind: 'decision',
+          contractDigest: cDigest,
+          outcomeRevision: 2,
+          verdict: 'CONTINUE',
+          managerTaskId: 'mgr_task_1',
+          managerGeneration: 1,
+          resultDigest: hash('res_1'),
+          reviewDigest: hash('rev_1'),
+          summary: 'Decision review without prior kickoff',
+          evaluatedAt: 1500,
+        },
+      ],
+      operations: [],
+      actionsRequired: [],
+    };
+    fs.writeFileSync(
+      controller.store.recordPath('ses_root'),
+      JSON.stringify(v1Fixture, null, 2),
+    );
+
+    await expect(
+      toolInstance.execute(
+        {
+          action: 'checkpoint',
+          kind: 'kickoff',
+          reason: 'Attempt retrospective kickoff',
+        },
+        { sessionID: 'ses_root', agent: 'orchestrator' } as never,
+      ),
+    ).rejects.toThrow(
+      'Historical record has review activity without an authenticated kickoff review',
+    );
   });
 
   test('external_handoff action sets waiting_external', async () => {

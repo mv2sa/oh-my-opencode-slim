@@ -12,6 +12,7 @@ import {
   OutcomeContractSchema,
   type OutcomeEvidenceAttestation,
   type OutcomeFinalCertificate,
+  type OutcomeKickoffGateState,
   type OutcomeManagerReviewSummary,
   type OutcomePendingOperation,
   type OutcomePhase,
@@ -21,7 +22,15 @@ import {
 } from './controller-schema';
 import { safeParseOutcomeReview } from './parser';
 import { getProcessEpoch } from './process-epoch';
-import type { OutcomeReview } from './schema';
+import type {
+  AuthorizationKind,
+  EvidenceFreshness,
+  EvidenceStatus,
+  GoalStatus,
+  OutcomeReview,
+  RuleEnforcementStatus,
+  RuleType,
+} from './schema';
 import { OutcomeStore, type OutcomeStoreResult } from './store';
 
 const CLAIM_SECRETS_SYMBOL = Symbol.for('omos.outcome.claim_secrets');
@@ -114,10 +123,145 @@ export function parseOutcomeDispatchMarker(
   return markers.length === 1 ? markers[0] : null;
 }
 
+export interface OutcomeReviewExactPayload {
+  candidateFingerprint?: string;
+  goals: Array<{
+    id: string;
+    description: string;
+    status: GoalStatus;
+  }>;
+  scope: {
+    inScope: string[];
+    outOfScope: string[];
+  };
+  rules: Array<{
+    id: string;
+    sourcePath: string;
+    category: string;
+    summary: string;
+    ruleType: RuleType;
+    enforcementStatus: RuleEnforcementStatus;
+    evidenceIds: string[];
+  }>;
+  evidence: Array<{
+    id: string;
+    command: string;
+    status: EvidenceStatus;
+    fingerprint: string;
+    freshness: EvidenceFreshness;
+    isFinalCandidate: boolean;
+  }>;
+  exceptions: Array<{
+    ruleId: string;
+    justification: string;
+    justified: boolean;
+    scope: string;
+    authorizationKind: AuthorizationKind;
+    authorizationReference: string;
+  }>;
+}
+
+export function buildOutcomeReviewExactPayload(
+  record: OutcomeRecord,
+  checkpoint: OutcomeCheckpointClaim,
+): OutcomeReviewExactPayload {
+  const goals = record.contract.goals.map(({ id, description, status }) => ({
+    id,
+    description,
+    status,
+  }));
+
+  const scope = {
+    inScope: [...record.contract.inScope],
+    outOfScope: [...record.contract.outOfScope],
+  };
+
+  const includedEvidenceSet = new Set(
+    checkpoint.includedEvidenceAttestationIds,
+  );
+
+  const rules = record.contract.rules.map((rule) => {
+    for (const evId of rule.evidenceAttestationIds) {
+      if (!includedEvidenceSet.has(evId)) {
+        throw new Error(
+          `Rule '${rule.id}' references evidence attestation '${evId}' not included in checkpoint claim`,
+        );
+      }
+    }
+    return {
+      id: rule.id,
+      sourcePath: rule.sourcePath,
+      category: rule.category,
+      summary: rule.summary,
+      ruleType: rule.ruleType,
+      enforcementStatus: rule.enforcementStatus,
+      evidenceIds: [...rule.evidenceAttestationIds],
+    };
+  });
+
+  const attestations = new Map(
+    record.receipts.evidence
+      .filter((e) => e.kind === 'orchestrator_attestation')
+      .map((e) => [e.id, e as OutcomeEvidenceAttestation]),
+  );
+
+  const evidence = checkpoint.includedEvidenceAttestationIds.map((id) => {
+    const entry = attestations.get(id);
+    if (!entry) {
+      throw new Error(
+        `Included evidence attestation '${id}' not found in durable receipts`,
+      );
+    }
+    return {
+      id: entry.id,
+      command: entry.description,
+      status: entry.assertedStatus,
+      fingerprint: entry.candidateFingerprint,
+      freshness: entry.assertedFreshness,
+      isFinalCandidate: checkpoint.kind === 'final',
+    };
+  });
+
+  const authorizations = new Map(
+    record.receipts.authorizations.map((a) => [a.id, a]),
+  );
+
+  const exceptions = record.contract.exceptions.map((exc) => {
+    const auth = authorizations.get(exc.authorizationId);
+    if (!auth) {
+      throw new Error(
+        `Exception for rule '${exc.ruleId}' references missing authorization '${exc.authorizationId}'`,
+      );
+    }
+    return {
+      ruleId: exc.ruleId,
+      justification: exc.justification,
+      justified: true,
+      scope: exc.scope,
+      authorizationKind: auth.kind,
+      authorizationReference: auth.reference,
+    };
+  });
+
+  return {
+    ...(checkpoint.candidateFingerprint
+      ? { candidateFingerprint: checkpoint.candidateFingerprint }
+      : {}),
+    goals,
+    scope,
+    rules,
+    evidence,
+    exceptions,
+  };
+}
+
 export function buildOutcomeReviewPacket(
   record: OutcomeRecord,
   checkpoint: OutcomeCheckpointClaim,
 ): string {
+  const exactPayload = buildOutcomeReviewExactPayload(record, checkpoint);
+  const exactJson = JSON.stringify(exactPayload, null, 2);
+
   const lines: string[] = [
     '# Outcome Contract Review Packet',
     `Outcome ID: ${record.outcomeId}`,
@@ -173,6 +317,14 @@ export function buildOutcomeReviewPacket(
     }
   }
 
+  lines.push(
+    '',
+    '## Exact Controller-Authenticated Review Values (Manager MUST copy exactly)',
+    '```json',
+    exactJson,
+    '```',
+  );
+
   return lines.join('\n');
 }
 
@@ -199,6 +351,14 @@ export interface OutcomeStatusProjection {
   revision?: number;
   phase?: OutcomePhase;
   contractDigest?: string;
+  kickoffGate?: {
+    state: OutcomeKickoffGateState;
+    attempts: number;
+    maxAttempts: number;
+    authenticatedReviewId?: string;
+    lastCheckpointId?: string;
+    failureReason?: string;
+  };
   checkpoint?: {
     checkpointId: string;
     kind: OutcomeCheckpointKind;
@@ -214,6 +374,7 @@ export interface OutcomeStatusProjection {
     id: string;
     toolName: string;
     status: string;
+    error?: string;
   }[];
   finalCertificate?: OutcomeFinalCertificate;
 }
@@ -222,11 +383,26 @@ export type OutcomeControllerResult<T> =
   | { success: true; data: T }
   | { success: false; error: string; code?: string };
 
+export interface OutcomeUserTurnResult {
+  receipt: OutcomeUserMessageReceipt;
+  receiptId: string;
+  status: 'written' | 'noop';
+  noop: boolean;
+}
+
 export interface OutcomeBeginResult {
   outcomeId: string;
   revision: number;
   phase: OutcomePhase;
-  checkpoint: {
+  kickoffGate?: {
+    state: OutcomeKickoffGateState;
+    attempts: number;
+    maxAttempts: number;
+    authenticatedReviewId?: string;
+    lastCheckpointId?: string;
+    failureReason?: string;
+  };
+  checkpoint?: {
     checkpointId: string;
     kind: OutcomeCheckpointKind;
     claimGeneration: number;
@@ -481,6 +657,16 @@ export class OutcomeController {
       revision: record.revision,
       phase: record.phase,
       contractDigest: record.contractDigest,
+      kickoffGate: record.kickoffGate
+        ? {
+            state: record.kickoffGate.state,
+            attempts: record.kickoffGate.attempts,
+            maxAttempts: record.kickoffGate.maxAttempts,
+            authenticatedReviewId: record.kickoffGate.authenticatedReviewId,
+            lastCheckpointId: record.kickoffGate.lastCheckpointId,
+            failureReason: record.kickoffGate.failureReason,
+          }
+        : undefined,
       checkpoint: record.checkpoint
         ? {
             checkpointId: record.checkpoint.checkpointId,
@@ -497,11 +683,14 @@ export class OutcomeController {
         (a) => a.resolvedAt === undefined,
       ),
       activeOperations: record.operations
-        .filter((op) => op.status === 'running')
+        .filter((op) =>
+          ['running', 'failed', 'interrupted'].includes(op.status),
+        )
         .map((op) => ({
           id: op.id,
           toolName: op.toolName,
           status: op.status,
+          error: op.error,
         })),
       finalCertificate: record.finalCertificate,
     };
@@ -550,6 +739,20 @@ export class OutcomeController {
       };
     }
 
+    if (record.kickoffGate?.state === 'exhausted') {
+      return {
+        kind: 'recovery',
+        message: `Kickoff attempts exhausted (${record.kickoffGate.attempts}/${record.kickoffGate.maxAttempts}): ${record.kickoffGate.failureReason ?? 'Maximum kickoff attempts reached; outcome failed.'}`,
+      };
+    }
+
+    if (record.kickoffGate?.state === 'legacy_late_missing') {
+      return {
+        kind: 'recovery',
+        message: `Retrospective kickoff forbidden for legacy record: ${record.kickoffGate.failureReason ?? 'Historical record has review activity without an authenticated kickoff review.'}`,
+      };
+    }
+
     if (record.phase === 'action_required') {
       if (record.checkpoint?.state === 'review_uncertain') {
         return {
@@ -560,10 +763,24 @@ export class OutcomeController {
       const unresolvedActions = record.actionsRequired.filter(
         (a) => a.resolvedAt === undefined,
       );
-      if (unresolvedActions.length > 0) {
+      const unresolvedOperations = record.operations.filter((operation) =>
+        ['failed', 'interrupted'].includes(operation.status),
+      );
+      if (unresolvedActions.length > 0 || unresolvedOperations.length > 0) {
+        const messages: string[] = [];
+        if (unresolvedActions.length > 0) {
+          messages.push(
+            `Action required: ${unresolvedActions.map((a) => a.reason).join('; ')}`,
+          );
+        }
+        if (unresolvedOperations.length > 0) {
+          messages.push(
+            `Interrupted or failed operations require acknowledgement: ${unresolvedOperations.map((operation) => `${operation.id} (${operation.toolName})`).join('; ')}. Call outcome_control(action='acknowledge_operation', operationId=...) for each after reconciling its actual outcome.`,
+          );
+        }
         return {
           kind: 'recovery',
-          message: `Action required: ${unresolvedActions.map((a) => a.reason).join('; ')}`,
+          message: messages.join('\n'),
         };
       }
     }
@@ -691,6 +908,66 @@ export class OutcomeController {
     }
 
     if (!record.checkpoint) {
+      if (record.kickoffGate.state === 'legacy_late_missing') {
+        return {
+          success: false,
+          error:
+            record.kickoffGate.failureReason ??
+            'Retrospective kickoff is forbidden for legacy record with missing kickoff',
+          code: 'retrospective_kickoff_forbidden',
+        };
+      }
+      if (
+        record.kickoffGate.state === 'exhausted' ||
+        record.kickoffGate.attempts >= record.kickoffGate.maxAttempts
+      ) {
+        return {
+          success: false,
+          error:
+            record.kickoffGate.failureReason ??
+            'Kickoff retry attempts exhausted (2/2)',
+          code: 'kickoff_retry_exhausted',
+        };
+      }
+      if (record.kickoffGate.state === 'authenticated') {
+        return {
+          success: true,
+          data: {
+            outcomeId: record.outcomeId,
+            revision: record.revision,
+            phase: record.phase,
+            kickoffGate: {
+              state: record.kickoffGate.state,
+              attempts: record.kickoffGate.attempts,
+              maxAttempts: record.kickoffGate.maxAttempts,
+              authenticatedReviewId: record.kickoffGate.authenticatedReviewId,
+              lastCheckpointId: record.kickoffGate.lastCheckpointId,
+              failureReason: record.kickoffGate.failureReason,
+            },
+            dispatchNudgePending: false,
+            idempotent: true,
+          },
+        };
+      }
+      if (record.kickoffGate.state === 'legacy_certified') {
+        return {
+          success: true,
+          data: {
+            outcomeId: record.outcomeId,
+            revision: record.revision,
+            phase: record.phase,
+            kickoffGate: {
+              state: record.kickoffGate.state,
+              attempts: record.kickoffGate.attempts,
+              maxAttempts: record.kickoffGate.maxAttempts,
+              failureReason: record.kickoffGate.failureReason,
+            },
+            dispatchNudgePending: false,
+            idempotent: true,
+          },
+        };
+      }
+
       const claimToken = randomBytes(32).toString('hex');
       const now = this.#clock();
       const expiresAt = now + 600_000;
@@ -725,6 +1002,14 @@ export class OutcomeController {
           outcomeId: record.outcomeId,
           revision: record.revision,
           phase: record.phase,
+          kickoffGate: {
+            state: record.kickoffGate.state,
+            attempts: record.kickoffGate.attempts,
+            maxAttempts: record.kickoffGate.maxAttempts,
+            authenticatedReviewId: record.kickoffGate.authenticatedReviewId,
+            lastCheckpointId: record.kickoffGate.lastCheckpointId,
+            failureReason: record.kickoffGate.failureReason,
+          },
           checkpoint: {
             checkpointId: checkpoint.checkpointId,
             kind: checkpoint.kind,
@@ -738,12 +1023,38 @@ export class OutcomeController {
 
     const checkpoint = record.checkpoint;
     if (isSettledCheckpoint(checkpoint.state)) {
+      if (record.kickoffGate.state === 'legacy_late_missing') {
+        return {
+          success: false,
+          error:
+            record.kickoffGate.failureReason ??
+            'Retrospective kickoff is forbidden for legacy record with missing kickoff',
+          code: 'retrospective_kickoff_forbidden',
+        };
+      }
+      if (record.kickoffGate.state === 'exhausted') {
+        return {
+          success: false,
+          error:
+            record.kickoffGate.failureReason ??
+            'Kickoff retry attempts exhausted (2/2)',
+          code: 'kickoff_retry_exhausted',
+        };
+      }
       return {
         success: true,
         data: {
           outcomeId: record.outcomeId,
           revision: record.revision,
           phase: record.phase,
+          kickoffGate: {
+            state: record.kickoffGate.state,
+            attempts: record.kickoffGate.attempts,
+            maxAttempts: record.kickoffGate.maxAttempts,
+            authenticatedReviewId: record.kickoffGate.authenticatedReviewId,
+            lastCheckpointId: record.kickoffGate.lastCheckpointId,
+            failureReason: record.kickoffGate.failureReason,
+          },
           checkpoint: {
             checkpointId: checkpoint.checkpointId,
             kind: checkpoint.kind,
@@ -771,6 +1082,14 @@ export class OutcomeController {
         outcomeId: record.outcomeId,
         revision: record.revision,
         phase: record.phase,
+        kickoffGate: {
+          state: record.kickoffGate.state,
+          attempts: record.kickoffGate.attempts,
+          maxAttempts: record.kickoffGate.maxAttempts,
+          authenticatedReviewId: record.kickoffGate.authenticatedReviewId,
+          lastCheckpointId: record.kickoffGate.lastCheckpointId,
+          failureReason: record.kickoffGate.failureReason,
+        },
         checkpoint: {
           checkpointId: checkpoint.checkpointId,
           kind: checkpoint.kind,
@@ -796,6 +1115,29 @@ export class OutcomeController {
     }
     const record = recRes.data;
 
+    if (record.kickoffGate.state === 'legacy_late_missing') {
+      return {
+        success: false,
+        error:
+          record.kickoffGate.failureReason ??
+          'Retrospective kickoff is forbidden for legacy record with missing kickoff',
+        code: 'retrospective_kickoff_forbidden',
+      };
+    }
+    if (
+      record.kickoffGate.state === 'exhausted' ||
+      (params.kind === 'kickoff' &&
+        record.kickoffGate.attempts >= record.kickoffGate.maxAttempts)
+    ) {
+      return {
+        success: false,
+        error:
+          record.kickoffGate.failureReason ??
+          'Kickoff retry attempts exhausted (2/2)',
+        code: 'kickoff_retry_exhausted',
+      };
+    }
+
     if (record.waitCondition) {
       return {
         success: false,
@@ -812,6 +1154,19 @@ export class OutcomeController {
           'Cannot open checkpoint while Controller actions remain unresolved',
         code: 'action_unresolved',
       };
+    }
+
+    const includedEvidenceIds = new Set(params.evidenceAttestationIds ?? []);
+    for (const rule of record.contract.rules) {
+      for (const evId of rule.evidenceAttestationIds) {
+        if (!includedEvidenceIds.has(evId)) {
+          return {
+            success: false,
+            error: `Checkpoint must include evidence attestation '${evId}' referenced by rule '${rule.id}'`,
+            code: 'invalid_checkpoint_params',
+          };
+        }
+      }
     }
 
     if (
@@ -1909,69 +2264,146 @@ export class OutcomeController {
         data: { observationId: '', operationId: '' },
       };
     }
-    const recRes = this.readRecord(rootSessionId);
-    if (!recRes.success) {
-      return {
-        success: false,
-        error: recRes.error.message,
-        code: recRes.code,
-      };
-    }
-    const record = recRes.data;
 
     const observationId = `obs_${callId}`;
     const operationId = `op_${callId}`;
     const outputDigest = canonicalDigest('omos/tool-output/v1', output);
     const now = this.#clock();
 
-    const completeRes = this.#store.mutate(rootSessionId, record.revision, {
-      type: 'complete_tool_call',
-      operationId,
-      observationId,
-      outputDigest,
-      completedEpoch: this.#serverEpoch,
-      completedAt: now,
-    });
-    if (!completeRes.success) {
+    const maxCasRetries = 5;
+    for (let attempt = 0; attempt < maxCasRetries; attempt++) {
+      const recRes = this.readRecord(rootSessionId);
+      if (!recRes.success) {
+        return {
+          success: false,
+          error: recRes.error.message,
+          code: recRes.code,
+        };
+      }
+      const record = recRes.data;
+
+      const completeRes = this.#store.mutate(rootSessionId, record.revision, {
+        type: 'complete_tool_call',
+        operationId,
+        observationId,
+        outputDigest,
+        completedEpoch: this.#serverEpoch,
+        completedAt: now,
+      });
+
+      if (completeRes.success) {
+        return { success: true, data: { observationId, operationId } };
+      }
+
+      if (completeRes.code !== 'conflict') {
+        return {
+          success: false,
+          error: completeRes.error.message,
+          code: completeRes.code,
+        };
+      }
+    }
+
+    return {
+      success: false,
+      error: 'CAS conflict retry limit exceeded while completing tool call',
+      code: 'conflict',
+    };
+  }
+
+  observeExternalUserTurn(
+    rootSessionId: string,
+    messageId: string,
+    text: string,
+  ): OutcomeControllerResult<OutcomeUserTurnResult> {
+    if (!messageId || typeof messageId !== 'string' || !messageId.trim()) {
       return {
         success: false,
-        error: completeRes.error.message,
-        code: completeRes.code,
+        error: 'External user message requires a non-empty messageId',
+        code: 'invalid_parameter',
       };
     }
-    return { success: true, data: { observationId, operationId } };
+    const canonicalMessageId = messageId.trim();
+
+    const contentDigest = canonicalDigest('omos/user-message/v1', text);
+    const maxCasRetries = 5;
+
+    for (let attempt = 0; attempt < maxCasRetries; attempt++) {
+      const recRes = this.readRecord(rootSessionId);
+      if (!recRes.success) {
+        return {
+          success: false,
+          error: recRes.error.message,
+          code: recRes.code,
+        };
+      }
+      const record = recRes.data;
+
+      const receiptId = `usr_${this.#randomId().replace(/-/g, '').slice(0, 16)}`;
+      const now = this.#clock();
+      const receipt: OutcomeUserMessageReceipt = {
+        id: receiptId,
+        messageId: canonicalMessageId,
+        contentDigest,
+        observedEpoch: this.#serverEpoch,
+        observedAt: now,
+        createdRevision: record.revision + 1,
+        provenance: 'external_user',
+      };
+
+      const mutateRes = this.#store.mutate(rootSessionId, record.revision, {
+        type: 'append_user_message',
+        receipt,
+      });
+
+      if (mutateRes.success) {
+        if (mutateRes.status === 'noop') {
+          const existing = mutateRes.data.receipts.userMessages.find(
+            (entry) => entry.messageId === canonicalMessageId,
+          );
+          return {
+            success: true,
+            data: {
+              receipt: existing ?? receipt,
+              receiptId: existing?.id ?? receipt.id,
+              status: 'noop',
+              noop: true,
+            },
+          };
+        }
+        return {
+          success: true,
+          data: {
+            receipt,
+            receiptId: receipt.id,
+            status: 'written',
+            noop: false,
+          },
+        };
+      }
+
+      if (mutateRes.code !== 'conflict') {
+        return {
+          success: false,
+          error: mutateRes.error.message,
+          code: mutateRes.code,
+        };
+      }
+    }
+
+    return {
+      success: false,
+      error: 'CAS conflict retry limit exceeded while appending user message',
+      code: 'conflict',
+    };
   }
 
   observeUserTurn(
     rootSessionId: string,
     messageId: string,
     text: string,
-  ): void {
-    if (!messageId.trim()) return;
-    const recRes = this.readRecord(rootSessionId);
-    if (!recRes.success) {
-      if (recRes.code === 'missing') return;
-      throw new Error(
-        `Managed outcome state is unavailable (${recRes.code}): ${recRes.error.message}`,
-      );
-    }
-    const record = recRes.data;
-
-    const receiptId = `usr_${this.#randomId().replace(/-/g, '').slice(0, 16)}`;
-    const now = this.#clock();
-    const receipt: OutcomeUserMessageReceipt = {
-      id: receiptId,
-      messageId,
-      contentDigest: canonicalDigest('omos/user-message/v1', text),
-      observedEpoch: this.#serverEpoch,
-      observedAt: now,
-      createdRevision: record.revision + 1,
-    };
-
-    this.#store.mutate(rootSessionId, record.revision, {
-      type: 'append_user_message',
-      receipt,
-    });
+  ): OutcomeControllerResult<OutcomeUserTurnResult> {
+    return this.observeExternalUserTurn(rootSessionId, messageId, text);
   }
 
   validateAndMarkDispatching(

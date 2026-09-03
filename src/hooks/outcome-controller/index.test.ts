@@ -4,11 +4,15 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { OutcomeController } from '../../outcome/controller';
 import {
+  canonicalDigest,
   type OutcomeContract,
   OutcomeContractSchema,
 } from '../../outcome/controller-schema';
 import { BackgroundJobBoard } from '../../utils';
-import { createInternalAgentTextPart } from '../../utils/internal-initiator';
+import {
+  createInternalAgentTextPart,
+  INTERNAL_INITIATOR_METADATA_KEY,
+} from '../../utils/internal-initiator';
 import { isTaggedPart } from '../cache-safe-injection';
 import {
   createOutcomeControllerHook,
@@ -768,5 +772,386 @@ describe('OutcomeControllerHook', () => {
         { args: { command: 'systemctl restart postgresql' } },
       ),
     ).resolves.toBeUndefined();
+  });
+
+  test('before without after reconciles running operation to interrupted exactly once on idle', async () => {
+    const root = 'ses_managed';
+    const hook = createOutcomeControllerHook({} as never, {
+      controller,
+      shouldManageSession: (id) => id === root,
+      backgroundJobBoard: board,
+    });
+    controller.begin(root, sampleContract());
+
+    await hook['tool.execute.before'](
+      { tool: 'bash', sessionID: root, callID: 'call_stale_op' },
+      { args: { command: 'echo running' } },
+    );
+
+    let record = controller.readRecord(root);
+    expect(record.success).toBe(true);
+    if (!record.success) return;
+    expect(record.data.operations).toHaveLength(1);
+    expect(record.data.operations[0].status).toBe('running');
+    const revBeforeIdle = record.data.revision;
+
+    await hook.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: root },
+      },
+    });
+
+    record = controller.readRecord(root);
+    expect(record.success).toBe(true);
+    if (!record.success) return;
+    expect(record.data.operations).toHaveLength(1);
+    expect(record.data.operations[0].status).toBe('interrupted');
+    expect(record.data.operations[0].error).toBe(
+      'Session became idle without a durable tool after-hook',
+    );
+    expect(record.data.revision).toBe(revBeforeIdle + 1);
+  });
+
+  test('active running child suppresses idle operation reconciliation', async () => {
+    const root = 'ses_managed';
+    const hook = createOutcomeControllerHook({} as never, {
+      controller,
+      shouldManageSession: (id) => id === root,
+      backgroundJobBoard: board,
+    });
+    controller.begin(root, sampleContract());
+
+    await hook['tool.execute.before'](
+      { tool: 'read', sessionID: root, callID: 'call_child_suppressed' },
+      { args: { filePath: '/workspace/test.ts' } },
+    );
+
+    board.registerLaunch({
+      taskID: 'child_running_op',
+      parentSessionID: root,
+      agent: 'explorer',
+      description: 'Active child running',
+    });
+
+    let record = controller.readRecord(root);
+    expect(record.success).toBe(true);
+    if (!record.success) return;
+    expect(record.data.operations[0].status).toBe('running');
+    const revBefore = record.data.revision;
+
+    await hook.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: root },
+      },
+    });
+
+    record = controller.readRecord(root);
+    expect(record.success).toBe(true);
+    if (!record.success) return;
+    expect(record.data.operations[0].status).toBe('running');
+    expect(record.data.revision).toBe(revBefore);
+  });
+
+  test('repeated idle produces no record growth or byte mutation', async () => {
+    const root = 'ses_managed';
+    const hook = createOutcomeControllerHook({} as never, {
+      controller,
+      shouldManageSession: (id) => id === root,
+      backgroundJobBoard: board,
+    });
+    controller.begin(root, sampleContract());
+
+    await hook['tool.execute.before'](
+      { tool: 'bash', sessionID: root, callID: 'call_repeat_idle' },
+      { args: { command: 'echo once' } },
+    );
+
+    await hook.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: root },
+      },
+    });
+
+    const recordAfterFirst = controller.readRecord(root);
+    expect(recordAfterFirst.success).toBe(true);
+    if (!recordAfterFirst.success) return;
+    const finalRevision = recordAfterFirst.data.revision;
+    const filePath = controller.store.recordPath(root);
+    const bytesAfterFirst = fs.readFileSync(filePath, 'utf-8');
+
+    // Repeated session.idle and session.status: idle events
+    for (let i = 0; i < 3; i += 1) {
+      await hook.event({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: root },
+        },
+      });
+      await hook.event({
+        event: {
+          type: 'session.status',
+          properties: { sessionID: root, status: { type: 'idle' } },
+        },
+      });
+    }
+
+    const recordAfterRepeats = controller.readRecord(root);
+    expect(recordAfterRepeats.success).toBe(true);
+    if (!recordAfterRepeats.success) return;
+    expect(recordAfterRepeats.data.revision).toBe(finalRevision);
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(bytesAfterFirst);
+  });
+
+  test('whole-message external provenance rejects mixed internal and accepts pure external', async () => {
+    const root = 'ses_managed';
+    const hook = createOutcomeControllerHook({} as never, {
+      controller,
+      shouldManageSession: (id) => id === root,
+      backgroundJobBoard: board,
+    });
+    controller.begin(root, sampleContract());
+
+    // 1. Mixed plain + synthetic part -> rejected (0 receipts)
+    await hook['chat.message']({
+      sessionID: root,
+      messageID: 'msg_mixed_1',
+      parts: [
+        { type: 'text', text: 'Plain user request' },
+        { type: 'text', text: 'Synthetic notice', synthetic: true },
+      ],
+    });
+
+    // 2. Synthetic part alone -> rejected (0 receipts)
+    await hook['chat.message']({
+      sessionID: root,
+      messageID: 'msg_synth',
+      parts: [{ type: 'text', text: 'Only synthetic', synthetic: true }],
+    });
+
+    // 3. Part with internal initiator metadata -> rejected (0 receipts)
+    await hook['chat.message']({
+      sessionID: root,
+      messageID: 'msg_internal_meta',
+      parts: [
+        {
+          type: 'text',
+          text: 'Internal initiator part',
+          metadata: { [INTERNAL_INITIATOR_METADATA_KEY]: true },
+        },
+      ],
+    });
+
+    // 4. Part with compaction_continue metadata -> rejected (0 receipts)
+    await hook['chat.message']({
+      sessionID: root,
+      messageID: 'msg_compaction',
+      parts: [
+        {
+          type: 'text',
+          text: 'Compaction continuation',
+          metadata: { compaction_continue: true },
+        },
+      ],
+    });
+
+    // 5. Part with backgroundJobBoard metadata -> rejected (0 receipts)
+    await hook['chat.message']({
+      sessionID: root,
+      messageID: 'msg_board_meta',
+      parts: [
+        {
+          type: 'text',
+          text: 'Job board metadata',
+          metadata: { 'oh-my-opencode-slim.backgroundJobBoard': true },
+        },
+      ],
+    });
+
+    // 6. Part with outcome controller metadata -> rejected (0 receipts)
+    await hook['chat.message']({
+      sessionID: root,
+      messageID: 'msg_outcome_meta',
+      parts: [
+        {
+          type: 'text',
+          text: 'Outcome controller metadata',
+          metadata: { [OUTCOME_CONTROLLER_METADATA_KEY]: true },
+        },
+      ],
+    });
+
+    // 7. Clean input.parts but internal output.parts -> rejected (never trust cleaner input)
+    await hook['chat.message'](
+      {
+        sessionID: root,
+        messageID: 'msg_clean_in_dirty_out',
+        parts: [{ type: 'text', text: 'Clean input text' }],
+      },
+      {
+        message: { id: 'msg_clean_in_dirty_out' },
+        parts: [
+          { type: 'text', text: 'Clean input text' },
+          { type: 'text', text: 'Internal tail', synthetic: true },
+        ],
+      },
+    );
+
+    let rec = controller.readRecord(root);
+    expect(rec.success).toBe(true);
+    if (!rec.success) return;
+    expect(rec.data.receipts.userMessages).toHaveLength(0);
+
+    // 8. Marker text alone WITHOUT metadata -> accepted as ordinary external text
+    await hook['chat.message']({
+      sessionID: root,
+      messageID: 'msg_marker_text_only',
+      parts: [
+        {
+          type: 'text',
+          text: 'User discussion about <!-- SLIM_INTERNAL_INITIATOR --> marker',
+        },
+      ],
+    });
+
+    rec = controller.readRecord(root);
+    expect(rec.success).toBe(true);
+    if (!rec.success) return;
+    expect(rec.data.receipts.userMessages).toHaveLength(1);
+    expect(rec.data.receipts.userMessages[0].messageId).toBe(
+      'msg_marker_text_only',
+    );
+    expect(rec.data.receipts.userMessages[0].provenance).toBe('external_user');
+  });
+
+  test('authoritative output parts are preferred when provided and nonempty', async () => {
+    const root = 'ses_managed';
+    const hook = createOutcomeControllerHook({} as never, {
+      controller,
+      shouldManageSession: (id) => id === root,
+      backgroundJobBoard: board,
+    });
+    controller.begin(root, sampleContract());
+
+    await hook['chat.message'](
+      {
+        sessionID: root,
+        messageID: 'msg_auth_parts',
+        parts: [{ type: 'text', text: 'ignored input text' }],
+      },
+      {
+        message: { id: 'msg_auth_parts' },
+        parts: [{ type: 'text', text: 'authoritative output text' }],
+      },
+    );
+
+    const rec = controller.readRecord(root);
+    expect(rec.success).toBe(true);
+    if (!rec.success) return;
+    expect(rec.data.receipts.userMessages).toHaveLength(1);
+    expect(rec.data.receipts.userMessages[0].contentDigest).toBe(
+      canonicalDigest('omos/user-message/v1', 'authoritative output text'),
+    );
+  });
+
+  test('authoritative empty output parts never fall back to dirty input parts', async () => {
+    const root = 'ses_managed';
+    const hook = createOutcomeControllerHook({} as never, {
+      controller,
+      shouldManageSession: (id) => id === root,
+      backgroundJobBoard: board,
+    });
+    controller.begin(root, sampleContract());
+
+    await hook['chat.message'](
+      {
+        sessionID: root,
+        messageID: 'msg_empty_authoritative',
+        parts: [{ type: 'text', text: 'Dirty input must not be trusted' }],
+      },
+      { message: { id: 'msg_empty_authoritative' }, parts: [] },
+    );
+
+    const rec = controller.readRecord(root);
+    expect(rec.success).toBe(true);
+    if (!rec.success) return;
+    expect(rec.data.receipts.userMessages).toHaveLength(0);
+  });
+
+  test('initial external turn before outcome begin remains an unmanaged no-op', async () => {
+    const root = 'ses_not_begun';
+    const hook = createOutcomeControllerHook({} as never, {
+      controller,
+      shouldManageSession: (id) => id === root,
+      backgroundJobBoard: board,
+    });
+
+    await expect(
+      hook['chat.message']({
+        sessionID: root,
+        messageID: 'msg_before_begin',
+        parts: [{ type: 'text', text: 'Start a non-trivial outcome' }],
+      }),
+    ).resolves.toBeUndefined();
+    expect(controller.getStatus(root).isManaged).toBe(false);
+  });
+
+  test('host message ID is required and duplicate host events are idempotent', async () => {
+    const root = 'ses_managed';
+    const hook = createOutcomeControllerHook({} as never, {
+      controller,
+      shouldManageSession: (id) => id === root,
+      backgroundJobBoard: board,
+    });
+    controller.begin(root, sampleContract());
+
+    // Message with no messageID anywhere -> mints nothing
+    await hook['chat.message']({
+      sessionID: root,
+      parts: [{ type: 'text', text: 'Anonymous message without ID' }],
+    });
+    let rec = controller.readRecord(root);
+    expect(rec.success).toBe(true);
+    if (!rec.success) return;
+    expect(rec.data.receipts.userMessages).toHaveLength(0);
+
+    // Message with host ID -> mints receipt
+    await hook['chat.message']({
+      sessionID: root,
+      messageID: 'msg_idempotent_1',
+      parts: [{ type: 'text', text: 'Legitimate turn' }],
+    });
+    rec = controller.readRecord(root);
+    expect(rec.success).toBe(true);
+    if (!rec.success) return;
+    expect(rec.data.receipts.userMessages).toHaveLength(1);
+    const revAfterFirst = rec.data.revision;
+
+    // Duplicate event with same messageID and content -> idempotent no-op
+    await hook['chat.message']({
+      sessionID: root,
+      messageID: 'msg_idempotent_1',
+      parts: [{ type: 'text', text: 'Legitimate turn' }],
+    });
+    rec = controller.readRecord(root);
+    expect(rec.success).toBe(true);
+    if (!rec.success) return;
+    expect(rec.data.receipts.userMessages).toHaveLength(1);
+    expect(rec.data.revision).toBe(revAfterFirst);
+
+    await expect(
+      hook['chat.message']({
+        sessionID: root,
+        messageID: 'msg_idempotent_1',
+        parts: [{ type: 'text', text: 'Conflicting reused identity' }],
+      }),
+    ).rejects.toThrow('already recorded with different content');
+    rec = controller.readRecord(root);
+    expect(rec.success).toBe(true);
+    if (!rec.success) return;
+    expect(rec.data.receipts.userMessages).toHaveLength(1);
+    expect(rec.data.revision).toBe(revAfterFirst);
   });
 });

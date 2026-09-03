@@ -1,8 +1,10 @@
 import type { Plugin } from '@opencode-ai/plugin';
 import type { OutcomeController } from '../../outcome/controller';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
+import { isRecord } from '../../utils/guards';
 import {
   createInternalAgentTextPart,
+  INTERNAL_INITIATOR_METADATA_KEY,
   isInternalInitiatorPart,
 } from '../../utils/internal-initiator';
 import { parseTaskIdFromTaskOutput } from '../../utils/task';
@@ -21,6 +23,25 @@ export const OUTCOME_CONTROLLER_METADATA_KEY =
 
 export const OUTCOME_CONTROLLER_WAKE_TEXT =
   'Action required on outcome protocol. Check outcome_control status or pending checkpoint instructions.';
+
+function hasInternalMetadata(metadata: unknown): boolean {
+  if (!isRecord(metadata)) return false;
+  return (
+    metadata[INTERNAL_INITIATOR_METADATA_KEY] === true ||
+    metadata.compaction_continue === true ||
+    metadata[OUTCOME_CONTROLLER_METADATA_KEY] === true ||
+    metadata['oh-my-opencode-slim.backgroundJobBoard'] === true
+  );
+}
+
+export function isInternalOrSyntheticPart(part: unknown): boolean {
+  if (!isRecord(part)) return false;
+  if (part.synthetic === true) return true;
+  if (isInternalInitiatorPart(part)) return true;
+  if (hasInternalMetadata(part.metadata)) return true;
+  if (hasInternalMetadata(part.providerMetadata)) return true;
+  return false;
+}
 
 const EXTERNAL_HANDOFF_ERROR =
   "Managed orchestrators cannot directly restart the current OpenCode process. Call outcome_control(action='external_handoff', handoffKind='restart_current_opencode', ...) and give the user restart instructions instead.";
@@ -428,31 +449,66 @@ export function createOutcomeControllerHook(
         parts?: unknown[];
         messageID?: string;
       },
-      output?: { message?: { id?: string } },
+      output?: { message?: { id?: string }; parts?: unknown[] },
     ): Promise<void> => {
       const sessionID = input.sessionID;
       if (!sessionID || !shouldManageSession(sessionID)) return;
 
-      const parts = Array.isArray(input.parts) ? input.parts : [];
-      const nonSyntheticTexts = parts
-        .filter(
-          (p) =>
-            p &&
-            typeof p === 'object' &&
-            (p as { type?: string }).type === 'text' &&
-            (p as { synthetic?: boolean }).synthetic !== true &&
-            !isInternalInitiatorPart(p),
-        )
-        .map((p) => (p as { text?: string }).text || '')
-        .filter((t) => t.trim().length > 0);
+      const messageID = input.messageID?.trim()
+        ? input.messageID.trim()
+        : output?.message?.id?.trim()
+          ? output.message.id.trim()
+          : undefined;
+      if (!messageID) return;
 
-      if (nonSyntheticTexts.length > 0) {
-        const fullText = nonSyntheticTexts.join('\n');
-        const messageID = input.messageID ?? output?.message?.id;
-        if (messageID?.trim()) {
-          idleWokenSessions.delete(sessionID);
-          controller.observeUserTurn(sessionID, messageID, fullText);
+      // An explicitly supplied output.parts array is authoritative even when
+      // empty. Never fall back to dirtier input parts after a host transform
+      // removed content.
+      const rawParts = Array.isArray(output?.parts)
+        ? output.parts
+        : Array.isArray(input.parts)
+          ? input.parts
+          : [];
+
+      if (rawParts.length === 0) return;
+
+      // Reject entire message if any authoritative part is synthetic, internal initiator, or compaction continuation
+      for (const part of rawParts) {
+        if (isInternalOrSyntheticPart(part)) {
+          return;
         }
+      }
+
+      const textParts: string[] = [];
+      for (const part of rawParts) {
+        if (
+          isRecord(part) &&
+          part.type === 'text' &&
+          typeof part.text === 'string' &&
+          part.text.trim().length > 0
+        ) {
+          textParts.push(part.text);
+        }
+      }
+
+      if (textParts.length === 0) return;
+
+      const fullText = textParts.join('\n');
+
+      idleWokenSessions.delete(sessionID);
+      const observed = controller.observeExternalUserTurn(
+        sessionID,
+        messageID,
+        fullText,
+      );
+      if (!observed.success) {
+        // The first external turn precedes outcome_control(begin), so no durable
+        // outcome exists yet. Preserve unmanaged behavior for that boundary;
+        // every failure after a record exists remains fail closed.
+        if (observed.code === 'missing') return;
+        throw new Error(
+          `Failed to persist external user message: ${observed.error}`,
+        );
       }
     },
 
@@ -503,15 +559,25 @@ export function createOutcomeControllerHook(
         if (backgroundJobBoard?.hasRunning?.(eventSessionID)) {
           return;
         }
+
+        const reconcileRes =
+          controller.store.reconcileIdleOperations(eventSessionID);
+        if (!reconcileRes.success) {
+          throw new Error(
+            `Failed to reconcile idle operations: ${reconcileRes.error.message}`,
+          );
+        }
+        const updatedRecord = reconcileRes.data;
+
         const hasTerminalUnreconciledChildren =
           backgroundJobBoard?.hasTerminalUnreconciled?.(eventSessionID) ??
           false;
 
         // Send one-flight promptAsync if actionable
         if (
-          (record.phase === 'action_required' ||
-            record.checkpoint?.state === 'claimed' ||
-            record.checkpoint?.state === 'review_uncertain' ||
+          (updatedRecord.phase === 'action_required' ||
+            updatedRecord.checkpoint?.state === 'claimed' ||
+            updatedRecord.checkpoint?.state === 'review_uncertain' ||
             hasTerminalUnreconciledChildren) &&
           !idleWokenSessions.has(eventSessionID)
         ) {

@@ -3,12 +3,16 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  buildOutcomeReviewExactPayload,
+  buildOutcomeReviewPacket,
   formatOutcomeDispatchMarker,
   type ManagerTaskVerification,
   OutcomeController,
 } from './controller';
 import {
   canonicalDigest,
+  computeOutcomeCheckpointFingerprint,
+  computeOutcomeContractDigest,
   type OutcomeContract,
   OutcomeContractSchema,
 } from './controller-schema';
@@ -818,6 +822,16 @@ describe('OutcomeController service over frozen store', () => {
         (a) => a.code === 'interrupted_operation',
       ),
     ).toBe(true);
+    expect(controller2.getStatus(root).activeOperations).toEqual([
+      expect.objectContaining({
+        id: 'op_call_hung_1',
+        status: 'interrupted',
+      }),
+    ]);
+    expect(controller2.getPendingNudge(root)).toMatchObject({
+      kind: 'recovery',
+      message: expect.stringContaining('acknowledge_operation'),
+    });
   });
 
   test('user decisions: USER_DECISION_REQUIRED review creates durable decision and resolve_user_decision resolves it', async () => {
@@ -1187,16 +1201,32 @@ describe('OutcomeController service over frozen store', () => {
     );
   });
 
-  test('prior-epoch stale claim requires explicit provenance before a new checkpoint', () => {
+  test('prior-epoch stale claim requires explicit provenance before a new checkpoint', async () => {
     const root = 'ses_stale_action_resolution';
     const old = new OutcomeController({
       storeDirectory: tempDir,
       serverEpoch: 'epoch_old',
     });
     old.begin(root, testContract());
-    const current = new OutcomeController({
+    let current: OutcomeController;
+    current = new OutcomeController({
       storeDirectory: tempDir,
       serverEpoch: 'epoch_new',
+      getManagerTaskRecord: () => ({
+        taskID: 'mgr_stale_retry',
+        parentSessionID: root,
+        agent: 'outcome-manager',
+        generation: 1,
+        state: 'completed',
+      }),
+      readChildSessionResult: async () => ({
+        text: `<outcome_review>${JSON.stringify(
+          validReviewFor(current, root, 'CONTINUE'),
+        )}</outcome_review>`,
+        empty: false,
+        terminal: true,
+      }),
+      consumeManagerTask: () => true,
     });
     const recovered = current.readRecord(root);
     expect(recovered.success).toBe(true);
@@ -1226,6 +1256,7 @@ describe('OutcomeController service over frozen store', () => {
     const receipt = afterUser.data.receipts.userMessages.at(-1);
     expect(receipt).toBeDefined();
     if (!receipt) return;
+    expect(receipt.provenance).toBe('external_user');
     expect(
       current.resolveAction(root, {
         actionId: action.id,
@@ -1233,6 +1264,38 @@ describe('OutcomeController service over frozen store', () => {
         sourceUserMessageReceiptId: receipt.id,
       }).success,
     ).toBe(true);
+
+    // Opening decision checkpoint still fails before kickoff is authenticated
+    expect(
+      current.checkpoint(root, {
+        kind: 'decision',
+        reason: 'Blocked before kickoff authentication',
+      }).success,
+    ).toBe(false);
+
+    // Open kickoff retry checkpoint (attempt 2)
+    const retryKickoff = current.checkpoint(root, {
+      kind: 'kickoff',
+      reason: 'Retry kickoff after recovering stale claim',
+    });
+    expect(retryKickoff.success).toBe(true);
+    if (!retryKickoff.success) return;
+
+    // Authenticate kickoff
+    current.validateAndMarkDispatching(
+      root,
+      'call_stale_dispatch',
+      dispatchInstruction(current, root),
+    );
+    current.bindManagerTask(root, 'call_stale_dispatch', 'mgr_stale_retry', 1);
+    const reconcileRes = await current.reconcileReview(root, {
+      checkpointId: retryKickoff.data.checkpointId,
+      managerTaskId: 'mgr_stale_retry',
+      managerGeneration: 1,
+    });
+    expect(reconcileRes.success).toBe(true);
+
+    // Now decision checkpoint succeeds!
     expect(
       current.checkpoint(root, {
         kind: 'decision',
@@ -1552,5 +1615,1793 @@ describe('OutcomeController service over frozen store', () => {
     if (!finalReload.success) return;
     expect(finalReload.data.phase).toBe('accepted');
     expect(finalReload.data.finalCertificate).toBeDefined();
+  });
+
+  describe('Golden exact-packet contract review tests', () => {
+    test('emits exact JSON packet for empty rules/evidence/exceptions and authenticates generated review', async () => {
+      const root = 'ses_golden_empty';
+      let controller: OutcomeController;
+      controller = new OutcomeController({
+        storeDirectory: tempDir,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_golden_empty',
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => {
+          const recRes = controller.readRecord(root);
+          if (!recRes.success || !recRes.data.checkpoint) {
+            throw new Error('Record missing');
+          }
+          const packet = buildOutcomeReviewPacket(
+            recRes.data,
+            recRes.data.checkpoint,
+          );
+          expect(packet).toContain(
+            '## Exact Controller-Authenticated Review Values',
+          );
+          const exactPayload = buildOutcomeReviewExactPayload(
+            recRes.data,
+            recRes.data.checkpoint,
+          );
+          expect(exactPayload.goals).toEqual([
+            {
+              id: 'goal_slice',
+              description: 'Complete all requirements of the vertical slice',
+              status: 'in_progress',
+            },
+          ]);
+          expect(exactPayload.rules).toEqual([]);
+          expect(exactPayload.evidence).toEqual([]);
+          expect(exactPayload.exceptions).toEqual([]);
+
+          const review: OutcomeReview = {
+            summary: 'Initial kickoff contract verified exactly',
+            verdict: 'CONTINUE',
+            goals: exactPayload.goals,
+            scope: exactPayload.scope,
+            rules: exactPayload.rules,
+            evidence: exactPayload.evidence,
+            constraintCoherence: {
+              ordering: ['goals verified'],
+              coherent: true,
+            },
+            exceptions: exactPayload.exceptions,
+            handoff: {
+              ready: false,
+              summary: 'In progress',
+              verificationSteps: [],
+            },
+            lifecycle: {
+              stage: 'execution',
+              receiptAgreement: true,
+            },
+          };
+          return {
+            text: `<outcome_review>${JSON.stringify(review)}</outcome_review>`,
+            empty: false,
+            terminal: true,
+          };
+        },
+        consumeManagerTask: () => true,
+      });
+
+      const begun = controller.begin(root, testContract());
+      expect(begun.success).toBe(true);
+      if (!begun.success) return;
+
+      controller.validateAndMarkDispatching(
+        root,
+        'call_golden_empty',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(
+        root,
+        'call_golden_empty',
+        'mgr_golden_empty',
+        1,
+      );
+
+      const reconcileRes = await controller.reconcileReview(root, {
+        checkpointId: begun.data.checkpoint.checkpointId,
+        managerTaskId: 'mgr_golden_empty',
+        managerGeneration: 1,
+      });
+      expect(reconcileRes.success).toBe(true);
+      expect(reconcileRes.data.verdict).toBe('CONTINUE');
+      expect(controller.getStatus(root).kickoffGate?.state).toBe(
+        'authenticated',
+      );
+    });
+
+    test('emits exact JSON packet for populated rules/evidence/exceptions and authenticates generated review', async () => {
+      const root = 'ses_golden_populated';
+      const candidate = hash('candidate_golden_populated');
+
+      // Initialize with a contract that has rules, waiver, and exception
+      const initialStore = new OutcomeStore({ storeDirectory: tempDir });
+      initialStore.init(root, {
+        contract: testContract(),
+      });
+      // Register repository waiver
+      const c1 = new OutcomeController({ storeDirectory: tempDir });
+      const regWaiver = c1.registerRepositoryWaiver(root, {
+        repositoryReference: 'waiver_golden_ref',
+      });
+      expect(regWaiver.success).toBe(true);
+      if (!regWaiver.success) return;
+
+      // Submit evidence for machine-enforced rule
+      const ev1 = c1.submitEvidence(root, {
+        description: 'Biome linter check passes cleanly',
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: candidate,
+      });
+      expect(ev1.success).toBe(true);
+      if (!ev1.success) return;
+
+      // Revise contract to add machine-enforced rule (with evidence) and waived rule with exception
+      const populatedContract = testContract({
+        rules: [
+          {
+            id: 'rule_lint',
+            sourcePath: 'biome.json',
+            category: 'style',
+            summary: 'Biome linter must pass',
+            ruleType: 'machine_enforced',
+            enforcementStatus: 'satisfied',
+            evidenceAttestationIds: [ev1.data.attestationId],
+          },
+          {
+            id: 'rule_waived',
+            sourcePath: 'docs/arch.md',
+            category: 'documentation',
+            summary: 'Detailed architecture documentation required',
+            ruleType: 'semantic',
+            enforcementStatus: 'waived',
+            evidenceAttestationIds: [],
+          },
+        ],
+        exceptions: [
+          {
+            ruleId: 'rule_waived',
+            justification: 'Waiver granted for initial vertical slice',
+            scope: 'vertical-slice-only',
+            authorizationId: regWaiver.data.authorizationId,
+          },
+        ],
+      });
+
+      const reviseRes = c1.reviseContract(root, {
+        contract: populatedContract,
+      });
+      expect(reviseRes.success).toBe(true);
+
+      let reviewPayloadToReturn: OutcomeReview | undefined;
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_golden_pop',
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: `<outcome_review>${JSON.stringify(reviewPayloadToReturn)}</outcome_review>`,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+
+      // 1. Open kickoff checkpoint with included evidence
+      const kickoffChk = controller.checkpoint(root, {
+        kind: 'kickoff',
+        reason: 'Kickoff with initial evidence and waiver',
+        evidenceAttestationIds: [ev1.data.attestationId],
+      });
+      expect(kickoffChk.success).toBe(true);
+      if (!kickoffChk.success) return;
+
+      const recordKickoff = controller.readRecord(root);
+      expect(recordKickoff.success).toBe(true);
+      if (!recordKickoff.success || !recordKickoff.data.checkpoint) return;
+
+      const kickoffExact = buildOutcomeReviewExactPayload(
+        recordKickoff.data,
+        recordKickoff.data.checkpoint,
+      );
+      expect(kickoffExact.rules).toHaveLength(2);
+      expect(kickoffExact.rules[0].evidenceIds).toEqual([
+        ev1.data.attestationId,
+      ]);
+      expect(kickoffExact.evidence).toHaveLength(1);
+      expect(kickoffExact.evidence[0]).toEqual({
+        id: ev1.data.attestationId,
+        command: 'Biome linter check passes cleanly',
+        status: 'passed',
+        fingerprint: candidate,
+        freshness: 'fresh',
+        isFinalCandidate: false,
+      });
+      expect(kickoffExact.exceptions).toHaveLength(1);
+      expect(kickoffExact.exceptions[0]).toEqual({
+        ruleId: 'rule_waived',
+        justification: 'Waiver granted for initial vertical slice',
+        justified: true,
+        scope: 'vertical-slice-only',
+        authorizationKind: 'repository_waiver',
+        authorizationReference: 'waiver_golden_ref',
+      });
+
+      reviewPayloadToReturn = {
+        summary: 'Kickoff verified',
+        verdict: 'CONTINUE',
+        goals: kickoffExact.goals,
+        scope: kickoffExact.scope,
+        rules: kickoffExact.rules,
+        evidence: kickoffExact.evidence,
+        constraintCoherence: {
+          ordering: ['rules check'],
+          coherent: true,
+        },
+        exceptions: kickoffExact.exceptions,
+        handoff: {
+          ready: false,
+          summary: 'Kickoff done',
+          verificationSteps: [],
+        },
+        lifecycle: {
+          stage: 'execution',
+          receiptAgreement: true,
+        },
+      };
+
+      controller.validateAndMarkDispatching(
+        root,
+        'call_k_pop',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(root, 'call_k_pop', 'mgr_golden_pop', 1);
+      const kRec = await controller.reconcileReview(root, {
+        checkpointId: kickoffChk.data.checkpointId,
+        managerTaskId: 'mgr_golden_pop',
+        managerGeneration: 1,
+      });
+      expect(kRec.success).toBe(true);
+
+      // 2. Satisfy goal status
+      expect(
+        controller.updateGoalStatus(root, {
+          goalId: 'goal_slice',
+          status: 'satisfied',
+        }).success,
+      ).toBe(true);
+
+      // 3. Open final checkpoint with evidence
+      const finalChk = controller.checkpoint(root, {
+        kind: 'final',
+        reason: 'Final review with evidence and waiver',
+        candidateFingerprint: candidate,
+        evidenceAttestationIds: [ev1.data.attestationId],
+      });
+      expect(finalChk.success).toBe(true);
+      if (!finalChk.success) return;
+
+      const recordFinal = controller.readRecord(root);
+      expect(recordFinal.success).toBe(true);
+      if (!recordFinal.success || !recordFinal.data.checkpoint) return;
+      const finalRecord = recordFinal.data;
+      const finalClaim = finalRecord.checkpoint;
+      const packet = buildOutcomeReviewPacket(finalRecord, finalClaim);
+      expect(packet).toContain(
+        '## Exact Controller-Authenticated Review Values',
+      );
+
+      const finalExact = buildOutcomeReviewExactPayload(
+        finalRecord,
+        finalClaim,
+      );
+      expect(finalExact.candidateFingerprint).toBe(candidate);
+      expect(finalExact.goals[0].status).toBe('satisfied');
+      expect(finalExact.evidence).toHaveLength(1);
+      expect(finalExact.evidence[0]).toEqual({
+        id: ev1.data.attestationId,
+        command: 'Biome linter check passes cleanly',
+        status: 'passed',
+        fingerprint: candidate,
+        freshness: 'fresh',
+        isFinalCandidate: true,
+      });
+      expect(finalExact.rules[0].evidenceIds).toEqual([ev1.data.attestationId]);
+
+      // Return exact ACCEPT review generated solely from exact payload
+      reviewPayloadToReturn = {
+        summary: 'Final review verified and accepted',
+        verdict: 'ACCEPT',
+        ...(finalExact.candidateFingerprint
+          ? { candidateFingerprint: finalExact.candidateFingerprint }
+          : {}),
+        goals: finalExact.goals,
+        scope: finalExact.scope,
+        rules: finalExact.rules,
+        evidence: finalExact.evidence,
+        constraintCoherence: {
+          ordering: ['verified'],
+          coherent: true,
+        },
+        exceptions: finalExact.exceptions,
+        handoff: {
+          ready: true,
+          summary: 'All checks verified',
+          verificationSteps: ['bun test', 'bun run typecheck'],
+        },
+        lifecycle: {
+          stage: 'completed',
+          receiptAgreement: true,
+        },
+      };
+
+      controller.validateAndMarkDispatching(
+        root,
+        'call_f_pop',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(root, 'call_f_pop', 'mgr_golden_pop', 1);
+      const finalRec = await controller.reconcileReview(root, {
+        checkpointId: finalChk.data.checkpointId,
+        managerTaskId: 'mgr_golden_pop',
+        managerGeneration: 1,
+      });
+      expect(finalRec.success).toBe(true);
+      expect(finalRec.data.verdict).toBe('ACCEPT');
+
+      const fin = controller.finalize(root, { summary: 'Completed' });
+      expect(fin.success).toBe(true);
+    });
+
+    test('one-character mismatch in exact review fields fails authentication', async () => {
+      const root = 'ses_golden_mismatch';
+      let reviewPayloadToReturn: OutcomeReview;
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_mismatch',
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: `<outcome_review>${JSON.stringify(reviewPayloadToReturn)}</outcome_review>`,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+
+      controller.begin(root, testContract());
+      const recordMis = controller.readRecord(root);
+      expect(recordMis.success).toBe(true);
+      if (!recordMis.success || !recordMis.data.checkpoint) return;
+      const record = recordMis.data;
+      const checkpoint = record.checkpoint;
+      const exact = buildOutcomeReviewExactPayload(record, checkpoint);
+
+      // Helper to build base review
+      const makeReview = (
+        overrides: Partial<OutcomeReview>,
+      ): OutcomeReview => ({
+        summary: 'Review',
+        verdict: 'CONTINUE',
+        goals: exact.goals,
+        scope: exact.scope,
+        rules: exact.rules,
+        evidence: exact.evidence,
+        constraintCoherence: { ordering: ['1'], coherent: true },
+        exceptions: exact.exceptions,
+        handoff: { ready: false, summary: 'no', verificationSteps: [] },
+        lifecycle: { stage: 'execution', receiptAgreement: true },
+        ...overrides,
+      });
+
+      // Goal description 1-character mismatch
+      reviewPayloadToReturn = makeReview({
+        goals: [
+          {
+            ...exact.goals[0],
+            description: `${exact.goals[0].description}x`,
+          },
+        ],
+      });
+      controller.validateAndMarkDispatching(
+        root,
+        'call_mis_1',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(root, 'call_mis_1', 'mgr_mismatch', 1);
+      const res1 = await controller.reconcileReview(root, {
+        checkpointId: checkpoint.checkpointId,
+        managerTaskId: 'mgr_mismatch',
+      });
+      expect(res1.success).toBe(false);
+      expect(res1.code).toBe('review_auth_failed');
+    });
+
+    test('added discovered rule not in contract fails authentication', async () => {
+      const root = 'ses_golden_extra_rule';
+      let reviewPayloadToReturn: OutcomeReview;
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_extra_rule',
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: `<outcome_review>${JSON.stringify(reviewPayloadToReturn)}</outcome_review>`,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+
+      controller.begin(root, testContract());
+      const recordExtra = controller.readRecord(root);
+      expect(recordExtra.success).toBe(true);
+      if (!recordExtra.success || !recordExtra.data.checkpoint) return;
+      const record = recordExtra.data;
+      const checkpoint = record.checkpoint;
+      const exact = buildOutcomeReviewExactPayload(record, checkpoint);
+
+      // Review includes an uncontracted / discovered rule
+      reviewPayloadToReturn = {
+        summary: 'Review with extra discovered rule',
+        verdict: 'CONTINUE',
+        goals: exact.goals,
+        scope: exact.scope,
+        rules: [
+          {
+            id: 'discovered_rule_1',
+            sourcePath: 'unknown.ts',
+            category: 'uncontracted',
+            summary: 'Discovered undeclared rule',
+            ruleType: 'semantic',
+            enforcementStatus: 'satisfied',
+            evidenceIds: [],
+          },
+        ],
+        evidence: exact.evidence,
+        constraintCoherence: { ordering: ['1'], coherent: true },
+        exceptions: exact.exceptions,
+        handoff: { ready: false, summary: 'no', verificationSteps: [] },
+        lifecycle: { stage: 'execution', receiptAgreement: true },
+      };
+
+      controller.validateAndMarkDispatching(
+        root,
+        'call_extra_rule',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(root, 'call_extra_rule', 'mgr_extra_rule', 1);
+      const res = await controller.reconcileReview(root, {
+        checkpointId: checkpoint.checkpointId,
+        managerTaskId: 'mgr_extra_rule',
+      });
+      expect(res.success).toBe(false);
+      expect(res.code).toBe('review_auth_failed');
+      expect(res.error).toContain('Manager review rule set does not match');
+    });
+
+    test('buildOutcomeReviewExactPayload throws if exception lacks referenced authorization and packet construction fails', () => {
+      const root = 'ses_golden_missing_auth';
+      const controller = new OutcomeController({ storeDirectory: tempDir });
+      controller.begin(root, testContract());
+      const rec = controller.readRecord(root);
+      expect(rec.success).toBe(true);
+      if (!rec.success || !rec.data.checkpoint) return;
+
+      // Tamper contract exception to reference missing authorization ID
+      const tamperedRecord = structuredClone(rec.data);
+      tamperedRecord.contract.rules.push({
+        id: 'rule_waived_test',
+        sourcePath: 'waived.ts',
+        category: 'test',
+        summary: 'Waived test rule',
+        ruleType: 'semantic',
+        enforcementStatus: 'waived',
+        evidenceAttestationIds: [],
+      });
+      tamperedRecord.contract.exceptions.push({
+        ruleId: 'rule_waived_test',
+        justification: 'Waiver justification',
+        scope: 'scope_test',
+        authorizationId: 'auth_missing_123',
+      });
+
+      const checkpoint = rec.data.checkpoint;
+
+      expect(() =>
+        buildOutcomeReviewExactPayload(tamperedRecord, checkpoint),
+      ).toThrow(
+        "Exception for rule 'rule_waived_test' references missing authorization 'auth_missing_123'",
+      );
+      expect(() =>
+        buildOutcomeReviewPacket(tamperedRecord, checkpoint),
+      ).toThrow(
+        "Exception for rule 'rule_waived_test' references missing authorization 'auth_missing_123'",
+      );
+    });
+
+    test('buildOutcomeReviewExactPayload throws defensively if claim omits rule-referenced evidence or contains missing attestation', () => {
+      const root = 'ses_golden_defensive_checks';
+      const candidate = hash('cand_defensive');
+      const controller = new OutcomeController({ storeDirectory: tempDir });
+      controller.begin(root, testContract());
+      const ev = controller.submitEvidence(root, {
+        description: 'Defensive check attestation',
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: candidate,
+      });
+      expect(ev.success).toBe(true);
+      if (!ev.success) return;
+
+      const rec = controller.readRecord(root);
+      expect(rec.success).toBe(true);
+      if (!rec.success || !rec.data.checkpoint) return;
+
+      // 1. Claim omits evidence required by a rule
+      const tamperedRecord1 = structuredClone(rec.data);
+      tamperedRecord1.contract.rules.push({
+        id: 'rule_with_ev',
+        sourcePath: 'ev.ts',
+        category: 'test',
+        summary: 'Rule with evidence',
+        ruleType: 'machine_enforced',
+        enforcementStatus: 'satisfied',
+        evidenceAttestationIds: [ev.data.attestationId],
+      });
+      const claimWithoutEv = structuredClone(rec.data.checkpoint);
+      claimWithoutEv.includedEvidenceAttestationIds = [];
+
+      expect(() =>
+        buildOutcomeReviewExactPayload(tamperedRecord1, claimWithoutEv),
+      ).toThrow(
+        `Rule 'rule_with_ev' references evidence attestation '${ev.data.attestationId}' not included in checkpoint claim`,
+      );
+
+      // 2. Claim includes an attestation ID not present in receipts
+      const claimWithMissingEv = structuredClone(rec.data.checkpoint);
+      claimWithMissingEv.includedEvidenceAttestationIds = [
+        'att_nonexistent_999',
+      ];
+
+      expect(() =>
+        buildOutcomeReviewExactPayload(rec.data, claimWithMissingEv),
+      ).toThrow(
+        "Included evidence attestation 'att_nonexistent_999' not found in durable receipts",
+      );
+    });
+
+    test('checkpoint fails closed with no write when rule-referenced evidence is omitted from included evidenceAttestationIds', () => {
+      const root = 'ses_checkpoint_no_write_missing_ev';
+      const candidate = hash('cand_no_write');
+      const initialStore = new OutcomeStore({ storeDirectory: tempDir });
+      initialStore.init(root, { contract: testContract() });
+      const controller = new OutcomeController({ storeDirectory: tempDir });
+
+      const ev = controller.submitEvidence(root, {
+        description: 'Required rule evidence',
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: candidate,
+      });
+      expect(ev.success).toBe(true);
+      if (!ev.success) return;
+
+      const contractWithRule = testContract({
+        rules: [
+          {
+            id: 'rule_needs_ev',
+            sourcePath: 'check.ts',
+            category: 'test',
+            summary: 'Rule requiring evidence',
+            ruleType: 'machine_enforced',
+            enforcementStatus: 'satisfied',
+            evidenceAttestationIds: [ev.data.attestationId],
+          },
+        ],
+      });
+
+      // Revise contract to declare the rule with evidence
+      const reviseRes = controller.reviseContract(root, {
+        contract: contractWithRule,
+      });
+      expect(reviseRes.success).toBe(true);
+
+      const file = controller.store.recordPath(root);
+      const bytesBefore = fs.readFileSync(file, 'utf8');
+      const recBefore = controller.readRecord(root).data;
+
+      // Attempt to open checkpoint with evidenceAttestationIds missing the rule's evidence
+      const chkRes = controller.checkpoint(root, {
+        kind: 'final',
+        reason: 'Final checkpoint with omitted evidence',
+        candidateFingerprint: candidate,
+        evidenceAttestationIds: [],
+      });
+      expect(chkRes.success).toBe(false);
+      expect(chkRes.code).toBe('invalid_checkpoint_params');
+      expect(chkRes.error).toContain(
+        `Checkpoint must include evidence attestation '${ev.data.attestationId}' referenced by rule 'rule_needs_ev'`,
+      );
+
+      // Assert no-write: file byte-identical, revision unchanged, actionsRequired unchanged, generation unchanged
+      const bytesAfter = fs.readFileSync(file, 'utf8');
+      const recAfter = controller.readRecord(root).data;
+      expect(bytesAfter).toBe(bytesBefore);
+      expect(recAfter.revision).toBe(recBefore.revision);
+      expect(recAfter.actionsRequired.length).toBe(
+        recBefore.actionsRequired.length,
+      );
+      expect(recAfter.nextClaimGeneration).toBe(recBefore.nextClaimGeneration);
+    });
+
+    test('idempotent begin returns truthful status and omits checkpoint metadata when no persisted checkpoint exists', () => {
+      const root = 'ses_idempotent_begin_no_claim';
+      const controller = new OutcomeController({ storeDirectory: tempDir });
+      controller.begin(root, testContract());
+
+      // Tamper state: mark kickoffGate authenticated and delete active checkpoint
+      const file = controller.store.recordPath(root);
+      const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+      record.kickoffGate = {
+        policyVersion: 1,
+        state: 'authenticated',
+        contractDigest: record.contractDigest,
+        attempts: 1,
+        maxAttempts: 2,
+        authenticatedReviewId: 'rev_kickoff_auth',
+        lastCheckpointId: record.checkpoint?.checkpointId,
+      };
+      record.reviewSummaries.push({
+        reviewId: 'rev_kickoff_auth',
+        checkpointId: record.checkpoint?.checkpointId ?? 'chk_k',
+        claimGeneration: 1,
+        checkpointKind: 'kickoff',
+        contractDigest: record.contractDigest,
+        outcomeRevision: record.revision,
+        verdict: 'CONTINUE',
+        managerTaskId: 'mgr_k',
+        managerGeneration: 1,
+        resultDigest: hash('res_k'),
+        reviewDigest: hash('rev_k'),
+        summary: 'Kickoff verified',
+        evaluatedAt: 1000,
+      });
+      delete record.checkpoint; // No active checkpoint exists!
+      fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
+
+      const beginRes = controller.begin(root, testContract());
+      expect(beginRes.success).toBe(true);
+      if (!beginRes.success) return;
+      expect(beginRes.data.idempotent).toBe(true);
+      expect(beginRes.data.checkpoint).toBeUndefined(); // Truthful: no fake checkpoint metadata!
+      expect(beginRes.data.kickoffGate?.state).toBe('authenticated');
+      expect(beginRes.data.dispatchNudgePending).toBe(false);
+    });
+  });
+
+  describe('Terrarium issue #397 controller-level replays', () => {
+    test('successful #397 replay: initial invalid kickoff -> provenance-backed action resolution -> retry CONTINUE -> final ACCEPT -> single certificate', async () => {
+      const root = 'ses_replay_successful_397';
+      const candidate = hash('cand_replay_397');
+      let now = 1_000;
+      let reviewResultText = '';
+      let currentTaskId = 'mgr_task_1';
+      let currentGeneration = 1;
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        clock: () => now,
+        getManagerTaskRecord: (taskId) => ({
+          taskID: taskId,
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: currentGeneration,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: reviewResultText,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+
+      // 1. Initial kickoff opened (attempt 1, generation 1)
+      const beginRes = controller.begin(root, testContract());
+      expect(beginRes.success).toBe(true);
+      if (!beginRes.success) return;
+      expect(beginRes.data.checkpoint.claimGeneration).toBe(1);
+      expect(controller.getStatus(root).kickoffGate?.attempts).toBe(1);
+      expect(controller.getStatus(root).kickoffGate?.state).toBe('required');
+
+      // 2. Manager produces invalid review
+      reviewResultText = 'Not valid XML review';
+      controller.validateAndMarkDispatching(
+        root,
+        'call_k1',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(
+        root,
+        'call_k1',
+        currentTaskId,
+        currentGeneration,
+      );
+      const r1 = await controller.reconcileReview(root, {
+        checkpointId: beginRes.data.checkpoint.checkpointId,
+        managerTaskId: currentTaskId,
+        managerGeneration: currentGeneration,
+      });
+      expect(r1.success).toBe(false);
+      expect(r1.code).toBe('review_invalid');
+
+      // Check state: phase is action_required, kickoffGate state is required, attempts is 1
+      const statusAfterInvalid = controller.getStatus(root);
+      expect(statusAfterInvalid.phase).toBe('action_required');
+      expect(statusAfterInvalid.kickoffGate?.attempts).toBe(1);
+      expect(statusAfterInvalid.kickoffGate?.state).toBe('required');
+      expect(statusAfterInvalid.actionsRequired).toHaveLength(1);
+      const actionToResolve = statusAfterInvalid.actionsRequired[0];
+
+      // 3. User provenance is recorded
+      now += 10;
+      controller.observeUserTurn(
+        root,
+        'msg_user_retry_instruction',
+        'Please retry kickoff review following exact contract instructions',
+      );
+      const userReceipt = controller
+        .readRecord(root)
+        .data.receipts.userMessages.at(-1);
+      expect(userReceipt?.provenance).toBe('external_user');
+
+      // 4. Resolve action with external user provenance
+      now += 5;
+      const resolveRes = controller.resolveAction(root, {
+        actionId: actionToResolve.id,
+        reason: 'User provided retry direction',
+        sourceUserMessageReceiptId: userReceipt?.id,
+      });
+      expect(resolveRes.success).toBe(true);
+
+      // 5. Open exactly one retry kickoff checkpoint (attempt 2, generation 2)
+      const retryKickoff = controller.checkpoint(root, {
+        kind: 'kickoff',
+        reason: 'Retry kickoff review with exact packet',
+      });
+      expect(retryKickoff.success).toBe(true);
+      if (!retryKickoff.success) return;
+      expect(retryKickoff.data.claimGeneration).toBe(2);
+
+      // 6. Manager produces exact valid review with CONTINUE
+      currentTaskId = 'mgr_task_2';
+      currentGeneration = 2;
+      reviewResultText = `<outcome_review>${JSON.stringify(
+        validReviewFor(controller, root, 'CONTINUE'),
+      )}</outcome_review>`;
+
+      controller.validateAndMarkDispatching(
+        root,
+        'call_k2',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(
+        root,
+        'call_k2',
+        currentTaskId,
+        currentGeneration,
+      );
+      const r2 = await controller.reconcileReview(root, {
+        checkpointId: retryKickoff.data.checkpointId,
+        managerTaskId: currentTaskId,
+        managerGeneration: currentGeneration,
+      });
+      expect(r2.success).toBe(true);
+      expect(r2.data.verdict).toBe('CONTINUE');
+
+      const statusAfterKickoff = controller.getStatus(root);
+      expect(statusAfterKickoff.kickoffGate?.state).toBe('authenticated');
+      expect(statusAfterKickoff.kickoffGate?.attempts).toBe(2);
+
+      // 7. Update goal status & submit final evidence
+      expect(
+        controller.updateGoalStatus(root, {
+          goalId: 'goal_slice',
+          status: 'satisfied',
+        }).success,
+      ).toBe(true);
+
+      const evSubmit = controller.submitEvidence(root, {
+        description: 'All tests passed cleanly',
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: candidate,
+      });
+      expect(evSubmit.success).toBe(true);
+      if (!evSubmit.success) return;
+
+      // 8. Open final checkpoint
+      const finalChk = controller.checkpoint(root, {
+        kind: 'final',
+        reason: 'Final review',
+        candidateFingerprint: candidate,
+        evidenceAttestationIds: [evSubmit.data.attestationId],
+      });
+      expect(finalChk.success).toBe(true);
+      if (!finalChk.success) return;
+      expect(finalChk.data.claimGeneration).toBe(3);
+
+      // 9. Manager ACCEPT review
+      currentTaskId = 'mgr_task_3';
+      currentGeneration = 3;
+      reviewResultText = `<outcome_review>${JSON.stringify(
+        validReviewFor(controller, root, 'ACCEPT', {
+          candidateFingerprint: candidate,
+        }),
+      )}</outcome_review>`;
+
+      controller.validateAndMarkDispatching(
+        root,
+        'call_f',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(
+        root,
+        'call_f',
+        currentTaskId,
+        currentGeneration,
+      );
+      const r3 = await controller.reconcileReview(root, {
+        checkpointId: finalChk.data.checkpointId,
+        managerTaskId: currentTaskId,
+        managerGeneration: currentGeneration,
+      });
+      expect(r3.success).toBe(true);
+      expect(r3.data.verdict).toBe('ACCEPT');
+
+      // 10. Finalize -> exactly one certificate
+      const finRes = controller.finalize(root, {
+        summary: 'Outcome completed successfully after kickoff retry',
+      });
+      expect(finRes.success).toBe(true);
+      if (!finRes.success) return;
+      expect(finRes.data.certificate).toBeDefined();
+
+      const finalRecord = controller.readRecord(root).data;
+      expect(finalRecord.phase).toBe('accepted');
+      expect(finalRecord.finalCertificate).toBeDefined();
+      expect(finalRecord.reviewSummaries).toHaveLength(2); // 1 kickoff + 1 final
+      expect(finalRecord.nextClaimGeneration).toBe(4); // Bounded generations (1, 2, 3)
+    });
+
+    test('legacy blocked #397 replay: sanitized migrated record cannot open retrospective kickoff/finalize, and repeated calls do not grow revision/actions', () => {
+      const root = 'root_terrarium_397_replay';
+      const c = testContract();
+      const cDigest = computeOutcomeContractDigest(c);
+      const candidate = hash('cand_397');
+
+      // Build sanitized V1 fixture matching Terrarium issue #397 anatomy:
+      const actionsRequired = Array.from({ length: 16 }, (_, i) => ({
+        id: `act_397_${i + 1}`,
+        code: 'manual_intervention' as const,
+        referenceId: `ref_397_${i + 1}`,
+        reason: `Historical invalid review action ${i + 1}`,
+        createdAt: 100 + i,
+        createdRevision: (i + 1) * 2,
+        resolvedAt: 100 + i + 1,
+        resolutionKind: 'orchestrator_provenance' as const,
+        resolutionReason: `Resolved ${i + 1}`,
+        resolutionUserMessageReceiptId: `usr_397_${i + 1}`,
+      }));
+
+      const userMessages = Array.from({ length: 16 }, (_, i) => ({
+        id: `usr_397_${i + 1}`,
+        messageId: `msg_397_${i + 1}`,
+        contentDigest: hash(`content_${i + 1}`),
+        observedEpoch: 'epoch_397_old',
+        observedAt: 100 + i,
+        createdRevision: (i + 1) * 2 + 1,
+      }));
+
+      const operations = Array.from({ length: 3 }, (_, i) => ({
+        id: `op_running_${i + 1}`,
+        callId: `call_run_${i + 1}`,
+        toolName: 'bash',
+        argumentDigest: hash(`run_args_${i + 1}`),
+        serverEpoch: 'epoch_397',
+        status: 'running' as const,
+        startedAt: 500 + i,
+        updatedAt: 500 + i,
+      }));
+
+      const v1Fixture = {
+        schema: 'omos_outcome_record',
+        schemaVersion: 1,
+        outcomeId: 'out_terrarium_397',
+        rootSessionId: root,
+        serverEpoch: 'epoch_397',
+        revision: 100,
+        nextClaimGeneration: 19,
+        contractDigest: cDigest,
+        createdAt: 1_000,
+        updatedAt: 2_000,
+        phase: 'reviewing',
+        contract: c,
+        receipts: {
+          evidence: [],
+          userMessages,
+          decisions: [],
+          authorizations: [],
+        },
+        reviewSummaries: [
+          {
+            reviewId: 'rev_final_397',
+            checkpointId: 'chk_final_397',
+            claimGeneration: 17,
+            checkpointKind: 'final',
+            contractDigest: cDigest,
+            outcomeRevision: 90,
+            verdict: 'ACCEPT',
+            managerTaskId: 'mgr_task_final',
+            managerGeneration: 1,
+            resultDigest: hash('res_final_397'),
+            reviewDigest: hash('rev_final_397'),
+            candidateFingerprint: candidate,
+            summary: 'Final deliverable accepted without prior kickoff',
+            evaluatedAt: 2_000,
+          },
+        ],
+        checkpoint: {
+          outcomeId: 'out_terrarium_397',
+          rootSessionId: root,
+          checkpointId: 'chk_kickoff_retrospective_18',
+          kind: 'kickoff' as const,
+          reason: 'Retrospective kickoff generation 18',
+          claimGeneration: 18,
+          claimTokenDigest: hash('token_18'),
+          contractDigest: cDigest,
+          outcomeRevision: 95,
+          serverEpoch: 'epoch_397',
+          claimedAt: 1_900,
+          expiresAt: 2_500,
+          includedDecisionIds: [],
+          includedExceptionRuleIds: [],
+          includedEvidenceAttestationIds: [],
+          state: 'running' as const,
+          dispatchCallId: 'call_retro_18',
+          managerTaskId: 'mgr_task_retro_18',
+          managerGeneration: 1,
+          checkpointFingerprint: computeOutcomeCheckpointFingerprint({
+            outcomeId: 'out_terrarium_397',
+            rootSessionId: root,
+            checkpointId: 'chk_kickoff_retrospective_18',
+            kind: 'kickoff',
+            reason: 'Retrospective kickoff generation 18',
+            claimGeneration: 18,
+            claimTokenDigest: hash('token_18'),
+            contractDigest: cDigest,
+            outcomeRevision: 95,
+            serverEpoch: 'epoch_397',
+            claimedAt: 1_900,
+            expiresAt: 2_500,
+            includedDecisionIds: [],
+            includedExceptionRuleIds: [],
+            includedEvidenceAttestationIds: [],
+          }),
+        },
+        operations,
+        actionsRequired,
+      };
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: 'epoch_397',
+      });
+      const file = controller.store.recordPath(root);
+      fs.writeFileSync(file, `${JSON.stringify(v1Fixture, null, 2)}\n`);
+
+      // 1. Status projection reflects legacy_late_missing
+      const status = controller.getStatus(root);
+      expect(status.isManaged).toBe(true);
+      expect(status.phase).toBe('failed');
+      expect(status.kickoffGate).toEqual({
+        state: 'legacy_late_missing',
+        attempts: 0,
+        maxAttempts: 2,
+        failureReason:
+          'Historical record has review activity without an authenticated kickoff review',
+      });
+
+      // 2. Pending nudge gives recovery message for legacy record
+      const nudge = controller.getPendingNudge(root);
+      expect(nudge?.kind).toBe('recovery');
+      expect(nudge?.message).toContain('Retrospective kickoff forbidden');
+
+      // 3. Begin, checkpoint, and finalize are rejected
+      const beginRes = controller.begin(root, c);
+      expect(beginRes.success).toBe(false);
+      expect(beginRes.code).toBe('retrospective_kickoff_forbidden');
+
+      const chkRes = controller.checkpoint(root, {
+        kind: 'kickoff',
+        reason: 'Try retrospective kickoff 19',
+      });
+      expect(chkRes.success).toBe(false);
+      expect(chkRes.code).toBe('retrospective_kickoff_forbidden');
+
+      const finalChkRes = controller.checkpoint(root, {
+        kind: 'final',
+        reason: 'Try final checkpoint',
+        candidateFingerprint: candidate,
+      });
+      expect(finalChkRes.success).toBe(false);
+      expect(finalChkRes.code).toBe('retrospective_kickoff_forbidden');
+
+      const finRes = controller.finalize(root, { summary: 'Try finalize' });
+      expect(finRes.success).toBe(false);
+
+      // 4. Repeated calls do not mutate file or grow revision / actions
+      const bytesBefore = fs.readFileSync(file, 'utf8');
+      const recBefore = controller.readRecord(root).data;
+
+      for (let i = 0; i < 5; i++) {
+        controller.getStatus(root);
+        controller.getPendingNudge(root);
+        controller.begin(root, c);
+        controller.checkpoint(root, {
+          kind: 'kickoff',
+          reason: 'Retry kickoff',
+        });
+        controller.finalize(root, { summary: 'Retry finalize' });
+      }
+
+      const bytesAfter = fs.readFileSync(file, 'utf8');
+      const recAfter = controller.readRecord(root).data;
+
+      expect(bytesAfter).toBe(bytesBefore);
+      expect(recAfter.revision).toBe(recBefore.revision);
+      expect(recAfter.actionsRequired.length).toBe(
+        recBefore.actionsRequired.length,
+      );
+    });
+
+    test('two kickoff failures -> third request stable no-write error', async () => {
+      const root = 'ses_replay_two_failures';
+      let now = 1_000;
+      const reviewResultText = 'invalid';
+      let currentTaskId = 'mgr_task_1';
+      let currentGeneration = 1;
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        clock: () => now,
+        getManagerTaskRecord: (taskId) => ({
+          taskID: taskId,
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: currentGeneration,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: reviewResultText,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+
+      // Attempt 1: begin outcome
+      const beginRes = controller.begin(root, testContract());
+      expect(beginRes.success).toBe(true);
+      if (!beginRes.success) return;
+
+      // Fail attempt 1
+      controller.validateAndMarkDispatching(
+        root,
+        'call_k1',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(
+        root,
+        'call_k1',
+        currentTaskId,
+        currentGeneration,
+      );
+      const r1 = await controller.reconcileReview(root, {
+        checkpointId: beginRes.data.checkpoint.checkpointId,
+        managerTaskId: currentTaskId,
+        managerGeneration: currentGeneration,
+      });
+      expect(r1.success).toBe(false);
+
+      const status1 = controller.getStatus(root);
+      expect(status1.kickoffGate?.attempts).toBe(1);
+      expect(status1.kickoffGate?.state).toBe('required');
+      const action1 = status1.actionsRequired[0];
+
+      // Resolve action with user provenance
+      now += 10;
+      controller.observeUserTurn(root, 'msg_u1', 'Retry please');
+      const recUser = controller.readRecord(root);
+      expect(recUser.success).toBe(true);
+      if (!recUser.success) return;
+      const u1 = recUser.data.receipts.userMessages.at(-1);
+      expect(u1).toBeDefined();
+      if (!u1) return;
+      expect(
+        controller.resolveAction(root, {
+          actionId: action1.id,
+          reason: 'User instruction',
+          sourceUserMessageReceiptId: u1.id,
+        }).success,
+      ).toBe(true);
+
+      // Attempt 2: open kickoff checkpoint
+      const k2 = controller.checkpoint(root, {
+        kind: 'kickoff',
+        reason: 'Kickoff attempt 2',
+      });
+      expect(k2.success).toBe(true);
+      if (!k2.success) return;
+      expect(k2.data.claimGeneration).toBe(2);
+
+      // Fail attempt 2
+      currentTaskId = 'mgr_task_2';
+      currentGeneration = 2;
+      controller.validateAndMarkDispatching(
+        root,
+        'call_k2',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(
+        root,
+        'call_k2',
+        currentTaskId,
+        currentGeneration,
+      );
+      const r2 = await controller.reconcileReview(root, {
+        checkpointId: k2.data.checkpointId,
+        managerTaskId: currentTaskId,
+        managerGeneration: currentGeneration,
+      });
+      expect(r2.success).toBe(false);
+
+      // Gate should now be exhausted and phase failed
+      const status2 = controller.getStatus(root);
+      expect(status2.kickoffGate?.state).toBe('exhausted');
+      expect(status2.kickoffGate?.attempts).toBe(2);
+      expect(status2.phase).toBe('failed');
+
+      // Nudge returns recovery message
+      const nudge = controller.getPendingNudge(root);
+      expect(nudge?.kind).toBe('recovery');
+      expect(nudge?.message).toContain('Kickoff attempts exhausted (2/2)');
+
+      // Record file snapshot before third request
+      const file = controller.store.recordPath(root);
+      const bytesBefore = fs.readFileSync(file, 'utf8');
+      const recBefore = controller.readRecord(root).data;
+
+      // Third request via checkpoint -> stable no-write error
+      const thirdChk = controller.checkpoint(root, {
+        kind: 'kickoff',
+        reason: 'Kickoff attempt 3',
+      });
+      expect(thirdChk.success).toBe(false);
+      expect(thirdChk.code).toBe('kickoff_retry_exhausted');
+
+      // Third request via begin -> stable no-write error
+      const thirdBegin = controller.begin(root, testContract());
+      expect(thirdBegin.success).toBe(false);
+      expect(thirdBegin.code).toBe('kickoff_retry_exhausted');
+
+      // Verify no-write
+      const bytesAfter = fs.readFileSync(file, 'utf8');
+      const recAfter = controller.readRecord(root).data;
+      expect(bytesAfter).toBe(bytesBefore);
+      expect(recAfter.revision).toBe(recBefore.revision);
+    });
+  });
+
+  describe('observeToolAfter CAS retry and idempotent completion', () => {
+    test('retries on CAS conflict and completes tool call', () => {
+      const root = 'ses_tool_cas_retry';
+      const controller = new OutcomeController({ storeDirectory: tempDir });
+      controller.begin(root, testContract());
+
+      const startRes = controller.observeToolBefore(
+        root,
+        'call_cas_1',
+        'bash',
+        {
+          cmd: 'ls',
+        },
+      );
+      expect(startRes.success).toBe(true);
+
+      // Advance revision concurrently by observing a user turn
+      let conflictInjected = true;
+      const originalRead = controller.readRecord.bind(controller);
+      controller.readRecord = (rootSessionId: string) => {
+        const res = originalRead(rootSessionId);
+        if (res.success && conflictInjected) {
+          conflictInjected = false;
+          controller.observeUserTurn(root, 'msg_concurrent', 'Concurrent turn');
+        }
+        return res;
+      };
+
+      const afterRes = controller.observeToolAfter(root, 'call_cas_1', 'bash', {
+        stdout: 'file1.txt',
+      });
+      expect(afterRes.success).toBe(true);
+
+      const rec = originalRead(root).data;
+      const op = rec.operations.find((o) => o.id === 'op_call_cas_1');
+      expect(op?.status).toBe('completed');
+    });
+
+    test('matching-digest completion is treated as success without creating new revision', () => {
+      const root = 'ses_tool_noop_completion';
+      const controller = new OutcomeController({ storeDirectory: tempDir });
+      controller.begin(root, testContract());
+
+      controller.observeToolBefore(root, 'call_noop_1', 'bash', {
+        cmd: 'pwd',
+      });
+      const first = controller.observeToolAfter(root, 'call_noop_1', 'bash', {
+        stdout: '/app',
+      });
+      expect(first.success).toBe(true);
+
+      const rec1 = controller.readRecord(root).data;
+      const rev1 = rec1.revision;
+
+      // Second identical complete call
+      const second = controller.observeToolAfter(root, 'call_noop_1', 'bash', {
+        stdout: '/app',
+      });
+      expect(second.success).toBe(true);
+
+      const rec2 = controller.readRecord(root).data;
+      expect(rec2.revision).toBe(rev1); // No revision bump
+    });
+
+    test('differing digest completion fails', () => {
+      const root = 'ses_tool_diff_digest';
+      const controller = new OutcomeController({ storeDirectory: tempDir });
+      controller.begin(root, testContract());
+
+      controller.observeToolBefore(root, 'call_diff_1', 'bash', {
+        cmd: 'pwd',
+      });
+      const first = controller.observeToolAfter(root, 'call_diff_1', 'bash', {
+        stdout: '/app',
+      });
+      expect(first.success).toBe(true);
+
+      // Differing output
+      const second = controller.observeToolAfter(root, 'call_diff_1', 'bash', {
+        stdout: '/other/path',
+      });
+      expect(second.success).toBe(false);
+      expect(second.code).toBe('invalid_transition');
+    });
+  });
+
+  describe('Review preflight validation and idempotent retry', () => {
+    test('non-final ACCEPT is classified as invalid during preflight and persisted as invalid review', async () => {
+      const root = 'ses_preflight_non_final_accept';
+      const cand = hash('candidate_preflight');
+      const prematureAcceptReview: OutcomeReview = {
+        summary: 'Premature accept review',
+        verdict: 'ACCEPT',
+        candidateFingerprint: cand,
+        goals: [
+          {
+            id: 'goal_slice',
+            description: 'Complete all requirements of the vertical slice',
+            status: 'satisfied',
+          },
+        ],
+        scope: {
+          inScope: ['src/outcome', 'src/tools', 'src/hooks'],
+          outOfScope: ['Full autonomous agent rewrite'],
+        },
+        rules: [],
+        evidence: [
+          {
+            id: 'att_preflight',
+            command: 'bun test',
+            status: 'passed',
+            fingerprint: cand,
+            freshness: 'fresh',
+            isFinalCandidate: true,
+          },
+        ],
+        constraintCoherence: {
+          ordering: ['1'],
+          coherent: true,
+        },
+        exceptions: [],
+        handoff: {
+          ready: true,
+          summary: 'Ready',
+          verificationSteps: ['bun test'],
+        },
+        lifecycle: {
+          stage: 'completed',
+          receiptAgreement: true,
+        },
+      };
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_non_final_accept',
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: `<outcome_review>${JSON.stringify(prematureAcceptReview)}</outcome_review>`,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+
+      const begun = controller.begin(root, testContract());
+      expect(begun.success).toBe(true);
+      if (!begun.success) return;
+
+      controller.validateAndMarkDispatching(
+        root,
+        'call_accept_kickoff',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(
+        root,
+        'call_accept_kickoff',
+        'mgr_non_final_accept',
+        1,
+      );
+
+      const res = await controller.reconcileReview(root, {
+        checkpointId: begun.data.checkpoint.checkpointId,
+        managerTaskId: 'mgr_non_final_accept',
+        managerGeneration: 1,
+      });
+      expect(res.success).toBe(false);
+      expect(res.code).toBe('review_auth_failed');
+      expect(res.error).toContain(
+        'ACCEPT verdict is valid only for final checkpoint',
+      );
+
+      const record = controller.readRecord(root).data;
+      expect(record.checkpoint?.state).toBe('review_invalid');
+      expect(record.reviewSummaries).toHaveLength(0);
+
+      // Retry is idempotent and returns review_invalid
+      const retryRes = await controller.reconcileReview(root, {
+        checkpointId: begun.data.checkpoint.checkpointId,
+        managerTaskId: 'mgr_non_final_accept',
+        managerGeneration: 1,
+      });
+      expect(retryRes.success).toBe(false);
+      expect(retryRes.code).toBe('review_invalid');
+    });
+
+    test('unreconcilable kickoff checkpoint is classified as invalid during preflight', async () => {
+      const root = 'ses_unreconcilable_kickoff';
+      let controller: OutcomeController;
+      controller = new OutcomeController({
+        storeDirectory: tempDir,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_unreconcilable',
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: `<outcome_review>${JSON.stringify(
+            validReviewFor(controller, root, 'CONTINUE'),
+          )}</outcome_review>`,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+
+      const begun = controller.begin(root, testContract());
+      expect(begun.success).toBe(true);
+      if (!begun.success) return;
+
+      controller.validateAndMarkDispatching(
+        root,
+        'call_unrec',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(root, 'call_unrec', 'mgr_unreconcilable', 1);
+
+      // Modify kickoff gate attempts to 0 while keeping checkpoint valid
+      const file = controller.store.recordPath(root);
+      const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+      record.kickoffGate.attempts = 0;
+      delete record.kickoffGate.lastCheckpointId;
+      delete record.checkpoint; // delete active checkpoint to simulate gate reset
+      fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
+
+      const res = await controller.reconcileReview(root, {
+        checkpointId: begun.data.checkpoint.checkpointId,
+        managerTaskId: 'mgr_unreconcilable',
+        managerGeneration: 1,
+      });
+      expect(res.success).toBe(false);
+      expect(res.code).toBe('missing_checkpoint');
+    });
+  });
+
+  describe('Gate 3 remediation: atomic external user turns and late authoritative tool repair', () => {
+    test('observeExternalUserTurn / observeUserTurn returns OutcomeControllerResult, is idempotent on duplicate, fails on conflict, and retries bounded CAS', () => {
+      const root = 'ses_user_turn_lifecycle';
+      const controller = new OutcomeController({ storeDirectory: tempDir });
+      controller.begin(root, testContract());
+
+      // 1. First observation succeeds with written status
+      const res1 = controller.observeExternalUserTurn(
+        root,
+        'msg_u_1',
+        'Hello world',
+      );
+      expect(res1.success).toBe(true);
+      if (!res1.success) return;
+      expect(res1.data.status).toBe('written');
+      expect(res1.data.noop).toBe(false);
+      expect(res1.data.receipt.messageId).toBe('msg_u_1');
+      expect(res1.data.receipt.provenance).toBe('external_user');
+
+      const rec1 = controller.readRecord(root).data;
+      const file = controller.store.recordPath(root);
+      const bytes1 = fs.readFileSync(file, 'utf8');
+
+      // 2. Exact duplicate returns noop with identical revision and bytes
+      const res2 = controller.observeExternalUserTurn(
+        root,
+        'msg_u_1',
+        'Hello world',
+      );
+      expect(res2.success).toBe(true);
+      if (!res2.success) return;
+      expect(res2.data.status).toBe('noop');
+      expect(res2.data.noop).toBe(true);
+      expect(res2.data.receipt.id).toBe(res1.data.receipt.id);
+
+      const rec2 = controller.readRecord(root).data;
+      expect(rec2.revision).toBe(rec1.revision);
+      expect(fs.readFileSync(file, 'utf8')).toBe(bytes1);
+
+      // 3. observeUserTurn compatibility alias works identically
+      const res3 = controller.observeUserTurn(root, 'msg_u_1', 'Hello world');
+      expect(res3.success).toBe(true);
+      if (!res3.success) return;
+      expect(res3.data.status).toBe('noop');
+      expect(res3.data.noop).toBe(true);
+      expect(fs.readFileSync(file, 'utf8')).toBe(bytes1);
+
+      // 4. Conflicting content on same messageId fails closed with stable error and unchanged bytes
+      const conflictRes = controller.observeExternalUserTurn(
+        root,
+        'msg_u_1',
+        'Different text',
+      );
+      expect(conflictRes.success).toBe(false);
+      expect(conflictRes.code).toBe('invalid_transition');
+      expect(conflictRes.error).toContain(
+        'already recorded with different content',
+      );
+      expect(fs.readFileSync(file, 'utf8')).toBe(bytes1);
+
+      const paddedDuplicate = controller.observeExternalUserTurn(
+        root,
+        '  msg_u_1  ',
+        'Hello world',
+      );
+      expect(paddedDuplicate.success).toBe(true);
+      if (paddedDuplicate.success) {
+        expect(paddedDuplicate.data.noop).toBe(true);
+        expect(paddedDuplicate.data.receipt.messageId).toBe('msg_u_1');
+      }
+      expect(fs.readFileSync(file, 'utf8')).toBe(bytes1);
+
+      const paddedConflict = controller.observeExternalUserTurn(
+        root,
+        '\tmsg_u_1\n',
+        'Different padded text',
+      );
+      expect(paddedConflict.success).toBe(false);
+      expect(paddedConflict.code).toBe('invalid_transition');
+      expect(fs.readFileSync(file, 'utf8')).toBe(bytes1);
+
+      // 5. Empty or whitespace messageId fails with invalid_parameter
+      const emptyRes = controller.observeExternalUserTurn(
+        root,
+        '   ',
+        'Some text',
+      );
+      expect(emptyRes.success).toBe(false);
+      expect(emptyRes.code).toBe('invalid_parameter');
+
+      // 6. Unmanaged session returns missing failure
+      const unmanagedRes = controller.observeExternalUserTurn(
+        'ses_unmanaged',
+        'msg_x',
+        'Text',
+      );
+      expect(unmanagedRes.success).toBe(false);
+      expect(unmanagedRes.code).toBe('missing');
+
+      // 7. CAS conflict retry in observeExternalUserTurn
+      let conflictCount = 2;
+      const originalRead = controller.readRecord.bind(controller);
+      controller.readRecord = (rootSessionId: string) => {
+        const res = originalRead(rootSessionId);
+        if (res.success && conflictCount > 0) {
+          conflictCount--;
+          controller.updateGoalStatus(root, {
+            goalId: 'goal_slice',
+            status: 'in_progress',
+          });
+        }
+        return res;
+      };
+
+      const casRes = controller.observeExternalUserTurn(
+        root,
+        'msg_cas_user',
+        'Retry with CAS',
+      );
+      expect(casRes.success).toBe(true);
+      if (casRes.success) {
+        expect(casRes.data.status).toBe('written');
+        expect(casRes.data.receipt.messageId).toBe('msg_cas_user');
+      }
+    });
+
+    test('before -> reconcileIdleOperations -> authoritative after -> completed with cleared recovery nudge', async () => {
+      const root = 'ses_idle_repair_controller';
+      let controller: OutcomeController;
+      controller = new OutcomeController({
+        storeDirectory: tempDir,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_task_idle_repair',
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: `<outcome_review>${JSON.stringify(
+            validReviewFor(controller, root, 'CONTINUE'),
+          )}</outcome_review>`,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+
+      const beginRes = controller.begin(root, testContract());
+      expect(beginRes.success).toBe(true);
+      if (!beginRes.success) return;
+
+      // Complete kickoff review with CONTINUE to authenticate kickoff gate
+      controller.validateAndMarkDispatching(
+        root,
+        'call_kickoff_dispatch',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(
+        root,
+        'call_kickoff_dispatch',
+        'mgr_task_idle_repair',
+        1,
+      );
+      const kickoffReconcile = await controller.reconcileReview(root, {
+        checkpointId: beginRes.data.checkpoint.checkpointId,
+        managerTaskId: 'mgr_task_idle_repair',
+        managerGeneration: 1,
+      });
+      expect(kickoffReconcile.success).toBe(true);
+      expect(controller.getPendingNudge(root)).toBeUndefined();
+
+      // 1. Tool before
+      const startRes = controller.observeToolBefore(
+        root,
+        'call_idle_target',
+        'bash',
+        {
+          cmd: 'npm test',
+        },
+      );
+      expect(startRes.success).toBe(true);
+
+      // Verify operation running
+      let rec = controller.readRecord(root).data;
+      let op = rec.operations.find((o) => o.id === 'op_call_idle_target');
+      expect(op?.status).toBe('running');
+
+      // 2. Idle reconciliation marks running op as interrupted
+      const idleRes = controller.store.reconcileIdleOperations(root);
+      expect(idleRes.success).toBe(true);
+
+      rec = controller.readRecord(root).data;
+      op = rec.operations.find((o) => o.id === 'op_call_idle_target');
+      expect(op?.status).toBe('interrupted');
+      expect(op?.error).toBe(
+        'Session became idle without a durable tool after-hook',
+      );
+
+      // Nudge returns recovery guidance for interrupted operation
+      const nudgeBefore = controller.getPendingNudge(root);
+      expect(nudgeBefore?.kind).toBe('recovery');
+      expect(nudgeBefore?.message).toContain('op_call_idle_target');
+
+      // 3. Late authoritative after-hook completes the operation
+      const afterRes = controller.observeToolAfter(
+        root,
+        'call_idle_target',
+        'bash',
+        {
+          stdout: 'Tests passed: 10/10',
+        },
+      );
+      expect(afterRes.success).toBe(true);
+
+      rec = controller.readRecord(root).data;
+      op = rec.operations.find((o) => o.id === 'op_call_idle_target');
+      expect(op?.status).toBe('completed');
+      expect(op?.error).toBeUndefined();
+
+      // Nudge is cleared (no longer nudging for the repaired operation)
+      const nudgeAfter = controller.getPendingNudge(root);
+      expect(nudgeAfter).toBeUndefined();
+
+      const file = controller.store.recordPath(root);
+      const bytesAfterRepair = fs.readFileSync(file, 'utf8');
+
+      // 4. Repeated late after is a true no-op
+      const repeatAfter = controller.observeToolAfter(
+        root,
+        'call_idle_target',
+        'bash',
+        {
+          stdout: 'Tests passed: 10/10',
+        },
+      );
+      expect(repeatAfter.success).toBe(true);
+      expect(fs.readFileSync(file, 'utf8')).toBe(bytesAfterRepair);
+
+      // 5. Conflicting output on late after fails closed
+      const conflictAfter = controller.observeToolAfter(
+        root,
+        'call_idle_target',
+        'bash',
+        {
+          stdout: 'Different output',
+        },
+      );
+      expect(conflictAfter.success).toBe(false);
+      expect(conflictAfter.code).toBe('invalid_transition');
+    });
+
+    test('rejection of restart-interrupted, failed, and acknowledged operations in Controller observeToolAfter', () => {
+      const root = 'ses_tool_rejections';
+      const controller = new OutcomeController({ storeDirectory: tempDir });
+      controller.begin(root, testContract());
+
+      // 1. Restart-interrupted rejection
+      const restartRoot = 'ses_tool_restart_rej';
+      const c1 = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: 'epoch_ctrl_1',
+      });
+      c1.begin(restartRoot, testContract());
+      c1.observeToolBefore(restartRoot, 'call_restart_hung', 'bash', {
+        cmd: 'sleep 100',
+      });
+
+      const c2 = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: 'epoch_ctrl_2',
+      });
+      // readRecord triggers recovery
+      const recoveredRec = c2.readRecord(restartRoot);
+      expect(recoveredRec.success).toBe(true);
+      if (recoveredRec.success) {
+        const op = recoveredRec.data.operations.find(
+          (o) => o.id === 'op_call_restart_hung',
+        );
+        expect(op?.status).toBe('interrupted');
+        expect(op?.error).toBe('Operation interrupted by process restart');
+      }
+
+      const restartAfterRes = c2.observeToolAfter(
+        restartRoot,
+        'call_restart_hung',
+        'bash',
+        {
+          stdout: 'finished after restart',
+        },
+      );
+      expect(restartAfterRes.success).toBe(false);
+      expect(restartAfterRes.code).toBe('invalid_transition');
+
+      // 2. Failed operation rejection
+      controller.observeToolBefore(root, 'call_will_fail', 'bash', {
+        cmd: 'bad_cmd',
+      });
+      const rec = controller.readRecord(root).data;
+      controller.store.mutate(root, rec.revision, {
+        type: 'finish_operation',
+        operationId: 'op_call_will_fail',
+        status: 'failed',
+        error: 'Exit code 1',
+      });
+
+      const failedAfterRes = controller.observeToolAfter(
+        root,
+        'call_will_fail',
+        'bash',
+        {
+          stdout: 'trying after finish',
+        },
+      );
+      expect(failedAfterRes.success).toBe(false);
+      expect(failedAfterRes.code).toBe('invalid_transition');
+
+      // 3. Acknowledged operation rejection
+      controller.observeToolBefore(root, 'call_will_ack', 'bash', {
+        cmd: 'ack_cmd',
+      });
+      controller.store.reconcileIdleOperations(root);
+      const rec2 = controller.readRecord(root).data;
+      controller.store.mutate(root, rec2.revision, {
+        type: 'acknowledge_operation',
+        operationId: 'op_call_will_ack',
+      });
+
+      const ackAfterRes = controller.observeToolAfter(
+        root,
+        'call_will_ack',
+        'bash',
+        {
+          stdout: 'trying after ack',
+        },
+      );
+      expect(ackAfterRes.success).toBe(false);
+      expect(ackAfterRes.code).toBe('invalid_transition');
+    });
   });
 });

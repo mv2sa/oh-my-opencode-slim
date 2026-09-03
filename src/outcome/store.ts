@@ -5,9 +5,11 @@ import * as path from 'node:path';
 import { ZodError } from 'zod';
 import {
   canonicalDigest,
+  computeActionArchiveChainDigest,
   computeOutcomeAuthorizationDigest,
   computeOutcomeCheckpointFingerprint,
   computeOutcomeContractDigest,
+  initialActionArchiveChainDigest,
   MAX_OUTCOME_RECORD_BYTES,
   OUTCOME_RECORD_SCHEMA,
   OUTCOME_RECORD_VERSION,
@@ -19,6 +21,7 @@ import {
   type OutcomeDecisionReceipt,
   type OutcomeEvidenceEntry,
   type OutcomeFinalCertificate,
+  type OutcomeKickoffGate,
   type OutcomeManagerReviewSummary,
   type OutcomePendingOperation,
   type OutcomeRecord,
@@ -28,9 +31,14 @@ import {
   type OutcomeUserMessageReceipt,
   parseOutcomeRecord,
   serializeOutcomeRecord,
+  validateVerdictForCheckpointKind,
 } from './controller-schema';
 import { getProcessEpoch } from './process-epoch';
-import { type OutcomeReview, OutcomeReviewSchema } from './schema';
+import {
+  type OutcomeReview,
+  OutcomeReviewSchema,
+  type OutcomeVerdict,
+} from './schema';
 
 export type OutcomeStoreErrorCode =
   | 'missing'
@@ -42,6 +50,9 @@ export type OutcomeStoreErrorCode =
   | 'invalid_session_id'
   | 'symlink_detected'
   | 'invalid_transition'
+  | 'action_capacity_exhausted'
+  | 'kickoff_retry_exhausted'
+  | 'retrospective_kickoff_forbidden'
   | 'io_error'
   | 'durability_uncertain';
 
@@ -246,6 +257,7 @@ export type OutcomeRecordMutation =
       goalId: string;
       newStatus: 'satisfied';
     }
+  | { type: 'reconcile_idle_operations' }
   | { type: 'finalize'; summary: string };
 
 export interface OutcomeReviewPersistence {
@@ -353,6 +365,7 @@ export class OutcomeStore {
       if (existing.code !== 'missing') return existing;
       const now = this.#clock();
       const contract = contractResult.data;
+      const contractDigest = computeOutcomeContractDigest(contract);
       const record: OutcomeRecord = {
         schema: OUTCOME_RECORD_SCHEMA,
         schemaVersion: OUTCOME_RECORD_VERSION,
@@ -363,11 +376,22 @@ export class OutcomeStore {
         serverEpoch: this.#serverEpoch,
         revision: 1,
         nextClaimGeneration: 1,
-        contractDigest: computeOutcomeContractDigest(contract),
+        contractDigest,
         createdAt: now,
         updatedAt: now,
         phase: 'active',
         contract,
+        kickoffGate: {
+          policyVersion: 1,
+          state: 'required',
+          contractDigest,
+          attempts: 0,
+          maxAttempts: 2,
+        },
+        resolvedActionArchive: {
+          count: 0,
+          chainDigest: initialActionArchiveChainDigest(),
+        },
         receipts: {
           evidence: [],
           userMessages: [],
@@ -423,6 +447,87 @@ export class OutcomeStore {
           ),
         );
       }
+
+      if (mutation.type === 'complete_tool_call') {
+        const op = current.operations.find(
+          (entry) => entry.id === mutation.operationId,
+        );
+        const obs = current.receipts.evidence.find(
+          (entry) => entry.id === mutation.observationId,
+        );
+        if (op && obs && obs.kind === 'controller_observed') {
+          if (op.status === 'completed') {
+            if (
+              obs.completionObserved &&
+              obs.outputDigest === mutation.outputDigest &&
+              obs.completedEpoch === mutation.completedEpoch
+            ) {
+              return {
+                success: true,
+                data: current,
+                revision: current.revision,
+                status: 'noop',
+              };
+            }
+            return failure(
+              new OutcomeStoreError(
+                'invalid_transition',
+                'Tool operation already completed with differing output digest or epoch',
+                { rootSessionId: session },
+              ),
+            );
+          }
+        }
+      } else if (mutation.type === 'complete_observation') {
+        const obs = current.receipts.evidence.find(
+          (entry) => entry.id === mutation.observationId,
+        );
+        if (obs && obs.kind === 'controller_observed') {
+          if (obs.completionObserved) {
+            if (
+              obs.outputDigest === mutation.outputDigest &&
+              obs.completedEpoch === mutation.completedEpoch
+            ) {
+              return {
+                success: true,
+                data: current,
+                revision: current.revision,
+                status: 'noop',
+              };
+            }
+            return failure(
+              new OutcomeStoreError(
+                'invalid_transition',
+                'Tool observation already completed with differing output digest or epoch',
+                { rootSessionId: session },
+              ),
+            );
+          }
+        }
+      } else if (mutation.type === 'append_user_message') {
+        const canonicalMessageId = mutation.receipt.messageId.trim();
+        const existing = current.receipts.userMessages.find(
+          (entry) => entry.messageId === canonicalMessageId,
+        );
+        if (existing) {
+          if (existing.contentDigest === mutation.receipt.contentDigest) {
+            return {
+              success: true,
+              data: current,
+              revision: current.revision,
+              status: 'noop',
+            };
+          }
+          return failure(
+            new OutcomeStoreError(
+              'invalid_transition',
+              `User message '${canonicalMessageId}' was already recorded with different content`,
+              { rootSessionId: session },
+            ),
+          );
+        }
+      }
+
       if (current.revision !== expectedRevision) {
         return failure(
           new OutcomeStoreError('conflict', 'Outcome revision conflict', {
@@ -476,6 +581,13 @@ export class OutcomeStore {
     try {
       const current = currentResult.data;
       const claim = requireClaim(current, input);
+      if (input.review && typeof input.review === 'object') {
+        validateVerdictForCheckpointKind(
+          claim.kind,
+          (input.review as { verdict?: OutcomeVerdict }).verdict,
+        );
+      }
+      const review = OutcomeReviewSchema.parse(input.review);
       if (input.recovered) {
         if (
           claim.state !== 'result_available' ||
@@ -499,12 +611,22 @@ export class OutcomeStore {
       ) {
         throw new Error('Manager result digest mismatch');
       }
-      const review = OutcomeReviewSchema.parse(input.review);
       if (
         claim.kind === 'final' &&
         review.candidateFingerprint !== claim.candidateFingerprint
       ) {
         throw new Error('Manager review candidate mismatch');
+      }
+      if (claim.kind === 'kickoff') {
+        if (
+          current.kickoffGate.state !== 'required' ||
+          current.kickoffGate.lastCheckpointId !== claim.checkpointId ||
+          current.kickoffGate.attempts === 0
+        ) {
+          throw new Error(
+            'Kickoff review is not reconcilable for current kickoff gate state',
+          );
+        }
       }
       authenticateReview(current, claim, review);
       return {
@@ -631,12 +753,29 @@ export class OutcomeStore {
           );
         }
         if (input.outcome === 'valid') {
+          if (input.review && typeof input.review === 'object') {
+            validateVerdictForCheckpointKind(
+              claim.kind,
+              (input.review as { verdict?: OutcomeVerdict }).verdict,
+            );
+          }
           const review = OutcomeReviewSchema.parse(input.review);
           if (
             claim.kind === 'final' &&
             review.candidateFingerprint !== claim.candidateFingerprint
           ) {
             throw new Error('Manager review candidate mismatch');
+          }
+          if (claim.kind === 'kickoff') {
+            if (
+              current.kickoffGate.state !== 'required' ||
+              current.kickoffGate.lastCheckpointId !== claim.checkpointId ||
+              current.kickoffGate.attempts === 0
+            ) {
+              throw new Error(
+                'Kickoff review is not reconcilable for current kickoff gate state',
+              );
+            }
           }
           authenticateReview(current, claim, review);
         }
@@ -733,13 +872,42 @@ export class OutcomeStore {
             }
           : operation,
       );
-      let checkpoint = current.checkpoint
+      const checkpoint = current.checkpoint
         ? { ...current.checkpoint }
         : undefined;
-      const actionsRequired = [...current.actionsRequired];
+      const recovered: OutcomeRecord = {
+        ...current,
+        serverEpoch: this.#serverEpoch,
+        revision: current.revision + 1,
+        updatedAt: now,
+        checkpoint,
+        waitCondition:
+          current.waitCondition?.kind === 'external_handoff' &&
+          current.waitCondition.originatingServerEpoch !== this.#serverEpoch
+            ? {
+                ...current.waitCondition,
+                restartObservedRevision: current.revision + 1,
+              }
+            : current.waitCondition,
+        operations,
+        actionsRequired: [...current.actionsRequired],
+        resolvedActionArchive: current.resolvedActionArchive
+          ? { ...current.resolvedActionArchive }
+          : { count: 0, chainDigest: initialActionArchiveChainDigest() },
+        kickoffGate: current.kickoffGate
+          ? { ...current.kickoffGate }
+          : {
+              policyVersion: 1,
+              state: 'required',
+              contractDigest: current.contractDigest,
+              attempts: 0,
+              maxAttempts: 2,
+            },
+      };
       if (checkpoint && checkpoint.serverEpoch !== this.#serverEpoch) {
         if (checkpoint.state === 'claimed') {
-          actionsRequired.push(
+          insertActionRequired(
+            recovered,
             action(
               `reclaim_${checkpoint.checkpointId}`,
               'stale_claim',
@@ -749,15 +917,16 @@ export class OutcomeStore {
               current.revision + 1,
             ),
           );
-          checkpoint = undefined;
+          recovered.checkpoint = undefined;
         } else if (['dispatching', 'running'].includes(checkpoint.state)) {
-          checkpoint = {
+          recovered.checkpoint = {
             ...checkpoint,
             state: 'review_uncertain',
             recoveryNote:
               'Manager dispatch crossed a process epoch and requires reconciliation',
           };
-          actionsRequired.push(
+          insertActionRequired(
+            recovered,
             action(
               `uncertain_${checkpoint.checkpointId}`,
               'review_uncertain',
@@ -770,7 +939,8 @@ export class OutcomeStore {
         }
       }
       for (const id of newlyInterrupted) {
-        actionsRequired.push(
+        insertActionRequired(
+          recovered,
           action(
             `interrupted_${id}_${current.revision + 1}`,
             'interrupted_operation',
@@ -792,27 +962,36 @@ export class OutcomeStore {
           revision: current.revision,
           status: 'noop',
         };
-      const recovered: OutcomeRecord = {
-        ...current,
-        serverEpoch: this.#serverEpoch,
-        revision: current.revision + 1,
-        updatedAt: now,
-        phase: actionsRequired.some((item) => item.resolvedAt === undefined)
-          ? 'action_required'
-          : current.phase,
-        checkpoint,
-        waitCondition:
-          current.waitCondition?.kind === 'external_handoff' &&
-          current.waitCondition.originatingServerEpoch !== this.#serverEpoch
-            ? {
-                ...current.waitCondition,
-                restartObservedRevision: current.revision + 1,
-              }
-            : current.waitCondition,
-        operations,
-        actionsRequired,
-      };
+      recovered.phase = recovered.actionsRequired.some(
+        (item) => item.resolvedAt === undefined,
+      )
+        ? 'action_required'
+        : current.phase;
       return this.#persist(session, recovered, 'recovered');
+    });
+  }
+
+  reconcileIdleOperations(
+    rootSessionId: string,
+  ): OutcomeStoreResult<OutcomeRecord> {
+    const session = safeSession(rootSessionId);
+    if (session instanceof OutcomeStoreError) return failure(session);
+    const currentResult = this.read(session);
+    if (!currentResult.success) return currentResult;
+    const current = currentResult.data;
+    const hasRunningSameEpoch = current.operations.some(
+      (op) => op.serverEpoch === this.#serverEpoch && op.status === 'running',
+    );
+    if (!hasRunningSameEpoch) {
+      return {
+        success: true,
+        data: current,
+        revision: current.revision,
+        status: 'noop',
+      };
+    }
+    return this.mutate(session, current.revision, {
+      type: 'reconcile_idle_operations',
     });
   }
 
@@ -1087,6 +1266,7 @@ function applyMutation(
       if (current.checkpoint && !isReviewed(current.checkpoint.state))
         throw new Error('Contract cannot change while a checkpoint exists');
       const contract = OutcomeContractSchema.parse(mutation.contract);
+      const nextContractDigest = computeOutcomeContractDigest(contract);
       const authorityChanged =
         current.contract.objective !== contract.objective ||
         canonicalDigest('omos/outcome-scope/v1', {
@@ -1097,18 +1277,20 @@ function applyMutation(
             inScope: contract.inScope,
             outOfScope: contract.outOfScope,
           });
-      if (authorityChanged) {
-        const receipt = current.receipts.userMessages.find(
-          (entry) => entry.id === mutation.sourceUserMessageReceiptId,
+
+      const receipt = mutation.sourceUserMessageReceiptId
+        ? current.receipts.userMessages.find(
+            (entry) => entry.id === mutation.sourceUserMessageReceiptId,
+          )
+        : undefined;
+      const hasExternalUserAuth =
+        receipt?.provenance === 'external_user' &&
+        contract.sourceMessageIds.includes(receipt.messageId);
+
+      if (authorityChanged && !hasExternalUserAuth) {
+        throw new Error(
+          'Objective or scope revision requires an external_user receipt included in sourceMessageIds',
         );
-        if (
-          !receipt ||
-          !contract.sourceMessageIds.includes(receipt.messageId)
-        ) {
-          throw new Error(
-            'Objective or scope revision requires a durable user receipt included in sourceMessageIds',
-          );
-        }
       }
       for (const exception of contract.exceptions) {
         const authorization = current.receipts.authorizations.find(
@@ -1120,10 +1302,32 @@ function applyMutation(
           );
         }
       }
+
+      let kickoffGate: OutcomeKickoffGate;
+      if (nextContractDigest !== current.contractDigest) {
+        if (hasExternalUserAuth) {
+          kickoffGate = {
+            policyVersion: 1,
+            state: 'required',
+            contractDigest: nextContractDigest,
+            attempts: 0,
+            maxAttempts: 2,
+          };
+        } else {
+          kickoffGate = {
+            ...current.kickoffGate,
+            contractDigest: nextContractDigest,
+          };
+        }
+      } else {
+        kickoffGate = current.kickoffGate;
+      }
+
       next = {
         ...next,
         contract,
-        contractDigest: computeOutcomeContractDigest(contract),
+        contractDigest: nextContractDigest,
+        kickoffGate,
         phase: 'active',
       };
       delete next.checkpoint;
@@ -1178,7 +1382,15 @@ function applyMutation(
         throw new Error('Target is not a tool observation');
       }
       if (existing.completionObserved) {
-        throw new Error('Observation is already completed');
+        if (
+          existing.outputDigest === mutation.outputDigest &&
+          existing.completedEpoch === mutation.completedEpoch
+        ) {
+          break;
+        }
+        throw new Error(
+          'Observation is already completed with different output or epoch',
+        );
       }
       if (existing.startedEpoch !== mutation.completedEpoch) {
         throw new Error('A generic completion must belong to its start epoch');
@@ -1199,22 +1411,49 @@ function applyMutation(
       const observationIndex = next.receipts.evidence.findIndex(
         (entry) => entry.id === mutation.observationId,
       );
-      if (
-        operationIndex < 0 ||
-        next.operations[operationIndex].status !== 'running'
-      ) {
-        throw new Error('Tool operation is not running');
+      if (operationIndex < 0 || observationIndex < 0) {
+        throw new Error('Tool operation or observation does not exist');
       }
+      const op = next.operations[operationIndex];
       const observation = next.receipts.evidence[observationIndex];
-      if (
-        observation?.kind !== 'controller_observed' ||
-        observation.completionObserved
-      ) {
-        throw new Error('Tool observation is missing or already complete');
+      if (observation?.kind !== 'controller_observed') {
+        throw new Error(
+          'Tool observation is missing or not controller_observed',
+        );
+      }
+      if (op.status === 'completed') {
+        if (
+          observation.completionObserved &&
+          observation.outputDigest === mutation.outputDigest &&
+          observation.completedEpoch === mutation.completedEpoch
+        ) {
+          break;
+        }
+        throw new Error(
+          'Tool operation already completed with different output or epoch',
+        );
+      }
+      const isIdleInterrupted =
+        op.status === 'interrupted' &&
+        op.serverEpoch === epoch &&
+        op.error === 'Session became idle without a durable tool after-hook';
+
+      const isRunning = op.status === 'running' && op.serverEpoch === epoch;
+
+      if (!isRunning && !isIdleInterrupted) {
+        throw new Error(
+          'Tool operation is not running or repairable idle-interrupted',
+        );
+      }
+      if (observation.completionObserved) {
+        throw new Error('Tool observation is already complete');
       }
       if (
-        observation.callId !== next.operations[operationIndex].callId ||
-        observation.startedEpoch !== mutation.completedEpoch
+        observation.callId !== op.callId ||
+        observation.toolName !== op.toolName ||
+        observation.argumentDigest !== op.argumentDigest ||
+        observation.startedEpoch !== mutation.completedEpoch ||
+        mutation.completedEpoch !== epoch
       ) {
         throw new Error('Tool completion identity or epoch mismatch');
       }
@@ -1225,21 +1464,48 @@ function applyMutation(
         completedEpoch: mutation.completedEpoch,
         completedAt: mutation.completedAt,
       };
-      next.operations[operationIndex] = {
-        ...next.operations[operationIndex],
+      const completedOp: OutcomePendingOperation = {
+        id: op.id,
+        callId: op.callId,
+        toolName: op.toolName,
+        argumentDigest: op.argumentDigest,
+        serverEpoch: op.serverEpoch,
         status: 'completed',
+        startedAt: op.startedAt,
         updatedAt: mutation.completedAt,
       };
+      next.operations[operationIndex] = completedOp;
       break;
     }
-    case 'append_user_message':
+    case 'append_user_message': {
+      const canonicalMessageId = mutation.receipt.messageId.trim();
+      const existing = next.receipts.userMessages.find(
+        (entry) => entry.messageId === canonicalMessageId,
+      );
+      if (existing) {
+        if (existing.contentDigest === mutation.receipt.contentDigest) {
+          break;
+        }
+        throw new OutcomeStoreError(
+          'invalid_transition',
+          `User message '${canonicalMessageId}' was already recorded with different content`,
+        );
+      }
       if (mutation.receipt.createdRevision !== revision) {
         throw new Error(
           'User message createdRevision must equal its persisted revision',
         );
       }
-      next.receipts.userMessages.push(mutation.receipt);
+      if (!mutation.receipt.provenance) {
+        throw new Error('User message receipt requires explicit provenance');
+      }
+      next.receipts.userMessages.push({
+        ...mutation.receipt,
+        messageId: canonicalMessageId,
+        provenance: mutation.receipt.provenance,
+      });
       break;
+    }
     case 'append_decision':
       next.receipts.decisions.push(mutation.receipt);
       break;
@@ -1258,8 +1524,10 @@ function applyMutation(
       const userMsg = next.receipts.userMessages.find(
         (entry) => entry.id === mutation.sourceUserMessageReceiptId,
       );
-      if (!userMsg) {
-        throw new Error('Source user message receipt does not exist');
+      if (userMsg?.provenance !== 'external_user') {
+        throw new Error(
+          'Decision resolution requires an external_user receipt',
+        );
       }
       if (userMsg.createdRevision <= existing.createdRevision) {
         throw new Error('Source user message must follow the decision request');
@@ -1287,13 +1555,75 @@ function applyMutation(
           'Authorization payloadDigest must be Controller-minted from its bound fields',
         );
       }
+      if (mutation.receipt.kind === 'user_decision') {
+        if (!mutation.receipt.decisionId) {
+          throw new Error('User authorization requires a decision ID');
+        }
+        const decision = next.receipts.decisions.find(
+          (d) => d.id === mutation.receipt.decisionId,
+        );
+        if (!decision?.sourceUserMessageReceiptId) {
+          throw new Error('User authorization requires a resolved decision');
+        }
+        const userMsg = next.receipts.userMessages.find(
+          (m) => m.id === decision.sourceUserMessageReceiptId,
+        );
+        if (userMsg?.provenance !== 'external_user') {
+          throw new Error(
+            'New user_decision authorization requires referenced decision to be backed by an external_user receipt',
+          );
+        }
+      }
       next.receipts.authorizations.push(mutation.receipt);
       break;
     case 'open_checkpoint': {
       if (current.checkpoint && !isReviewed(current.checkpoint.state))
         throw new Error('A checkpoint is already active');
+      if (mutation.kind === 'kickoff') {
+        if (current.kickoffGate.state === 'authenticated') {
+          throw new OutcomeStoreError(
+            'invalid_transition',
+            'Kickoff review is already authenticated for this contract',
+          );
+        }
+        if (current.kickoffGate.state === 'legacy_late_missing') {
+          throw new OutcomeStoreError(
+            'retrospective_kickoff_forbidden',
+            'Retrospective kickoff is forbidden for legacy record with missing kickoff',
+          );
+        }
+        if (
+          current.kickoffGate.state === 'exhausted' ||
+          current.kickoffGate.attempts >= current.kickoffGate.maxAttempts
+        ) {
+          throw new OutcomeStoreError(
+            'kickoff_retry_exhausted',
+            'Kickoff retry attempts exhausted',
+          );
+        }
+        next.kickoffGate = {
+          ...current.kickoffGate,
+          attempts: current.kickoffGate.attempts + 1,
+        };
+      } else {
+        if (current.kickoffGate.state !== 'authenticated') {
+          if (current.kickoffGate.state === 'legacy_late_missing') {
+            throw new OutcomeStoreError(
+              'retrospective_kickoff_forbidden',
+              'Historical kickoff is missing (legacy_late_missing); non-kickoff checkpoint forbidden',
+            );
+          }
+          throw new OutcomeStoreError(
+            'invalid_transition',
+            'Kickoff review must be authenticated before opening non-kickoff checkpoint',
+          );
+        }
+      }
       const claimGeneration = current.nextClaimGeneration;
       const checkpointId = `chk_${mutation.kind}_${randomId().slice(0, 16)}`;
+      if (mutation.kind === 'kickoff') {
+        next.kickoffGate.lastCheckpointId = checkpointId;
+      }
       const base = {
         outcomeId: current.outcomeId,
         rootSessionId: current.rootSessionId,
@@ -1377,6 +1707,12 @@ function applyMutation(
             : 'Consumed review requires a running or available bound result',
         );
       }
+      if (mutation.review && typeof mutation.review === 'object') {
+        validateVerdictForCheckpointKind(
+          claim.kind,
+          (mutation.review as { verdict?: OutcomeVerdict }).verdict,
+        );
+      }
       requireClaimToken(claim, mutation.claimToken);
       if (
         claim.resultDigest !== undefined &&
@@ -1407,6 +1743,12 @@ function applyMutation(
       if (claim.state !== 'result_available' || claim.serverEpoch === epoch) {
         throw new Error(
           'Recovered review requires a prior-epoch available result',
+        );
+      }
+      if (mutation.review && typeof mutation.review === 'object') {
+        validateVerdictForCheckpointKind(
+          claim.kind,
+          (mutation.review as { verdict?: OutcomeVerdict }).verdict,
         );
       }
       if (mutation.resultDigest !== claim.resultDigest)
@@ -1471,7 +1813,21 @@ function applyMutation(
         reviewDigest,
         recoveryNote: mutation.reason,
       };
-      next.actionsRequired.push(
+      if (claim.kind === 'kickoff') {
+        next.kickoffGate = {
+          ...next.kickoffGate,
+          failureReason: mutation.reason,
+          state:
+            next.kickoffGate.attempts >= next.kickoffGate.maxAttempts
+              ? 'exhausted'
+              : next.kickoffGate.state,
+        };
+        if (next.kickoffGate.state === 'exhausted') {
+          next.phase = 'failed';
+        }
+      }
+      insertActionRequired(
+        next,
         action(
           `invalid_review_${claim.checkpointId}_${claim.claimGeneration}`,
           'manual_intervention',
@@ -1493,7 +1849,21 @@ function applyMutation(
         state: 'retired',
         recoveryNote: mutation.reason,
       };
-      next.actionsRequired.push(
+      if (claim.kind === 'kickoff') {
+        next.kickoffGate = {
+          ...next.kickoffGate,
+          failureReason: mutation.reason,
+          state:
+            next.kickoffGate.attempts >= next.kickoffGate.maxAttempts
+              ? 'exhausted'
+              : next.kickoffGate.state,
+        };
+        if (next.kickoffGate.state === 'exhausted') {
+          next.phase = 'failed';
+        }
+      }
+      insertActionRequired(
+        next,
         action(
           `invalid_dispatch_${claim.checkpointId}_${claim.claimGeneration}`,
           'manual_intervention',
@@ -1516,6 +1886,29 @@ function applyMutation(
         state: 'retired',
         recoveryNote: mutation.reason,
       };
+      if (claim.kind === 'kickoff') {
+        next.kickoffGate = {
+          ...next.kickoffGate,
+          failureReason: mutation.reason,
+          state:
+            next.kickoffGate.attempts >= next.kickoffGate.maxAttempts
+              ? 'exhausted'
+              : next.kickoffGate.state,
+        };
+        if (next.kickoffGate.state === 'exhausted') {
+          next.phase = 'failed';
+        }
+      }
+      break;
+    }
+    case 'reconcile_idle_operations': {
+      for (const op of next.operations) {
+        if (op.serverEpoch === epoch && op.status === 'running') {
+          op.status = 'interrupted';
+          op.updatedAt = now;
+          op.error = 'Session became idle without a durable tool after-hook';
+        }
+      }
       break;
     }
     case 'set_wait':
@@ -1629,7 +2022,7 @@ function applyMutation(
           'Action createdRevision must equal its persisted revision',
         );
       }
-      next.actionsRequired.push(mutation.action);
+      insertActionRequired(next, mutation.action);
       next.phase = 'action_required';
       break;
     case 'resolve_action': {
@@ -1652,7 +2045,8 @@ function applyMutation(
       );
       if (
         (!userReceipt && evidence.length === 0) ||
-        (mutation.sourceUserMessageReceiptId !== undefined && !userReceipt) ||
+        (mutation.sourceUserMessageReceiptId !== undefined &&
+          userReceipt?.provenance !== 'external_user') ||
         evidence.some(
           (entry) =>
             !entry ||
@@ -1664,7 +2058,7 @@ function applyMutation(
           userReceipt.createdRevision <= unresolvedAction.createdRevision)
       ) {
         throw new Error(
-          'Action resolution requires subsequent user provenance or fresh passed subsequent orchestrator-attestation evidence',
+          'Action resolution requires subsequent external_user provenance or fresh passed subsequent orchestrator-attestation evidence',
         );
       }
       next.actionsRequired[index] = {
@@ -1804,6 +2198,9 @@ function recordParsedReview(
   persistedRevision: number,
   randomId: () => string,
 ): void {
+  if (claim.kind === 'kickoff') {
+    assertKickoffReviewReconcilable(record, claim);
+  }
   const reviewDigest = canonicalDigest('omos/outcome-manager-review/v1', {
     resultDigest,
     review,
@@ -1833,6 +2230,28 @@ function recordParsedReview(
     resultDigest,
     reviewDigest,
   };
+  if (claim.kind === 'kickoff') {
+    if (review.verdict === 'CONTINUE') {
+      record.kickoffGate = {
+        ...record.kickoffGate,
+        state: 'authenticated',
+        authenticatedReviewId: summary.reviewId,
+        failureReason: undefined,
+      };
+    } else {
+      record.kickoffGate = {
+        ...record.kickoffGate,
+        failureReason: review.summary,
+        state:
+          record.kickoffGate.attempts >= record.kickoffGate.maxAttempts
+            ? 'exhausted'
+            : record.kickoffGate.state,
+      };
+      if (record.kickoffGate.state === 'exhausted') {
+        record.phase = 'failed';
+      }
+    }
+  }
   if (review.verdict === 'USER_DECISION_REQUIRED') {
     const decisionId = `dec_${summary.reviewId}`;
     if (review.userDecision) {
@@ -1860,7 +2279,8 @@ function recordParsedReview(
     review.verdict === 'CORRECT_DRIFT' ||
     review.verdict === 'REVISE_CONTRACT'
   ) {
-    record.actionsRequired.push(
+    insertActionRequired(
+      record,
       action(
         `action_${summary.reviewId}`,
         'manual_intervention',
@@ -2011,6 +2431,12 @@ function resolveMatchingRecoveryActions(
 
 function derivePhase(record: OutcomeRecord): OutcomeRecord['phase'] {
   if (record.phase === 'accepted') return 'accepted';
+  if (
+    record.kickoffGate.state === 'exhausted' ||
+    record.kickoffGate.state === 'legacy_late_missing'
+  ) {
+    return 'failed';
+  }
   if (record.actionsRequired.some((entry) => entry.resolvedAt === undefined)) {
     return 'action_required';
   }
@@ -2061,13 +2487,19 @@ function assertFinalizable(record: OutcomeRecord): void {
     throw new Error('Final Manager ACCEPT review is missing or mismatched');
   }
   if (
-    !record.reviewSummaries.some(
-      (entry) =>
-        entry.checkpointKind === 'kickoff' &&
-        entry.contractDigest === record.contractDigest &&
-        !['REVISE_CONTRACT', 'USER_DECISION_REQUIRED'].includes(entry.verdict),
-    )
+    record.kickoffGate.state !== 'authenticated' ||
+    !record.kickoffGate.authenticatedReviewId
   ) {
+    throw new Error('Kickoff review has not completed');
+  }
+  const kickoffReview = record.reviewSummaries.find(
+    (entry) =>
+      entry.reviewId === record.kickoffGate.authenticatedReviewId &&
+      entry.checkpointKind === 'kickoff' &&
+      entry.contractDigest === record.contractDigest &&
+      entry.verdict === 'CONTINUE',
+  );
+  if (!kickoffReview) {
     throw new Error('Kickoff review has not completed');
   }
   if (record.contract.goals.some((goal) => goal.status !== 'satisfied')) {
@@ -2120,6 +2552,22 @@ function assertFinalizable(record: OutcomeRecord): void {
     )
   ) {
     throw new Error('Outcome still has unresolved operations');
+  }
+}
+
+function assertKickoffReviewReconcilable(
+  record: OutcomeRecord,
+  claim: OutcomeCheckpointClaim,
+): void {
+  if (
+    record.kickoffGate.state !== 'required' ||
+    record.kickoffGate.lastCheckpointId !== claim.checkpointId ||
+    record.kickoffGate.attempts < 1 ||
+    record.kickoffGate.attempts > record.kickoffGate.maxAttempts
+  ) {
+    throw new Error(
+      'Kickoff review is not reconcilable for current kickoff gate state',
+    );
   }
 }
 
@@ -2289,6 +2737,49 @@ function action(
   createdRevision: number,
 ): OutcomeActionRequired {
   return { id, code, referenceId, reason, createdAt, createdRevision };
+}
+
+function insertActionRequired(
+  record: OutcomeRecord,
+  newAction: OutcomeActionRequired,
+): void {
+  const unresolved = record.actionsRequired.filter(
+    (a) => a.resolvedAt === undefined,
+  );
+  if (unresolved.length >= 16) {
+    throw new OutcomeStoreError(
+      'action_capacity_exhausted',
+      'Action capacity exhausted by unresolved actions',
+    );
+  }
+  const resolved = record.actionsRequired.filter(
+    (a) => a.resolvedAt !== undefined,
+  );
+  resolved.sort((a, b) =>
+    a.createdRevision !== b.createdRevision
+      ? a.createdRevision - b.createdRevision
+      : a.id.localeCompare(b.id),
+  );
+
+  const maxResolvedToRetain = Math.max(0, Math.min(4, 15 - unresolved.length));
+  if (resolved.length > maxResolvedToRetain) {
+    const toArchiveCount = resolved.length - maxResolvedToRetain;
+    const toArchive = resolved.slice(0, toArchiveCount);
+    const toRetain = resolved.slice(toArchiveCount);
+
+    for (const item of toArchive) {
+      record.resolvedActionArchive.count += 1;
+      record.resolvedActionArchive.chainDigest =
+        computeActionArchiveChainDigest(
+          record.resolvedActionArchive.chainDigest,
+          record.resolvedActionArchive.count,
+          item,
+        );
+    }
+    record.actionsRequired = [...unresolved, ...toRetain];
+  }
+
+  record.actionsRequired.push(newAction);
 }
 
 function sessionHash(session: string): string {

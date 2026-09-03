@@ -454,6 +454,26 @@ The durable lifecycle has explicit exits rather than generic record mutation:
 instruction are emitted exclusively through the tagged trailing volatile
 message transform; they are never serialized in ordinary tool output.
 
+External user turn receipts are recorded in the durable outcome store with
+whole-message provenance validation. If ANY authoritative part in a message turn
+is synthetic, internal initiator, compaction continuation, or carries plugin
+internal metadata, the entire message is rejected and mints no user message
+receipt. Transformed `output.parts` are authoritative over cleaner `input.parts`
+when present. Host message IDs are required, and duplicate host events with the
+same message ID are idempotent no-ops. Literal marker text in ordinary user text
+without synthetic metadata remains ordinary external user text.
+
+On authoritative session idle (`session.idle` or `session.status: idle`) without
+active background child tasks, leftover running tool operations from the current
+server epoch are atomically reconciled to `interrupted` in the durable outcome
+store (with reason `Session became idle without a durable tool after-hook`)
+without fabricating success or creating spurious action noise. Repeated idle
+events are idempotent no-ops that produce no revision growth or byte mutation.
+Interrupted and failed operations remain visible in outcome status, and recovery
+nudges direct the orchestrator to acknowledge them via
+`outcome_control(action: "acknowledge_operation")`. Active child tasks suppress
+idle operation reconciliation until child execution reaches a terminal state.
+
 Outcome Manager dispatch uses its checkpoint claim as the durable operation
 boundary. A reservation that later fails task-session preflight is retired
 immediately and does not leave a generic running operation or require a process
