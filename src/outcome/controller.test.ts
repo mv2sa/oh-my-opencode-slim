@@ -3404,4 +3404,543 @@ describe('OutcomeController service over frozen store', () => {
       expect(ackAfterRes.code).toBe('invalid_transition');
     });
   });
+
+  describe('prior-epoch boardless recovery for restart resilience', () => {
+    function setupPriorEpochResultAvailable(
+      root: string,
+      options: {
+        oldEpoch?: string;
+        newEpoch?: string;
+        taskId?: string;
+        generation?: number;
+        callId?: string;
+        rawResultText?: string;
+      } = {},
+    ) {
+      const oldEpoch = options.oldEpoch ?? 'epoch_old_1';
+      const newEpoch = options.newEpoch ?? 'epoch_new_2';
+      const taskId = options.taskId ?? 'mgr_prior_task';
+      const generation = options.generation ?? 1;
+      const callId = options.callId ?? 'call_prior_dispatch';
+
+      const oldController = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: oldEpoch,
+        getManagerTaskRecord: () => ({
+          taskID: taskId,
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation,
+          state: 'running',
+        }),
+      });
+      const beginRes = oldController.begin(root, testContract());
+      if (!beginRes.success) throw new Error('begin failed');
+      const checkpointId = beginRes.data.checkpoint?.checkpointId;
+      if (!checkpointId) throw new Error('checkpointId missing');
+
+      oldController.validateAndMarkDispatching(
+        root,
+        callId,
+        dispatchInstruction(oldController, root),
+      );
+      const bindRes = oldController.bindManagerTask(
+        root,
+        callId,
+        taskId,
+        generation,
+      );
+      if (!bindRes.success) throw new Error(`bind failed: ${bindRes.error}`);
+
+      const newController = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: newEpoch,
+      });
+      newController.readRecord(root); // recovers running checkpoint to review_uncertain
+
+      const review = validReviewFor(newController, root, 'CONTINUE');
+      const text =
+        options.rawResultText ??
+        `<outcome_review>\n${JSON.stringify(review, null, 2)}\n</outcome_review>`;
+      const digest = canonicalDigest('omos/manager-result/v1', text);
+
+      const reconcileUncertainRes = newController.reconcileUncertain(root, {
+        checkpointId,
+        resolution: {
+          kind: 'result_available',
+          dispatchCallId: callId,
+          managerTaskId: taskId,
+          managerGeneration: generation,
+          resultDigest: digest,
+        },
+      });
+      if (!reconcileUncertainRes.success) {
+        throw new Error(
+          `reconcileUncertain failed: ${reconcileUncertainRes.error}`,
+        );
+      }
+
+      return {
+        checkpointId,
+        taskId,
+        generation,
+        callId,
+        digest,
+        text,
+        review,
+        oldEpoch,
+        newEpoch,
+      };
+    }
+
+    test('successful prior-epoch boardless recovery reconciles review and skips consumeManagerTask', async () => {
+      const root = 'ses_boardless_success';
+      const setup = setupPriorEpochResultAvailable(root);
+
+      let consumeCalls = 0;
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined, // no board record
+        readChildSessionResult: async (id) =>
+          id === setup.taskId
+            ? { text: setup.text, empty: false, terminal: true }
+            : undefined,
+        consumeManagerTask: () => {
+          consumeCalls++;
+          return true;
+        },
+      });
+
+      const res = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+
+      expect(res.success).toBe(true);
+      if (!res.success) return;
+      expect(res.data.verdict).toBe('CONTINUE');
+      expect(res.data.phase).toBe('active');
+      expect(consumeCalls).toBe(0); // skipped consumeManagerTask!
+
+      const record = controller.readRecord(root);
+      expect(record.success).toBe(true);
+      if (!record.success) return;
+      expect(record.data.checkpoint?.state).toBe('review_rejected');
+      expect(record.data.kickoffGate.state).toBe('authenticated');
+      expect(record.data.phase).toBe('active');
+      expect(record.data.reviewSummaries).toHaveLength(1);
+      expect(record.data.reviewSummaries[0].resultDigest).toBe(setup.digest);
+    });
+
+    test('boardless recovery rejects omitted or mismatched caller managerGeneration', async () => {
+      const root = 'ses_boardless_gen';
+      const setup = setupPriorEpochResultAvailable(root, { generation: 2 });
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: setup.text,
+          empty: false,
+          terminal: true,
+        }),
+      });
+
+      // 1. Omitted managerGeneration
+      const omittedRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+      });
+      expect(omittedRes.success).toBe(false);
+      expect(omittedRes.code).toBe('generation_mismatch');
+      expect(omittedRes.error).toContain('Manager generation mismatch');
+
+      // 2. Wrong managerGeneration
+      const wrongRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: 99,
+      });
+      expect(wrongRes.success).toBe(false);
+      expect(wrongRes.code).toBe('generation_mismatch');
+      expect(wrongRes.error).toContain('Manager generation mismatch');
+    });
+
+    test('boardless recovery rejects bound manager task mismatch', async () => {
+      const root = 'ses_boardless_task_mismatch';
+      const setup = setupPriorEpochResultAvailable(root);
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: setup.text,
+          empty: false,
+          terminal: true,
+        }),
+      });
+
+      const mismatchRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: 'mgr_completely_different',
+        managerGeneration: setup.generation,
+      });
+      expect(mismatchRes.success).toBe(false);
+      expect(mismatchRes.code).toBe('manager_task_mismatch');
+    });
+
+    test('boardless recovery rejects changed child result digest', async () => {
+      const root = 'ses_boardless_digest_mismatch';
+      const setup = setupPriorEpochResultAvailable(root);
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: `<outcome_review>\n${JSON.stringify({ ...setup.review, summary: 'Changed summary digest' }, null, 2)}\n</outcome_review>`,
+          empty: false,
+          terminal: true,
+        }),
+      });
+
+      const res = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+      expect(res.success).toBe(false);
+      expect(res.code).toBe('result_digest_mismatch');
+    });
+
+    test('boardless recovery enforces terminal, nonempty, and present child result', async () => {
+      const root = 'ses_boardless_result_states';
+      const setup = setupPriorEpochResultAvailable(root);
+
+      let childResult:
+        | { text: string; empty: boolean; terminal: boolean }
+        | undefined;
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => childResult,
+      });
+
+      // 1. Non-terminal result
+      childResult = { text: setup.text, empty: false, terminal: false };
+      const nonTerminalRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+      expect(nonTerminalRes.success).toBe(false);
+      expect(nonTerminalRes.code).toBe('result_not_terminal');
+
+      // 2. Empty result
+      childResult = { text: '', empty: true, terminal: true };
+      const emptyRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+      expect(emptyRes.success).toBe(false);
+      expect(emptyRes.code).toBe('result_not_terminal');
+
+      // 3. Missing result (reader returns undefined)
+      childResult = undefined;
+      const missingRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+      expect(missingRes.success).toBe(false);
+      expect(missingRes.code).toBe('result_not_terminal');
+    });
+
+    test('current-epoch board loss remains untracked_manager_task', async () => {
+      const root = 'ses_current_epoch_loss';
+      const epoch = 'epoch_current_loss';
+
+      let boardRecord: ManagerTaskVerification | undefined = {
+        taskID: 'mgr_curr_1',
+        parentSessionID: root,
+        agent: 'outcome-manager',
+        generation: 1,
+        state: 'running',
+      };
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: epoch,
+        getManagerTaskRecord: (id) =>
+          id === 'mgr_curr_1' ? boardRecord : undefined,
+        readChildSessionResult: async () => ({
+          text: 'irrelevant',
+          empty: false,
+          terminal: true,
+        }),
+      });
+
+      const beginRes = controller.begin(root, testContract());
+      expect(beginRes.success).toBe(true);
+      if (!beginRes.success) return;
+      const checkpointId = beginRes.data.checkpoint?.checkpointId;
+      if (!checkpointId) throw new Error('checkpointId missing');
+
+      const nudge = controller.getPendingNudge(root);
+      if (nudge?.kind !== 'dispatch') throw new Error('dispatch nudge missing');
+      const rawToken = nudge.marker.claimToken;
+
+      const dispatchRes = controller.validateAndMarkDispatching(
+        root,
+        'call_curr_1',
+        nudge.instruction,
+      );
+      expect(dispatchRes.success).toBe(true);
+
+      const bindRes = controller.bindManagerTask(
+        root,
+        'call_curr_1',
+        'mgr_curr_1',
+        1,
+      );
+      expect(bindRes.success).toBe(true);
+
+      const review = validReviewFor(controller, root, 'CONTINUE');
+      const text = `<outcome_review>\n${JSON.stringify(review, null, 2)}\n</outcome_review>`;
+      const digest = canonicalDigest('omos/manager-result/v1', text);
+
+      // Mutate to result_available within current epoch
+      const rec = controller.readRecord(root);
+      expect(rec.success).toBe(true);
+      if (!rec.success) return;
+
+      const markAvailRes = controller.store.mutate(root, rec.data.revision, {
+        type: 'mark_result_available',
+        checkpointId,
+        claimGeneration: 1,
+        claimToken: rawToken,
+        resultDigest: digest,
+      });
+      expect(markAvailRes.success).toBe(true);
+
+      const recordAfterAvail = controller.readRecord(root);
+      expect(recordAfterAvail.success).toBe(true);
+      if (!recordAfterAvail.success) return;
+      expect(recordAfterAvail.data.checkpoint?.state).toBe('result_available');
+      expect(recordAfterAvail.data.checkpoint?.serverEpoch).toBe(epoch);
+      expect(recordAfterAvail.data.checkpoint?.dispatchCallId).toBe(
+        'call_curr_1',
+      );
+      expect(recordAfterAvail.data.checkpoint?.managerTaskId).toBe(
+        'mgr_curr_1',
+      );
+      expect(recordAfterAvail.data.checkpoint?.managerGeneration).toBe(1);
+      expect(recordAfterAvail.data.checkpoint?.resultDigest).toBe(digest);
+
+      // Board loss occurs in current epoch immediately before reconcileReview
+      boardRecord = undefined;
+
+      const reconcileRes = await controller.reconcileReview(root, {
+        checkpointId,
+        managerTaskId: 'mgr_curr_1',
+        managerGeneration: 1,
+      });
+      expect(reconcileRes.success).toBe(false);
+      expect(reconcileRes.code).toBe('untracked_manager_task');
+      expect(reconcileRes.error).toContain(
+        'untracked on the background job board',
+      );
+    });
+
+    test('old claim with existing invalid board record follows normal checks', async () => {
+      const root = 'ses_prior_with_invalid_board';
+      const setup = setupPriorEpochResultAvailable(root);
+
+      let boardRecord: ManagerTaskVerification = {
+        taskID: setup.taskId,
+        parentSessionID: root,
+        agent: 'outcome-manager',
+        generation: setup.generation,
+        state: 'running', // invalid: not completed
+      };
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: (id) =>
+          id === setup.taskId ? boardRecord : undefined,
+        readChildSessionResult: async () => ({
+          text: setup.text,
+          empty: false,
+          terminal: true,
+        }),
+      });
+
+      // 1. Not completed state
+      const notCompletedRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+      expect(notCompletedRes.success).toBe(false);
+      expect(notCompletedRes.code).toBe('task_not_completed');
+
+      // 2. Wrong parent session
+      boardRecord = {
+        taskID: setup.taskId,
+        parentSessionID: 'other_session',
+        agent: 'outcome-manager',
+        generation: setup.generation,
+        state: 'completed',
+      };
+      const wrongParentRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+      expect(wrongParentRes.success).toBe(false);
+      expect(wrongParentRes.code).toBe('wrong_parent_session');
+
+      // 3. Wrong agent identity
+      boardRecord = {
+        taskID: setup.taskId,
+        parentSessionID: root,
+        agent: 'coder',
+        generation: setup.generation,
+        state: 'completed',
+      };
+      const wrongAgentRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+      expect(wrongAgentRes.success).toBe(false);
+      expect(wrongAgentRes.code).toBe('wrong_agent_identity');
+
+      // 4. Board generation mismatch
+      boardRecord = {
+        taskID: setup.taskId,
+        parentSessionID: root,
+        agent: 'outcome-manager',
+        generation: 99,
+        state: 'completed',
+      };
+      const genMismatchRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+      expect(genMismatchRes.success).toBe(false);
+      expect(genMismatchRes.code).toBe('generation_mismatch');
+    });
+
+    test('boardless recovery retry after persistence failure succeeds with exact result and rejects changed result', async () => {
+      const root = 'ses_boardless_persist_retry';
+      const setup = setupPriorEpochResultAvailable(root);
+
+      let failOnce = true;
+      let childText = setup.text;
+
+      const store = new OutcomeStore({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        beforePersistReconciledReview: () => {
+          if (failOnce) {
+            failOnce = false;
+            throw new OutcomeStoreError(
+              'io_error',
+              'injected io_error on boardless recovery',
+            );
+          }
+        },
+      });
+
+      let consumeCalls = 0;
+      const controller = new OutcomeController({
+        store,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: childText,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => {
+          consumeCalls++;
+          return true;
+        },
+      });
+
+      const params = {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      };
+
+      // Attempt 1: persistence failure
+      const first = await controller.reconcileReview(root, params);
+      expect(first).toMatchObject({ success: false, code: 'io_error' });
+      expect(consumeCalls).toBe(0);
+
+      // Attempt 2: changed result text during retry
+      childText = `<outcome_review>\n${JSON.stringify({ ...setup.review, summary: 'Tampered summary' }, null, 2)}\n</outcome_review>`;
+      const changed = await controller.reconcileReview(root, params);
+      expect(changed).toMatchObject({
+        success: false,
+        code: 'result_digest_mismatch',
+      });
+
+      // Attempt 3: exact result retry succeeds
+      childText = setup.text;
+      const retried = await controller.reconcileReview(root, params);
+      expect(retried.success).toBe(true);
+      expect(consumeCalls).toBe(0);
+
+      const record = controller.readRecord(root);
+      expect(record.success && record.data.checkpoint?.state).toBe(
+        'review_rejected',
+      );
+      expect(record.success && record.data.kickoffGate.state).toBe(
+        'authenticated',
+      );
+      expect(record.success && record.data.phase).toBe('active');
+      expect(record.success && record.data.reviewSummaries).toHaveLength(1);
+
+      // Attempt 4: subsequent call without a board record is rejected because claim is no longer result_available
+      const replay = await controller.reconcileReview(root, params);
+      expect(replay.success).toBe(false);
+      expect(replay.code).toBe('untracked_manager_task');
+    });
+
+    test('boardless recovery still requires verifier to be configured', async () => {
+      const root = 'ses_boardless_verifier_required';
+      const setup = setupPriorEpochResultAvailable(root);
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        // getManagerTaskRecord omitted!
+        readChildSessionResult: async () => ({
+          text: setup.text,
+          empty: false,
+          terminal: true,
+        }),
+      });
+
+      const res = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+      expect(res.success).toBe(false);
+      expect(res.code).toBe('verifier_unconfigured');
+    });
+  });
 });

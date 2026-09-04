@@ -1377,15 +1377,9 @@ export class OutcomeController {
         code: 'verifier_unconfigured',
       };
     }
-    {
-      const taskRecord = this.#getManagerTaskRecord(params.managerTaskId);
-      if (!taskRecord) {
-        return {
-          success: false,
-          error: `Manager task '${params.managerTaskId}' is untracked on the background job board`,
-          code: 'untracked_manager_task',
-        };
-      }
+    const taskRecord = this.#getManagerTaskRecord(params.managerTaskId);
+    let isBoardlessRecovery = false;
+    if (taskRecord) {
       if (taskRecord.parentSessionID !== rootSessionId) {
         return {
           success: false,
@@ -1422,6 +1416,35 @@ export class OutcomeController {
           code: 'task_not_completed',
         };
       }
+    } else {
+      const isBoardlessRecoveryEligible =
+        claim.state === 'result_available' &&
+        claim.serverEpoch !== this.#serverEpoch &&
+        claim.dispatchCallId !== undefined &&
+        claim.managerTaskId !== undefined &&
+        claim.managerGeneration !== undefined &&
+        claim.resultDigest !== undefined;
+
+      if (!isBoardlessRecoveryEligible) {
+        return {
+          success: false,
+          error: `Manager task '${params.managerTaskId}' is untracked on the background job board`,
+          code: 'untracked_manager_task',
+        };
+      }
+
+      if (
+        params.managerGeneration === undefined ||
+        params.managerGeneration !== claim.managerGeneration
+      ) {
+        return {
+          success: false,
+          error: `Manager generation mismatch: expected ${claim.managerGeneration}, got ${params.managerGeneration}`,
+          code: 'generation_mismatch',
+        };
+      }
+
+      isBoardlessRecovery = true;
     }
 
     if (!this.#readChildSessionResult) {
@@ -1432,7 +1455,7 @@ export class OutcomeController {
         code: 'reader_unconfigured',
       };
     }
-    if (!this.#consumeManagerTask) {
+    if (!isBoardlessRecovery && !this.#consumeManagerTask) {
       return {
         success: false,
         error: 'Manager task consumer is not configured',
@@ -1474,7 +1497,7 @@ export class OutcomeController {
         };
       }
       if (
-        !this.#consumeManagerTask(
+        !this.#consumeManagerTask?.(
           rootSessionId,
           params.managerTaskId,
           claim.managerGeneration as number,
@@ -1506,7 +1529,7 @@ export class OutcomeController {
         };
       }
       if (
-        !this.#consumeManagerTask(
+        !this.#consumeManagerTask?.(
           rootSessionId,
           params.managerTaskId,
           claim.managerGeneration as number,
@@ -1599,20 +1622,22 @@ export class OutcomeController {
         `Malformed outcome review payload: ${parseResult.error}`.slice(0, 500);
     }
 
-    if (
-      !this.#consumeManagerTask(
-        rootSessionId,
-        params.managerTaskId,
-        claim.managerGeneration as number,
-      )
-    ) {
-      return {
-        success: false,
-        error: 'Manager task completion could not be consumed consistently',
-        code: 'manager_consumption_failed',
-      };
+    if (!isBoardlessRecovery) {
+      if (
+        !this.#consumeManagerTask?.(
+          rootSessionId,
+          params.managerTaskId,
+          claim.managerGeneration as number,
+        )
+      ) {
+        return {
+          success: false,
+          error: 'Manager task completion could not be consumed consistently',
+          code: 'manager_consumption_failed',
+        };
+      }
+      this.#consumedReviewDigests.set(reconciliationKey, resultDigest);
     }
-    this.#consumedReviewDigests.set(reconciliationKey, resultDigest);
 
     const reviewRes = this.#store.persistReconciledReview(
       rootSessionId,
