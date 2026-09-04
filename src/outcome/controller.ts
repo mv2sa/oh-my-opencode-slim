@@ -4,6 +4,7 @@ import {
   computeOutcomeAuthorizationDigest,
   computeOutcomeContractDigest,
   computeOutcomeEvidenceAttestationDigest,
+  computeOutcomeHandoffSupersessionDigest,
   type OutcomeActionRequired,
   type OutcomeAuthorizationReceipt,
   type OutcomeCheckpointClaim,
@@ -35,6 +36,7 @@ import {
   formatMisboundRetirementNote,
   OutcomeStore,
   type OutcomeStoreResult,
+  parseMisboundRetirementNote,
 } from './store';
 
 const CLAIM_SECRETS_SYMBOL = Symbol.for('omos.outcome.claim_secrets');
@@ -521,6 +523,20 @@ export interface OutcomeExternalHandoffResult {
   phase: OutcomePhase;
   instructions: string;
   expectedPostRestartCheck?: string;
+}
+
+export interface OutcomeSupersedeExternalHandoffParams {
+  reason: string;
+  waitReferenceId: string;
+  waitCreatedRevision: number;
+  waitOriginatingServerEpoch: string;
+  waitRestartObservedRevision: number;
+  expectedPostRestartCheck: string;
+  retiredCheckpointId: string;
+  retiredClaimGeneration: number;
+  sourceUserMessageReceiptId: string;
+  evidenceAttestationId: string;
+  replacementCandidateFingerprint: string;
 }
 
 export interface OutcomeProtocolUpdateResult {
@@ -2068,8 +2084,14 @@ export class OutcomeController {
       };
     }
     const result = this.#store.mutate(rootSessionId, record.revision, {
-      type: 'clear_wait',
-      referenceId: wait.referenceId,
+      type: 'complete_external_handoff',
+      waitReferenceId: wait.referenceId,
+      waitCreatedRevision: wait.createdRevision,
+      waitOriginatingServerEpoch: wait.originatingServerEpoch,
+      waitRestartObservedRevision: wait.restartObservedRevision,
+      expectedPostRestartCheck: wait.expectedPostRestartCheck,
+      sourceUserMessageReceiptId: params.sourceUserMessageReceiptId,
+      evidenceAttestationId: params.evidenceAttestationId,
     });
     return result.success
       ? {
@@ -2081,6 +2103,456 @@ export class OutcomeController {
           },
         }
       : { success: false, error: result.error.message, code: result.code };
+  }
+
+  async supersedeExternalHandoff(
+    rootSessionId: string,
+    params: OutcomeSupersedeExternalHandoffParams,
+  ): Promise<OutcomeControllerResult<OutcomeProtocolUpdateResult>> {
+    if (
+      !params.reason ||
+      typeof params.reason !== 'string' ||
+      params.reason.trim() === '' ||
+      params.reason.trim().length > 512
+    ) {
+      return {
+        success: false,
+        error:
+          'Supersession reason must be a non-empty string of at most 512 characters',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
+      !params.waitReferenceId ||
+      typeof params.waitReferenceId !== 'string' ||
+      params.waitReferenceId.trim() === ''
+    ) {
+      return {
+        success: false,
+        error: 'waitReferenceId must be a non-empty string',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
+      typeof params.waitCreatedRevision !== 'number' ||
+      !Number.isInteger(params.waitCreatedRevision) ||
+      params.waitCreatedRevision <= 0
+    ) {
+      return {
+        success: false,
+        error: 'waitCreatedRevision must be a positive integer',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
+      !params.waitOriginatingServerEpoch ||
+      typeof params.waitOriginatingServerEpoch !== 'string' ||
+      params.waitOriginatingServerEpoch.trim() === ''
+    ) {
+      return {
+        success: false,
+        error: 'waitOriginatingServerEpoch must be a non-empty string',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
+      typeof params.waitRestartObservedRevision !== 'number' ||
+      !Number.isInteger(params.waitRestartObservedRevision) ||
+      params.waitRestartObservedRevision <= params.waitCreatedRevision
+    ) {
+      return {
+        success: false,
+        error:
+          'waitRestartObservedRevision must be an integer greater than waitCreatedRevision',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
+      !params.expectedPostRestartCheck ||
+      typeof params.expectedPostRestartCheck !== 'string' ||
+      params.expectedPostRestartCheck.trim() === ''
+    ) {
+      return {
+        success: false,
+        error: 'expectedPostRestartCheck must be a non-empty string',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
+      !params.retiredCheckpointId ||
+      typeof params.retiredCheckpointId !== 'string' ||
+      params.retiredCheckpointId.trim() === ''
+    ) {
+      return {
+        success: false,
+        error: 'retiredCheckpointId must be a non-empty string',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
+      typeof params.retiredClaimGeneration !== 'number' ||
+      !Number.isInteger(params.retiredClaimGeneration) ||
+      params.retiredClaimGeneration <= 0
+    ) {
+      return {
+        success: false,
+        error: 'retiredClaimGeneration must be a positive integer',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
+      !params.sourceUserMessageReceiptId ||
+      typeof params.sourceUserMessageReceiptId !== 'string' ||
+      params.sourceUserMessageReceiptId.trim() === ''
+    ) {
+      return {
+        success: false,
+        error: 'sourceUserMessageReceiptId must be a non-empty string',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
+      !params.evidenceAttestationId ||
+      typeof params.evidenceAttestationId !== 'string' ||
+      params.evidenceAttestationId.trim() === ''
+    ) {
+      return {
+        success: false,
+        error: 'evidenceAttestationId must be a non-empty string',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
+      !params.replacementCandidateFingerprint ||
+      typeof params.replacementCandidateFingerprint !== 'string' ||
+      !/^sha256:[a-f0-9]{64}$/.test(params.replacementCandidateFingerprint)
+    ) {
+      return {
+        success: false,
+        error:
+          'replacementCandidateFingerprint must be a valid sha256:<64-hex> digest',
+        code: 'invalid_parameter',
+      };
+    }
+
+    const recRes = this.readRecord(rootSessionId);
+    if (!recRes.success) {
+      return { success: false, error: recRes.error.message, code: recRes.code };
+    }
+    const record = recRes.data;
+
+    // Check if already superseded (idempotent retry)
+    if (!record.waitCondition) {
+      const existing = record.receipts.handoffSupersessions?.find(
+        (entry) =>
+          entry.waitReferenceId === params.waitReferenceId &&
+          entry.waitCreatedRevision === params.waitCreatedRevision &&
+          entry.retiredCheckpointId === params.retiredCheckpointId &&
+          entry.retiredClaimGeneration === params.retiredClaimGeneration,
+      );
+      if (existing) {
+        if (!this.#readChildSessionResult) {
+          return {
+            success: false,
+            error:
+              'readChildSessionResult reader not configured on OutcomeController',
+            code: 'reader_unconfigured',
+          };
+        }
+        const sessionResult = await this.#readChildSessionResult(
+          existing.retiredManagerTaskId,
+        );
+        if (sessionResult?.terminal !== true || sessionResult.empty === true) {
+          return {
+            success: false,
+            error:
+              'Manager child session has not produced a non-empty terminal completed output',
+            code: 'result_not_terminal',
+          };
+        }
+        const authoritativeDigest = canonicalDigest(
+          'omos/manager-result/v1',
+          sessionResult.text,
+        );
+        const expectedDigest = computeOutcomeHandoffSupersessionDigest({
+          ...existing,
+          reason: params.reason,
+        });
+
+        if (
+          existing.waitOriginatingServerEpoch ===
+            params.waitOriginatingServerEpoch &&
+          existing.waitRestartObservedRevision ===
+            params.waitRestartObservedRevision &&
+          existing.expectedPostRestartCheck ===
+            params.expectedPostRestartCheck &&
+          existing.sourceUserMessageReceiptId ===
+            params.sourceUserMessageReceiptId &&
+          existing.evidenceAttestationId === params.evidenceAttestationId &&
+          existing.replacementCandidateFingerprint ===
+            params.replacementCandidateFingerprint &&
+          existing.reason.trim() === params.reason.trim() &&
+          existing.observedChildResultDigest === authoritativeDigest &&
+          existing.payloadDigest === expectedDigest
+        ) {
+          return {
+            success: true,
+            data: {
+              revision: record.revision,
+              phase: record.phase,
+              contractDigest: record.contractDigest,
+            },
+          };
+        }
+        return {
+          success: false,
+          error:
+            'External handoff was already superseded with different parameters',
+          code: 'invalid_transition',
+        };
+      }
+      return {
+        success: false,
+        error: 'No external handoff is waiting',
+        code: 'no_external_handoff',
+      };
+    }
+
+    const wait = record.waitCondition;
+    if (wait.kind !== 'external_handoff') {
+      return {
+        success: false,
+        error: 'Active wait condition is not an external handoff',
+        code: 'invalid_wait_kind',
+      };
+    }
+    if (wait.referenceId !== params.waitReferenceId) {
+      return {
+        success: false,
+        error: `Wait reference ID mismatch: expected '${wait.referenceId}', got '${params.waitReferenceId}'`,
+        code: 'wait_reference_mismatch',
+      };
+    }
+    if (wait.createdRevision !== params.waitCreatedRevision) {
+      return {
+        success: false,
+        error: `Wait created revision mismatch: expected ${wait.createdRevision}, got ${params.waitCreatedRevision}`,
+        code: 'wait_revision_mismatch',
+      };
+    }
+    if (wait.originatingServerEpoch !== params.waitOriginatingServerEpoch) {
+      return {
+        success: false,
+        error: `Wait originating server epoch mismatch: expected '${wait.originatingServerEpoch}', got '${params.waitOriginatingServerEpoch}'`,
+        code: 'wait_epoch_mismatch',
+      };
+    }
+    if (wait.restartObservedRevision !== params.waitRestartObservedRevision) {
+      return {
+        success: false,
+        error: `Wait restart observed revision mismatch: expected ${wait.restartObservedRevision}, got ${params.waitRestartObservedRevision}`,
+        code: 'restart_revision_mismatch',
+      };
+    }
+    if (wait.expectedPostRestartCheck !== params.expectedPostRestartCheck) {
+      return {
+        success: false,
+        error: `Wait expected post restart check mismatch: expected '${wait.expectedPostRestartCheck}', got '${params.expectedPostRestartCheck}'`,
+        code: 'expected_check_mismatch',
+      };
+    }
+    if (wait.originatingServerEpoch === this.#serverEpoch) {
+      return {
+        success: false,
+        error:
+          'Superseding external handoff requires a different Controller server epoch',
+        code: 'restart_not_observed',
+      };
+    }
+    if (!params.expectedPostRestartCheck.includes(params.retiredCheckpointId)) {
+      return {
+        success: false,
+        error: 'Expected post restart check must contain retired checkpoint ID',
+        code: 'checkpoint_not_in_expected_check',
+      };
+    }
+
+    const claim = record.checkpoint;
+    if (!claim) {
+      return {
+        success: false,
+        error: 'Missing retired checkpoint',
+        code: 'missing_checkpoint',
+      };
+    }
+    if (claim.checkpointId !== params.retiredCheckpointId) {
+      return {
+        success: false,
+        error: `Retired checkpoint ID mismatch: expected '${claim.checkpointId}', got '${params.retiredCheckpointId}'`,
+        code: 'checkpoint_mismatch',
+      };
+    }
+    if (claim.claimGeneration !== params.retiredClaimGeneration) {
+      return {
+        success: false,
+        error: `Retired claim generation mismatch: expected ${claim.claimGeneration}, got ${params.retiredClaimGeneration}`,
+        code: 'generation_mismatch',
+      };
+    }
+    if (claim.kind !== 'final') {
+      return {
+        success: false,
+        error: 'Superseded handoff requires a retired final checkpoint',
+        code: 'checkpoint_not_final',
+      };
+    }
+    if (claim.state !== 'retired') {
+      return {
+        success: false,
+        error: `Checkpoint state is '${claim.state}', expected 'retired'`,
+        code: 'checkpoint_not_retired',
+      };
+    }
+    if (
+      !claim.dispatchCallId ||
+      !claim.managerTaskId ||
+      claim.managerGeneration === undefined ||
+      !claim.resultDigest
+    ) {
+      return {
+        success: false,
+        error:
+          'Retired checkpoint lacks complete Manager identity or result digest',
+        code: 'incomplete_claim_identity',
+      };
+    }
+    if (!claim.recoveryNote) {
+      return {
+        success: false,
+        error: 'Retired checkpoint lacks recovery note',
+        code: 'missing_recovery_note',
+      };
+    }
+    const parsedNote = parseMisboundRetirementNote(claim.recoveryNote);
+    if (!parsedNote) {
+      return {
+        success: false,
+        error:
+          'Retired checkpoint lacks a valid misbound retirement audit note',
+        code: 'invalid_retirement_audit',
+      };
+    }
+    if (parsedNote.boundDigest !== claim.resultDigest) {
+      return {
+        success: false,
+        error: 'Audit bound digest does not match claim result digest',
+        code: 'audit_bound_digest_mismatch',
+      };
+    }
+    if (parsedNote.observedDigest === parsedNote.boundDigest) {
+      return {
+        success: false,
+        error: 'Audit observed digest must differ from bound digest',
+        code: 'audit_observed_digest_equals_bound',
+      };
+    }
+
+    if (!this.#readChildSessionResult) {
+      return {
+        success: false,
+        error:
+          'readChildSessionResult reader not configured on OutcomeController',
+        code: 'reader_unconfigured',
+      };
+    }
+    const sessionResult = await this.#readChildSessionResult(
+      claim.managerTaskId,
+    );
+    if (sessionResult?.terminal !== true || sessionResult.empty === true) {
+      return {
+        success: false,
+        error: `Manager child session '${claim.managerTaskId}' has not produced a non-empty terminal completed output`,
+        code: 'result_not_terminal',
+      };
+    }
+    const authoritativeDigest = canonicalDigest(
+      'omos/manager-result/v1',
+      sessionResult.text,
+    );
+    if (authoritativeDigest !== parsedNote.observedDigest) {
+      return {
+        success: false,
+        error:
+          'Controller-authoritative terminal child digest does not match audit observed digest',
+        code: 'authoritative_digest_mismatch',
+      };
+    }
+
+    const userReceipt = record.receipts.userMessages.find(
+      (entry) => entry.id === params.sourceUserMessageReceiptId,
+    );
+    if (
+      userReceipt?.provenance !== 'external_user' ||
+      userReceipt.createdRevision <= wait.restartObservedRevision ||
+      userReceipt.observedEpoch !== this.#serverEpoch
+    ) {
+      return {
+        success: false,
+        error:
+          'Superseding external handoff requires a fresh external_user receipt minted after restart observation in current epoch',
+        code: 'invalid_user_provenance',
+      };
+    }
+
+    const evidence = record.receipts.evidence.find(
+      (entry) => entry.id === params.evidenceAttestationId,
+    );
+    if (
+      evidence?.kind !== 'orchestrator_attestation' ||
+      evidence.createdRevision <= userReceipt.createdRevision ||
+      evidence.assertedStatus !== 'passed' ||
+      evidence.assertedFreshness !== 'fresh' ||
+      evidence.candidateFingerprint !== params.replacementCandidateFingerprint
+    ) {
+      return {
+        success: false,
+        error:
+          'Superseding external handoff requires fresh passed evidence minted after user receipt matching replacement candidate',
+        code: 'invalid_evidence_provenance',
+      };
+    }
+
+    const result = this.#store.mutate(rootSessionId, record.revision, {
+      type: 'supersede_external_handoff',
+      reason: params.reason,
+      waitReferenceId: params.waitReferenceId,
+      waitCreatedRevision: params.waitCreatedRevision,
+      waitOriginatingServerEpoch: params.waitOriginatingServerEpoch,
+      waitRestartObservedRevision: params.waitRestartObservedRevision,
+      expectedPostRestartCheck: params.expectedPostRestartCheck,
+      retiredCheckpointId: params.retiredCheckpointId,
+      retiredClaimGeneration: params.retiredClaimGeneration,
+      retiredDispatchCallId: claim.dispatchCallId,
+      retiredManagerTaskId: claim.managerTaskId,
+      retiredManagerGeneration: claim.managerGeneration,
+      retiredBoundResultDigest: parsedNote.boundDigest,
+      observedChildResultDigest: authoritativeDigest,
+      retiredReasonDigest: parsedNote.reasonDigest,
+      sourceUserMessageReceiptId: params.sourceUserMessageReceiptId,
+      evidenceAttestationId: params.evidenceAttestationId,
+      replacementCandidateFingerprint: params.replacementCandidateFingerprint,
+    });
+    if (!result.success) {
+      return { success: false, error: result.error.message, code: result.code };
+    }
+    return {
+      success: true,
+      data: {
+        revision: result.data.revision,
+        phase: result.data.phase,
+        contractDigest: result.data.contractDigest,
+      },
+    };
   }
 
   resolveAction(

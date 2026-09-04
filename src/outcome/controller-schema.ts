@@ -325,12 +325,47 @@ export type OutcomeAuthorizationReceipt = z.infer<
   typeof OutcomeAuthorizationReceiptSchema
 >;
 
+export const OutcomeHandoffSupersessionReceiptSchema = z
+  .object({
+    id: Id,
+    kind: z.literal('external_handoff_supersession'),
+    waitReferenceId: Id,
+    waitCreatedRevision: Revision,
+    waitOriginatingServerEpoch: Id,
+    waitRestartObservedRevision: Revision,
+    expectedPostRestartCheck: Text,
+    retiredCheckpointId: Id,
+    retiredClaimGeneration: z.number().int().positive(),
+    retiredDispatchCallId: Id,
+    retiredManagerTaskId: Id,
+    retiredManagerGeneration: z.number().int().positive(),
+    retiredBoundResultDigest: Digest,
+    observedChildResultDigest: Digest,
+    retiredReasonDigest: Digest,
+    sourceUserMessageReceiptId: Id,
+    evidenceAttestationId: Id,
+    replacementCandidateFingerprint: Digest,
+    reason: Text,
+    payloadDigest: Digest,
+    supersededAt: Timestamp,
+    supersededRevision: Revision,
+    serverEpoch: Id,
+  })
+  .strict();
+export type OutcomeHandoffSupersessionReceipt = z.infer<
+  typeof OutcomeHandoffSupersessionReceiptSchema
+>;
+
 export const OutcomeReceiptsSchema = z
   .object({
     evidence: z.array(OutcomeEvidenceEntrySchema).max(64),
     userMessages: z.array(OutcomeUserMessageReceiptSchema).max(32),
     decisions: z.array(OutcomeDecisionReceiptSchema).max(32),
     authorizations: z.array(OutcomeAuthorizationReceiptSchema).max(32),
+    handoffSupersessions: z
+      .array(OutcomeHandoffSupersessionReceiptSchema)
+      .max(16)
+      .default([]),
   })
   .strict();
 export type OutcomeReceipts = z.infer<typeof OutcomeReceiptsSchema>;
@@ -892,6 +927,56 @@ export function computeOutcomeAuthorizationDigest(
   });
 }
 
+export function computeOutcomeHandoffSupersessionDigest(input: {
+  id: string;
+  kind: 'external_handoff_supersession';
+  waitReferenceId: string;
+  waitCreatedRevision: number;
+  waitOriginatingServerEpoch: string;
+  waitRestartObservedRevision: number;
+  expectedPostRestartCheck: string;
+  retiredCheckpointId: string;
+  retiredClaimGeneration: number;
+  retiredDispatchCallId: string;
+  retiredManagerTaskId: string;
+  retiredManagerGeneration: number;
+  retiredBoundResultDigest: string;
+  observedChildResultDigest: string;
+  retiredReasonDigest: string;
+  sourceUserMessageReceiptId: string;
+  evidenceAttestationId: string;
+  replacementCandidateFingerprint: string;
+  reason: string;
+  supersededAt: number;
+  supersededRevision: number;
+  serverEpoch: string;
+}): string {
+  return canonicalDigest('omos/external-handoff-supersession/v1', {
+    id: input.id,
+    kind: input.kind,
+    waitReferenceId: input.waitReferenceId,
+    waitCreatedRevision: input.waitCreatedRevision,
+    waitOriginatingServerEpoch: input.waitOriginatingServerEpoch,
+    waitRestartObservedRevision: input.waitRestartObservedRevision,
+    expectedPostRestartCheck: input.expectedPostRestartCheck,
+    retiredCheckpointId: input.retiredCheckpointId,
+    retiredClaimGeneration: input.retiredClaimGeneration,
+    retiredDispatchCallId: input.retiredDispatchCallId,
+    retiredManagerTaskId: input.retiredManagerTaskId,
+    retiredManagerGeneration: input.retiredManagerGeneration,
+    retiredBoundResultDigest: input.retiredBoundResultDigest,
+    observedChildResultDigest: input.observedChildResultDigest,
+    retiredReasonDigest: input.retiredReasonDigest,
+    sourceUserMessageReceiptId: input.sourceUserMessageReceiptId,
+    evidenceAttestationId: input.evidenceAttestationId,
+    replacementCandidateFingerprint: input.replacementCandidateFingerprint,
+    reason: input.reason.trim(),
+    supersededAt: input.supersededAt,
+    supersededRevision: input.supersededRevision,
+    serverEpoch: input.serverEpoch,
+  });
+}
+
 export function computeOutcomeCheckpointFingerprint(
   claim: Pick<
     OutcomeCheckpointClaim,
@@ -1104,6 +1189,7 @@ export function normalizeRecordV1ToV2(v1: OutcomeRecordV1): OutcomeRecord {
       ...v1.receipts,
       userMessages,
       decisions,
+      handoffSupersessions: [],
     },
     reviewSummaries: v1.reviewSummaries,
     checkpoint,
@@ -1668,6 +1754,155 @@ function validateRecordRelations(
         ctx,
         ['checkpoint', 'checkpointId'],
         'Active kickoff checkpoint ID must match kickoff gate lastCheckpointId',
+      );
+    }
+  }
+
+  addDuplicateIssues(
+    record.receipts.handoffSupersessions ?? [],
+    'id',
+    ['receipts', 'handoffSupersessions'],
+    ctx,
+  );
+  const attestationsForSupersession = new Map(
+    record.receipts.evidence
+      .filter((entry) => entry.kind === 'orchestrator_attestation')
+      .map((entry) => [entry.id, entry]),
+  );
+  const userMessagesForSupersession = new Map(
+    record.receipts.userMessages.map((entry) => [entry.id, entry]),
+  );
+  for (const [index, supersession] of (
+    record.receipts.handoffSupersessions ?? []
+  ).entries()) {
+    if (supersession.supersededRevision > record.revision) {
+      issue(
+        ctx,
+        ['receipts', 'handoffSupersessions', index, 'supersededRevision'],
+        'Supersession revision is in the future',
+      );
+    }
+    const expectedDigest =
+      computeOutcomeHandoffSupersessionDigest(supersession);
+    if (supersession.payloadDigest !== expectedDigest) {
+      issue(
+        ctx,
+        ['receipts', 'handoffSupersessions', index, 'payloadDigest'],
+        'Supersession digest does not match its fields',
+      );
+    }
+    if (
+      !userMessagesForSupersession.has(supersession.sourceUserMessageReceiptId)
+    ) {
+      issue(
+        ctx,
+        [
+          'receipts',
+          'handoffSupersessions',
+          index,
+          'sourceUserMessageReceiptId',
+        ],
+        'Supersession references missing user message',
+      );
+    }
+    const userReceipt = userMessagesForSupersession.get(
+      supersession.sourceUserMessageReceiptId,
+    );
+    if (
+      userReceipt &&
+      (userReceipt.createdRevision <=
+        supersession.waitRestartObservedRevision ||
+        userReceipt.createdRevision > supersession.supersededRevision ||
+        userReceipt.provenance !== 'external_user' ||
+        userReceipt.observedEpoch !== supersession.serverEpoch)
+    ) {
+      issue(
+        ctx,
+        [
+          'receipts',
+          'handoffSupersessions',
+          index,
+          'sourceUserMessageReceiptId',
+        ],
+        'Supersession user receipt must be fresh external_user minted after restart observation in current epoch',
+      );
+    }
+    if (!attestationsForSupersession.has(supersession.evidenceAttestationId)) {
+      issue(
+        ctx,
+        ['receipts', 'handoffSupersessions', index, 'evidenceAttestationId'],
+        'Supersession references missing evidence attestation',
+      );
+    }
+    const evidence = attestationsForSupersession.get(
+      supersession.evidenceAttestationId,
+    );
+    if (
+      evidence &&
+      (evidence.createdRevision <= (userReceipt?.createdRevision ?? 0) ||
+        evidence.createdRevision > supersession.supersededRevision ||
+        evidence.assertedStatus !== 'passed' ||
+        evidence.assertedFreshness !== 'fresh' ||
+        evidence.candidateFingerprint !==
+          supersession.replacementCandidateFingerprint)
+    ) {
+      issue(
+        ctx,
+        ['receipts', 'handoffSupersessions', index, 'evidenceAttestationId'],
+        'Supersession evidence must be fresh passed attestation minted after user receipt matching replacement candidate',
+      );
+    }
+    if (
+      !supersession.expectedPostRestartCheck.includes(
+        supersession.retiredCheckpointId,
+      )
+    ) {
+      issue(
+        ctx,
+        ['receipts', 'handoffSupersessions', index, 'expectedPostRestartCheck'],
+        'Expected post restart check must contain retired checkpoint ID',
+      );
+    }
+    if (
+      supersession.waitRestartObservedRevision <=
+      supersession.waitCreatedRevision
+    ) {
+      issue(
+        ctx,
+        [
+          'receipts',
+          'handoffSupersessions',
+          index,
+          'waitRestartObservedRevision',
+        ],
+        'Restart observation must follow wait creation',
+      );
+    }
+    if (
+      supersession.observedChildResultDigest ===
+      supersession.retiredBoundResultDigest
+    ) {
+      issue(
+        ctx,
+        [
+          'receipts',
+          'handoffSupersessions',
+          index,
+          'observedChildResultDigest',
+        ],
+        'Superseded misbound result observed digest must differ from bound digest',
+      );
+    }
+    if (supersession.waitOriginatingServerEpoch === supersession.serverEpoch) {
+      issue(
+        ctx,
+        [
+          'receipts',
+          'handoffSupersessions',
+          index,
+          'waitOriginatingServerEpoch',
+        ],
+        'Superseded handoff originating epoch must differ from current epoch',
       );
     }
   }

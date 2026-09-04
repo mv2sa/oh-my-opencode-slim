@@ -65,6 +65,7 @@ Use this tool to establish durable outcome contracts (begin), open checkpoint re
           'expire_checkpoint',
           'reconcile_uncertain',
           'acknowledge_operation',
+          'supersede_external_handoff',
         ])
         .describe('Outcome control action to execute'),
       contract: z
@@ -185,6 +186,46 @@ Use this tool to establish durable outcome contracts (begin), open checkpoint re
       resolution: OutcomeControlResolutionSchema.optional().describe(
         'Resolution object for reconcile_uncertain',
       ),
+      waitReferenceId: z
+        .string()
+        .optional()
+        .describe('Wait reference ID for supersede_external_handoff'),
+      waitCreatedRevision: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Wait created revision for supersede_external_handoff'),
+      waitOriginatingServerEpoch: z
+        .string()
+        .optional()
+        .describe(
+          'Wait originating server epoch for supersede_external_handoff',
+        ),
+      waitRestartObservedRevision: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          'Wait restart observed revision for supersede_external_handoff',
+        ),
+      retiredCheckpointId: z
+        .string()
+        .optional()
+        .describe('Retired checkpoint ID for supersede_external_handoff'),
+      retiredClaimGeneration: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Retired claim generation for supersede_external_handoff'),
+      replacementCandidateFingerprint: z
+        .string()
+        .optional()
+        .describe(
+          'Replacement candidate fingerprint for supersede_external_handoff',
+        ),
     },
     async execute(args, toolContext) {
       const sessionID = toolContext?.sessionID;
@@ -460,6 +501,43 @@ Use this tool to establish durable outcome contracts (begin), open checkpoint re
           });
           if (!res.success) {
             throw new Error(`acknowledge_operation failed: ${res.error}`);
+          }
+          return JSON.stringify(res.data, null, 2);
+        }
+        case 'supersede_external_handoff': {
+          if (
+            !args.reason ||
+            !args.waitReferenceId ||
+            args.waitCreatedRevision === undefined ||
+            !args.waitOriginatingServerEpoch ||
+            args.waitRestartObservedRevision === undefined ||
+            !args.expectedPostRestartCheck ||
+            !args.retiredCheckpointId ||
+            args.retiredClaimGeneration === undefined ||
+            !args.sourceUserMessageReceiptId ||
+            !args.evidenceAttestationId ||
+            !args.replacementCandidateFingerprint
+          ) {
+            throw new Error(
+              'outcome_control action="supersede_external_handoff" requires reason, waitReferenceId, waitCreatedRevision, waitOriginatingServerEpoch, waitRestartObservedRevision, expectedPostRestartCheck, retiredCheckpointId, retiredClaimGeneration, sourceUserMessageReceiptId, evidenceAttestationId, and replacementCandidateFingerprint',
+            );
+          }
+          const res = await controller.supersedeExternalHandoff(sessionID, {
+            reason: args.reason,
+            waitReferenceId: args.waitReferenceId,
+            waitCreatedRevision: args.waitCreatedRevision,
+            waitOriginatingServerEpoch: args.waitOriginatingServerEpoch,
+            waitRestartObservedRevision: args.waitRestartObservedRevision,
+            expectedPostRestartCheck: args.expectedPostRestartCheck,
+            retiredCheckpointId: args.retiredCheckpointId,
+            retiredClaimGeneration: args.retiredClaimGeneration,
+            sourceUserMessageReceiptId: args.sourceUserMessageReceiptId,
+            evidenceAttestationId: args.evidenceAttestationId,
+            replacementCandidateFingerprint:
+              args.replacementCandidateFingerprint,
+          });
+          if (!res.success) {
+            throw new Error(`supersede_external_handoff failed: ${res.error}`);
           }
           return JSON.stringify(res.data, null, 2);
         }

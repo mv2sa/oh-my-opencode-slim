@@ -13,6 +13,7 @@ import {
   canonicalDigest,
   computeOutcomeCheckpointFingerprint,
   computeOutcomeContractDigest,
+  computeOutcomeHandoffSupersessionDigest,
   type OutcomeContract,
   OutcomeContractSchema,
 } from './controller-schema';
@@ -4994,6 +4995,512 @@ describe('OutcomeController service over frozen store', () => {
         },
       });
       expect(changedRetryRes.success).toBe(false);
+    });
+  });
+
+  describe('supersede_external_handoff dedicated stale handoff supersession', () => {
+    async function setupSupersessionFixture(
+      root: string,
+      options: {
+        oldEpoch?: string;
+        newEpoch?: string;
+        finalTaskId?: string;
+        callId?: string;
+      } = {},
+    ) {
+      const oldEpoch = options.oldEpoch ?? 'epoch_super_old';
+      const newEpoch = options.newEpoch ?? 'epoch_super_new';
+      const finalTaskId = options.finalTaskId ?? 'mgr_final_task';
+      const callId = options.callId ?? 'call_final_disp';
+
+      const oldController = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: oldEpoch,
+        getManagerTaskRecord: (id) => ({
+          taskID: id,
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'running',
+        }),
+      });
+
+      // 1. Kickoff
+      const beg = oldController.begin(root, testContract());
+      expect(beg.success).toBe(true);
+      if (!beg.success) throw new Error('begin failed');
+      const kCpId = beg.data.checkpoint?.checkpointId;
+      if (!kCpId) throw new Error('kCpId missing');
+      const kNudge = oldController.getPendingNudge(root);
+      if (kNudge?.kind !== 'dispatch')
+        throw new Error('dispatch nudge missing');
+      expect(
+        oldController.validateAndMarkDispatching(
+          root,
+          'call_k',
+          kNudge.instruction,
+        ).success,
+      ).toBe(true);
+      expect(
+        oldController.bindManagerTask(root, 'call_k', 'mgr_k', 1).success,
+      ).toBe(true);
+      const kReview = validReviewFor(oldController, root, 'CONTINUE');
+      const kText = `<outcome_review>\n${JSON.stringify(kReview, null, 2)}\n</outcome_review>`;
+      const kDigest = canonicalDigest('omos/manager-result/v1', kText);
+      const rec1 = oldController.readRecord(root);
+      expect(rec1.success).toBe(true);
+      if (!rec1.success) throw new Error('rec1 missing');
+      expect(
+        oldController.store.mutate(root, rec1.data.revision, {
+          type: 'mark_result_available',
+          checkpointId: kCpId,
+          claimGeneration: 1,
+          claimToken: kNudge.marker.claimToken,
+          resultDigest: kDigest,
+        }).success,
+      ).toBe(true);
+      const kOldController = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: oldEpoch,
+        getManagerTaskRecord: (id) => ({
+          taskID: id,
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: kText,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+      const kRec = await kOldController.reconcileReview(root, {
+        checkpointId: kCpId,
+        managerTaskId: 'mgr_k',
+        managerGeneration: 1,
+      });
+      expect(kRec.success).toBe(true);
+
+      // 2. Open final checkpoint
+      const finalFingerprint = hash('final_candidate_orig');
+      const finalCp = kOldController.checkpoint(root, {
+        kind: 'final',
+        reason: 'Final review',
+        candidateFingerprint: finalFingerprint,
+      });
+      expect(finalCp.success).toBe(true);
+      if (!finalCp.success) throw new Error('finalCp failed');
+      const finalCpId = finalCp.data.checkpointId;
+      const finalClaimGeneration = finalCp.data.claimGeneration;
+      const finalNudge = kOldController.getPendingNudge(root);
+      if (finalNudge?.kind !== 'dispatch')
+        throw new Error('finalNudge missing');
+      expect(
+        kOldController.validateAndMarkDispatching(
+          root,
+          callId,
+          finalNudge.instruction,
+        ).success,
+      ).toBe(true);
+      expect(
+        kOldController.bindManagerTask(root, callId, finalTaskId, 1).success,
+      ).toBe(true);
+
+      // 3. Set external handoff wait
+      const postRestartCheck = `Confirm ${finalCpId} completed after restart`;
+      const handoffRes = kOldController.externalHandoff(root, {
+        kind: 'restart_current_opencode',
+        reason: 'Restarting CLI',
+        expectedPostRestartCheck: postRestartCheck,
+      });
+      expect(handoffRes.success).toBe(true);
+
+      // 5. Reconcile final checkpoint to result_available with misbound digest
+      const reviewObj = validReviewFor(oldController, root, 'CONTINUE');
+      const visibleReviewText = `<outcome_review>\n${JSON.stringify(reviewObj, null, 2)}\n</outcome_review>`;
+      const reasoningText =
+        '<thinking>\nInternal draft reasoning trace\n</thinking>';
+      const boundDigest = canonicalDigest(
+        'omos/manager-result/v1',
+        visibleReviewText,
+      );
+      const childReaderOutput = `${reasoningText}\n\n${visibleReviewText}`;
+      const authoritativeChildDigest = canonicalDigest(
+        'omos/manager-result/v1',
+        childReaderOutput,
+      );
+
+      // 4. Process restart to newEpoch
+      const newController = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: childReaderOutput,
+          empty: false,
+          terminal: true,
+        }),
+      });
+      const recAfterRestart = newController.readRecord(root);
+      expect(recAfterRestart.success).toBe(true);
+      if (!recAfterRestart.success) throw new Error('recAfterRestart missing');
+      const wait = recAfterRestart.data.waitCondition;
+      if (!wait) throw new Error('wait missing');
+      expect(wait.restartObservedRevision).toBeDefined();
+
+      const rAvailRes = await newController.reconcileUncertain(root, {
+        checkpointId: finalCpId,
+        resolution: {
+          kind: 'result_available',
+          dispatchCallId: callId,
+          managerTaskId: finalTaskId,
+          managerGeneration: 1,
+          resultDigest: boundDigest,
+        },
+      });
+      expect(rAvailRes.success).toBe(true);
+
+      // 6. Retire misbound result
+      const retireRes = await newController.reconcileUncertain(root, {
+        checkpointId: finalCpId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Retiring misbound final checkpoint',
+          dispatchCallId: callId,
+          managerTaskId: finalTaskId,
+          managerGeneration: 1,
+          boundResultDigest: boundDigest,
+        },
+      });
+      expect(retireRes.success).toBe(true);
+
+      // 7. Observe user turn with provenance external_user
+      const userRes = newController.observeExternalUserTurn(
+        root,
+        'msg_post_restart_user',
+        'Resume work with replacement plan',
+      );
+      expect(userRes.success).toBe(true);
+      if (!userRes.success) throw new Error('user turn failed');
+      const sourceUserMessageReceiptId = userRes.data.receiptId;
+
+      // 8. Submit fresh passed replacement evidence
+      const replacementCandidate = hash('replacement_candidate_fingerprint');
+      const evRes = newController.submitEvidence(root, {
+        description: postRestartCheck,
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: replacementCandidate,
+      });
+      expect(evRes.success).toBe(true);
+      if (!evRes.success) throw new Error('evidence submission failed');
+      const evidenceAttestationId = evRes.data.attestationId;
+
+      if (
+        !wait.originatingServerEpoch ||
+        wait.restartObservedRevision === undefined
+      ) {
+        throw new Error('wait origin or restart observation missing');
+      }
+      const waitOriginatingServerEpoch = wait.originatingServerEpoch;
+      const waitRestartObservedRevision = wait.restartObservedRevision;
+
+      return {
+        oldController,
+        newController,
+        checkpointId: finalCpId,
+        retiredClaimGeneration: finalClaimGeneration,
+        finalTaskId,
+        callId,
+        boundDigest,
+        authoritativeChildDigest,
+        childReaderOutput,
+        visibleReviewText,
+        wait,
+        waitOriginatingServerEpoch,
+        waitRestartObservedRevision,
+        postRestartCheck,
+        sourceUserMessageReceiptId,
+        evidenceAttestationId,
+        replacementCandidate,
+        oldEpoch,
+        newEpoch,
+      };
+    }
+
+    test('full positive live regression through handoff, restart, retirement, evidence, supersession, and unblocking', async () => {
+      const root = 'ses_super_positive_live';
+      const setup = await setupSupersessionFixture(root);
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async (id) =>
+          id === setup.finalTaskId
+            ? { text: setup.childReaderOutput, empty: false, terminal: true }
+            : undefined,
+      });
+
+      const params = {
+        reason: 'Superseding stale external handoff after retirement',
+        waitReferenceId: setup.wait.referenceId,
+        waitCreatedRevision: setup.wait.createdRevision,
+        waitOriginatingServerEpoch: setup.waitOriginatingServerEpoch,
+        waitRestartObservedRevision: setup.waitRestartObservedRevision,
+        expectedPostRestartCheck: setup.postRestartCheck,
+        retiredCheckpointId: setup.checkpointId,
+        retiredClaimGeneration: setup.retiredClaimGeneration,
+        sourceUserMessageReceiptId: setup.sourceUserMessageReceiptId,
+        evidenceAttestationId: setup.evidenceAttestationId,
+        replacementCandidateFingerprint: setup.replacementCandidate,
+      };
+
+      const res = await controller.supersedeExternalHandoff(root, params);
+      expect(res.success).toBe(true);
+      if (!res.success) return;
+
+      const record = controller.readRecord(root);
+      expect(record.success).toBe(true);
+      if (!record.success) return;
+
+      // Assert wait is cleared
+      expect(record.data.waitCondition).toBeUndefined();
+
+      // Assert retired checkpoint is preserved unchanged
+      expect(record.data.checkpoint?.state).toBe('retired');
+      expect(record.data.checkpoint?.resultDigest).toBe(setup.boundDigest);
+
+      // Assert audit receipt is exact
+      expect(record.data.receipts.handoffSupersessions).toHaveLength(1);
+      const receipt = record.data.receipts.handoffSupersessions[0];
+      expect(receipt.waitReferenceId).toBe(setup.wait.referenceId);
+      expect(receipt.payloadDigest).toBe(
+        computeOutcomeHandoffSupersessionDigest(receipt),
+      );
+
+      // Assert phase is active
+      expect(record.data.phase).toBe('active');
+
+      // Assert fresh checkpoint and contract revision are now possible
+      const freshCpRes = controller.checkpoint(root, {
+        kind: 'decision',
+        reason: 'Fresh decision checkpoint after handoff supersession',
+      });
+      expect(freshCpRes.success).toBe(true);
+    });
+
+    test('fail-closed rejections for tuple mismatches, epoch, candidate, and child output', async () => {
+      const root = 'ses_super_fail_closed';
+      const setup = await setupSupersessionFixture(root);
+
+      let childResult:
+        | { text: string; empty: boolean; terminal: boolean }
+        | undefined = {
+        text: setup.childReaderOutput,
+        empty: false,
+        terminal: true,
+      };
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => childResult,
+      });
+
+      const baseParams = () => ({
+        reason: 'Superseding stale handoff',
+        waitReferenceId: setup.wait.referenceId,
+        waitCreatedRevision: setup.wait.createdRevision,
+        waitOriginatingServerEpoch: setup.waitOriginatingServerEpoch,
+        waitRestartObservedRevision: setup.waitRestartObservedRevision,
+        expectedPostRestartCheck: setup.postRestartCheck,
+        retiredCheckpointId: setup.checkpointId,
+        retiredClaimGeneration: setup.retiredClaimGeneration,
+        sourceUserMessageReceiptId: setup.sourceUserMessageReceiptId,
+        evidenceAttestationId: setup.evidenceAttestationId,
+        replacementCandidateFingerprint: setup.replacementCandidate,
+      });
+
+      // 1. Wait reference mismatch
+      const r1 = await controller.supersedeExternalHandoff(root, {
+        ...baseParams(),
+        waitReferenceId: 'wrong_ref',
+      });
+      expect(r1.success).toBe(false);
+      expect(r1.code).toBe('wait_reference_mismatch');
+
+      // 2. Wait created revision mismatch
+      const r2 = await controller.supersedeExternalHandoff(root, {
+        ...baseParams(),
+        waitCreatedRevision: setup.wait.createdRevision - 1,
+      });
+      expect(r2.success).toBe(false);
+      expect(r2.code).toBe('wait_revision_mismatch');
+
+      // 3. Wait originating epoch mismatch
+      const r3 = await controller.supersedeExternalHandoff(root, {
+        ...baseParams(),
+        waitOriginatingServerEpoch: 'wrong_epoch',
+      });
+      expect(r3.success).toBe(false);
+      expect(r3.code).toBe('wait_epoch_mismatch');
+
+      // 4. Expected check missing checkpoint ID
+      const r4 = await controller.supersedeExternalHandoff(root, {
+        ...baseParams(),
+        expectedPostRestartCheck: 'Confirm something else completed',
+      });
+      expect(r4.success).toBe(false);
+      expect(r4.code).toBe('expected_check_mismatch');
+
+      // 5. Retired checkpoint ID mismatch
+      const r5 = await controller.supersedeExternalHandoff(root, {
+        ...baseParams(),
+        retiredCheckpointId: 'wrong_chk_id',
+      });
+      expect(r5.success).toBe(false);
+      expect(r5.code).toBe('checkpoint_not_in_expected_check');
+
+      // 6. Replacement candidate fingerprint mismatch
+      const r6 = await controller.supersedeExternalHandoff(root, {
+        ...baseParams(),
+        replacementCandidateFingerprint: hash(
+          'different_candidate_fingerprint',
+        ),
+      });
+      expect(r6.success).toBe(false);
+      expect(r6.code).toBe('invalid_evidence_provenance');
+
+      // 7. Child result digest mismatch with audit observed digest
+      childResult = {
+        text: 'different text entirely',
+        empty: false,
+        terminal: true,
+      };
+      const r7 = await controller.supersedeExternalHandoff(root, baseParams());
+      expect(r7.success).toBe(false);
+      expect(r7.code).toBe('authoritative_digest_mismatch');
+
+      // 8. Child result nonterminal
+      childResult = {
+        text: setup.childReaderOutput,
+        empty: false,
+        terminal: false,
+      };
+      const r8 = await controller.supersedeExternalHandoff(root, baseParams());
+      expect(r8.success).toBe(false);
+      expect(r8.code).toBe('result_not_terminal');
+
+      // 9. Oversized reason (> 512 characters)
+      childResult = {
+        text: setup.childReaderOutput,
+        empty: false,
+        terminal: true,
+      };
+      const r9 = await controller.supersedeExternalHandoff(root, {
+        ...baseParams(),
+        reason: 'O'.repeat(513),
+      });
+      expect(r9.success).toBe(false);
+      expect(r9.code).toBe('invalid_parameter');
+    });
+
+    test('post-rename directory-fsync durability_uncertain allows exact retry and rejects changed fields', async () => {
+      const root = 'ses_super_durability_uncertain';
+      const setup = await setupSupersessionFixture(root);
+
+      let failNextDirectoryFsync = false;
+      const childText = setup.childReaderOutput;
+
+      const store = new OutcomeStore({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        filesystem: {
+          renameSync: (oldPath, newPath) => {
+            fs.renameSync(oldPath, newPath);
+            if (typeof newPath === 'string' && newPath.endsWith('.json')) {
+              failNextDirectoryFsync = true;
+            }
+          },
+          fsyncSync: (descriptor) => {
+            if (
+              failNextDirectoryFsync &&
+              fs.fstatSync(descriptor).isDirectory()
+            ) {
+              failNextDirectoryFsync = false;
+              throw new Error(
+                'injected directory fsync failure after supersession rename',
+              );
+            }
+            fs.fsyncSync(descriptor);
+          },
+        },
+      });
+
+      const controller = new OutcomeController({
+        store,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: childText,
+          empty: false,
+          terminal: true,
+        }),
+      });
+
+      const params = {
+        reason: 'Superseding stale external handoff with durability test',
+        waitReferenceId: setup.wait.referenceId,
+        waitCreatedRevision: setup.wait.createdRevision,
+        waitOriginatingServerEpoch: setup.waitOriginatingServerEpoch,
+        waitRestartObservedRevision: setup.waitRestartObservedRevision,
+        expectedPostRestartCheck: setup.postRestartCheck,
+        retiredCheckpointId: setup.checkpointId,
+        retiredClaimGeneration: setup.retiredClaimGeneration,
+        sourceUserMessageReceiptId: setup.sourceUserMessageReceiptId,
+        evidenceAttestationId: setup.evidenceAttestationId,
+        replacementCandidateFingerprint: setup.replacementCandidate,
+      };
+
+      // 1. First attempt fails with durability_uncertain after rename
+      const first = await controller.supersedeExternalHandoff(root, params);
+      expect(first.success).toBe(false);
+      expect(first.code).toBe('durability_uncertain');
+
+      // Durable state on disk has already cleared waitCondition and written receipt
+      const recOnDisk = controller.readRecord(root);
+      expect(recOnDisk.success).toBe(true);
+      if (!recOnDisk.success) return;
+      expect(recOnDisk.data.waitCondition).toBeUndefined();
+      expect(recOnDisk.data.receipts.handoffSupersessions).toHaveLength(1);
+
+      // 2. Exact retry succeeds idempotently
+      const retry = await controller.supersedeExternalHandoff(root, params);
+      expect(retry.success).toBe(true);
+
+      // No duplicate audit receipt written
+      const recAfterRetry = controller.readRecord(root);
+      expect(recAfterRetry.success).toBe(true);
+      if (!recAfterRetry.success) return;
+      expect(recAfterRetry.data.receipts.handoffSupersessions).toHaveLength(1);
+
+      // 3. Changed reason on retry fails
+      const changedReason = await controller.supersedeExternalHandoff(root, {
+        ...params,
+        reason: 'Changed reason on retry',
+      });
+      expect(changedReason.success).toBe(false);
+
+      // 4. Changed replacement candidate on retry fails
+      const changedCandidate = await controller.supersedeExternalHandoff(root, {
+        ...params,
+        replacementCandidateFingerprint: hash('other_candidate_retry'),
+      });
+      expect(changedCandidate.success).toBe(false);
     });
   });
 });

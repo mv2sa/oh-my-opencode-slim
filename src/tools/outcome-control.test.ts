@@ -784,4 +784,195 @@ describe('outcome_control tool', () => {
       );
     });
   });
+
+  describe('supersede_external_handoff tool action', () => {
+    test('strictly validates inputs and awaits controller.supersedeExternalHandoff', async () => {
+      const root = 'ses_root';
+      const oldEpoch = 'epoch_tool_sup_old';
+      const newEpoch = 'epoch_tool_sup_new';
+
+      const kReview = validKickoffReview(sampleContract(), 'CONTINUE');
+      const kText = `<outcome_review>\n${JSON.stringify(kReview, null, 2)}\n</outcome_review>`;
+
+      const oldCtrl = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: oldEpoch,
+        getManagerTaskRecord: (id) => ({
+          taskID: id,
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: kText,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+      const beginRes = oldCtrl.begin(root, sampleContract());
+      expect(beginRes.success).toBe(true);
+      const kCpId = beginRes.data.checkpoint.checkpointId;
+
+      // Authenticate kickoff
+      const kNudge = oldCtrl.getPendingNudge(root);
+      if (kNudge?.kind !== 'dispatch') throw new Error('nudge missing');
+      expect(
+        oldCtrl.validateAndMarkDispatching(root, 'call_k', kNudge.instruction)
+          .success,
+      ).toBe(true);
+      expect(oldCtrl.bindManagerTask(root, 'call_k', 'mgr_k', 1).success).toBe(
+        true,
+      );
+
+      const kRec = await oldCtrl.reconcileReview(root, {
+        checkpointId: kCpId,
+        managerTaskId: 'mgr_k',
+        managerGeneration: 1,
+      });
+      expect(kRec.success).toBe(true);
+
+      // Open final checkpoint
+      const finalCp = oldCtrl.checkpoint(root, {
+        kind: 'final',
+        reason: 'Final review',
+        candidateFingerprint: hash('candidate_f'),
+      });
+      expect(finalCp.success).toBe(true);
+      const finalCpId = finalCp.data.checkpointId;
+      const fNudge = oldCtrl.getPendingNudge(root);
+      if (fNudge?.kind !== 'dispatch') throw new Error('nudge missing');
+      expect(
+        oldCtrl.validateAndMarkDispatching(root, 'call_f', fNudge.instruction)
+          .success,
+      ).toBe(true);
+      expect(oldCtrl.bindManagerTask(root, 'call_f', 'mgr_f', 1).success).toBe(
+        true,
+      );
+
+      // Set external handoff wait
+      const postRestartCheck = `Confirm ${finalCpId} completed`;
+      expect(
+        oldCtrl.externalHandoff(root, {
+          kind: 'restart_current_opencode',
+          reason: 'Restarting CLI',
+          expectedPostRestartCheck: postRestartCheck,
+        }).success,
+      ).toBe(true);
+
+      // Restart to newEpoch
+      const visibleText = `<outcome_review>\n${JSON.stringify(validKickoffReview(sampleContract(), 'CONTINUE'), null, 2)}\n</outcome_review>`;
+      const childReaderOutput = `<thinking>\ntrace\n</thinking>\n\n${visibleText}`;
+      const boundDigest = canonicalDigest(
+        'omos/manager-result/v1',
+        visibleText,
+      );
+
+      const newCtrl = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: childReaderOutput,
+          empty: false,
+          terminal: true,
+        }),
+      });
+      const recRestart = newCtrl.readRecord(root);
+      expect(recRestart.success).toBe(true);
+      const wait = recRestart.data.waitCondition;
+      if (
+        !wait?.originatingServerEpoch ||
+        wait.restartObservedRevision === undefined
+      ) {
+        throw new Error('wait incomplete');
+      }
+
+      // Reconcile and retire misbound final checkpoint
+      await newCtrl.reconcileUncertain(root, {
+        checkpointId: finalCpId,
+        resolution: {
+          kind: 'result_available',
+          dispatchCallId: 'call_f',
+          managerTaskId: 'mgr_f',
+          managerGeneration: 1,
+          resultDigest: boundDigest,
+        },
+      });
+      await newCtrl.reconcileUncertain(root, {
+        checkpointId: finalCpId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Retiring misbound',
+          dispatchCallId: 'call_f',
+          managerTaskId: 'mgr_f',
+          managerGeneration: 1,
+          boundResultDigest: boundDigest,
+        },
+      });
+
+      // User turn
+      const userRes = newCtrl.observeExternalUserTurn(
+        root,
+        'msg_u_post',
+        'Continue work',
+      );
+      expect(userRes.success).toBe(true);
+
+      // Evidence
+      const repCandidate = hash('replacement_candidate');
+      const evRes = newCtrl.submitEvidence(root, {
+        description: postRestartCheck,
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: repCandidate,
+      });
+      expect(evRes.success).toBe(true);
+
+      const tool = createOutcomeControlTool({
+        controller: newCtrl,
+        shouldManageSession: (id) => id === root,
+      }).outcome_control;
+
+      const baseParams = {
+        action: 'supersede_external_handoff' as const,
+        reason: 'Superseding via tool',
+        waitReferenceId: wait.referenceId,
+        waitCreatedRevision: wait.createdRevision,
+        waitOriginatingServerEpoch: wait.originatingServerEpoch,
+        waitRestartObservedRevision: wait.restartObservedRevision,
+        expectedPostRestartCheck: postRestartCheck,
+        retiredCheckpointId: finalCpId,
+        retiredClaimGeneration: finalCp.data.claimGeneration,
+        sourceUserMessageReceiptId: userRes.data.receiptId,
+        evidenceAttestationId: evRes.data.attestationId,
+        replacementCandidateFingerprint: repCandidate,
+      };
+
+      // Missing reason throws
+      await expect(
+        tool.execute({ ...baseParams, reason: undefined as never }, {
+          sessionID: root,
+          agent: 'orchestrator',
+        } as never),
+      ).rejects.toThrow();
+
+      // Missing waitReferenceId throws
+      await expect(
+        tool.execute({ ...baseParams, waitReferenceId: undefined as never }, {
+          sessionID: root,
+          agent: 'orchestrator',
+        } as never),
+      ).rejects.toThrow();
+
+      // Successful tool execution
+      const toolOutput = await tool.execute(baseParams, {
+        sessionID: root,
+        agent: 'orchestrator',
+      } as never);
+      const parsed = JSON.parse(String(toolOutput));
+      expect(parsed.phase).toBe('active');
+    });
+  });
 });

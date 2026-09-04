@@ -7,6 +7,8 @@ import {
   computeOutcomeAuthorizationDigest,
   computeOutcomeCheckpointFingerprint,
   computeOutcomeContractDigest,
+  computeOutcomeEvidenceAttestationDigest,
+  computeOutcomeHandoffSupersessionDigest,
   initialActionArchiveChainDigest,
   MAX_OUTCOME_RECORD_BYTES,
   type OutcomeContract,
@@ -15,7 +17,11 @@ import {
   serializeOutcomeRecord,
 } from './controller-schema';
 import type { OutcomeReview } from './schema';
-import { OutcomeStore, type OutcomeStoreResult } from './store';
+import {
+  OutcomeStore,
+  type OutcomeStoreResult,
+  parseMisboundRetirementNote,
+} from './store';
 
 const hash = (value: string) => canonicalDigest('test/v1', value);
 
@@ -521,6 +527,8 @@ describe('OutcomeStore protocol and integrity', () => {
     legacyRecord.schemaVersion = 1;
     delete legacyRecord.kickoffGate;
     delete legacyRecord.resolvedActionArchive;
+    delete (legacyRecord.receipts as Record<string, unknown>)
+      .handoffSupersessions;
     const legacyReceipts = legacyRecord.receipts as {
       userMessages: Array<Record<string, unknown>>;
     };
@@ -4128,5 +4136,486 @@ describe('OutcomeStore protocol and integrity', () => {
     });
     expect(mismatchRetry.success).toBe(false);
     expect(mismatchRetry.code).toBe('invalid_transition');
+  });
+
+  test('supersede_external_handoff clears exact handoff, preserves retired final checkpoint, writes audit receipt, and prevents bypasses', () => {
+    const root = 'root_store_supersede';
+    const oldStore = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_handoff_old',
+      clock: () => 100,
+    });
+    expectSuccess(oldStore.init(root, { contract: contract() }));
+
+    // 1. Kickoff approved
+    openCheckpoint(oldStore, root, 1, 'token-k', 'kickoff');
+    completeReview(oldStore, root, 2, 'token-k', 'CONTINUE');
+
+    // 2. Final checkpoint opened
+    const finalCandidate = hash('final_cand_orig');
+    const openedFinal = openCheckpoint(oldStore, root, 6, 'token-f', 'final', {
+      candidateFingerprint: finalCandidate,
+    });
+    expectSuccess(
+      oldStore.mutate(root, 7, {
+        type: 'mark_dispatching',
+        checkpointId: openedFinal.claim.checkpointId,
+        claimGeneration: openedFinal.claim.claimGeneration,
+        claimToken: 'token-f',
+        dispatchCallId: 'call_final_orig',
+      }),
+    );
+    expectSuccess(
+      oldStore.mutate(root, 8, {
+        type: 'bind_manager',
+        checkpointId: openedFinal.claim.checkpointId,
+        claimGeneration: openedFinal.claim.claimGeneration,
+        claimToken: 'token-f',
+        managerTaskId: 'mgr_final_orig',
+        managerGeneration: 1,
+      }),
+    );
+
+    // 3. External handoff set
+    const postRestartCheck = `Confirm ${openedFinal.claim.checkpointId} completed`;
+    const setWaitRes = oldStore.mutate(root, 9, {
+      type: 'set_wait',
+      wait: {
+        kind: 'external_handoff',
+        referenceId: 'ext_restart',
+        reason: 'Restart requested',
+        createdAt: 150,
+        createdRevision: 10,
+        originatingServerEpoch: 'epoch_handoff_old',
+        instructions: 'Restart opencode',
+        expectedPostRestartCheck: postRestartCheck,
+      },
+    });
+    expectSuccess(setWaitRes);
+
+    // Hardened bypasses:
+    // a. set_wait cannot overwrite an unresolved wait
+    const overwriteWait = oldStore.mutate(root, 10, {
+      type: 'set_wait',
+      wait: {
+        kind: 'external_handoff',
+        referenceId: 'ext_restart_diff',
+        reason: 'Different restart',
+        createdAt: 160,
+        createdRevision: 11,
+        originatingServerEpoch: 'epoch_handoff_old',
+      },
+    });
+    expect(overwriteWait.success).toBe(false);
+
+    // Exact set_wait retry returns status 'noop'
+    const waitBeforeRetry = setWaitRes.data.waitCondition;
+    if (!waitBeforeRetry) throw new Error('wait missing');
+    const sameWaitRetry = oldStore.mutate(root, 10, {
+      type: 'set_wait',
+      wait: waitBeforeRetry,
+    });
+    expectSuccess(sameWaitRetry);
+    expect(sameWaitRetry.status).toBe('noop');
+
+    // b. generic clear_wait cannot clear external_handoff
+    const clearWaitBypass = oldStore.mutate(root, 10, {
+      type: 'clear_wait',
+      referenceId: 'ext_restart',
+    });
+    expect(clearWaitBypass.success).toBe(false);
+
+    // c. revise_contract cannot change contract while wait condition exists
+    const reviseBypass = oldStore.mutate(root, 10, {
+      type: 'revise_contract',
+      contract: contract({ constraints: ['Cannot bypass wait'] }),
+    });
+    expect(reviseBypass.success).toBe(false);
+
+    // 4. Process restart to epoch_handoff_new
+    const newStore = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_handoff_new',
+      clock: () => 200,
+    });
+    const recovered = newStore.recover(root);
+    expectSuccess(recovered);
+    const wait = recovered.data.waitCondition;
+    if (
+      !wait?.originatingServerEpoch ||
+      wait.restartObservedRevision === undefined ||
+      !wait.expectedPostRestartCheck
+    ) {
+      throw new Error('recovered wait condition incomplete');
+    }
+    expect(wait.restartObservedRevision).toBeDefined();
+
+    // Reconcile uncertain final checkpoint to result_available with misbound digest
+    const misboundDigest = hash('bound_misbound_digest');
+    expectSuccess(
+      newStore.mutate(root, recovered.revision, {
+        type: 'reconcile_uncertain_checkpoint',
+        checkpointId: openedFinal.claim.checkpointId,
+        claimGeneration: openedFinal.claim.claimGeneration,
+        resolution: {
+          kind: 'result_available',
+          dispatchCallId: 'call_final_orig',
+          managerTaskId: 'mgr_final_orig',
+          managerGeneration: 1,
+          resultDigest: misboundDigest,
+        },
+      }),
+    );
+
+    // Retire misbound result
+    const observedDigest = hash('observed_diff_digest');
+    const retireRes = newStore.mutate(root, recovered.revision + 1, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: openedFinal.claim.checkpointId,
+      claimGeneration: openedFinal.claim.claimGeneration,
+      dispatchCallId: 'call_final_orig',
+      managerTaskId: 'mgr_final_orig',
+      managerGeneration: 1,
+      boundResultDigest: misboundDigest,
+      observedResultDigest: observedDigest,
+      reason: 'Retiring misbound final result',
+    });
+    expectSuccess(retireRes);
+    expect(retireRes.data.checkpoint?.state).toBe('retired');
+
+    // Add external_user receipt in current epoch
+    const userReceiptRes = newStore.mutate(root, retireRes.revision, {
+      type: 'append_user_message',
+      receipt: {
+        id: 'msg_user_post_restart',
+        messageId: 'msg_user_h1',
+        contentDigest: hash('user_post_msg'),
+        provenance: 'external_user',
+        observedEpoch: 'epoch_handoff_new',
+        observedAt: 250,
+        createdRevision: retireRes.revision + 1,
+      },
+    });
+    expectSuccess(userReceiptRes);
+
+    // Add fresh passed orchestrator attestation with replacement candidate fingerprint
+    const replacementCandidate = hash('replacement_candidate_fingerprint');
+    const attestationId = 'att_post_restart_h1';
+    const attestationPayload: import('./controller-schema').OutcomeEvidenceAttestation =
+      {
+        id: attestationId,
+        kind: 'orchestrator_attestation',
+        description: 'Post restart replacement check',
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: replacementCandidate,
+        payloadDigest: '',
+        createdRevision: userReceiptRes.revision + 1,
+        createdAt: 260,
+      };
+    attestationPayload.payloadDigest =
+      computeOutcomeEvidenceAttestationDigest(attestationPayload);
+    const evidenceRes = newStore.mutate(root, userReceiptRes.revision, {
+      type: 'append_evidence',
+      entry: attestationPayload,
+    });
+    expectSuccess(evidenceRes);
+
+    const parsedAuditNote = parseMisboundRetirementNote(
+      retireRes.data.checkpoint?.recoveryNote ?? '',
+    );
+    if (!parsedAuditNote) throw new Error('parsed audit note missing');
+    const baseSupersedeParams = {
+      reason: 'Superseding stale external handoff after misbound retirement',
+      waitReferenceId: wait.referenceId,
+      waitCreatedRevision: wait.createdRevision,
+      waitOriginatingServerEpoch: wait.originatingServerEpoch,
+      waitRestartObservedRevision: wait.restartObservedRevision,
+      expectedPostRestartCheck: wait.expectedPostRestartCheck,
+      retiredCheckpointId: openedFinal.claim.checkpointId,
+      retiredClaimGeneration: openedFinal.claim.claimGeneration,
+      retiredDispatchCallId: 'call_final_orig',
+      retiredManagerTaskId: 'mgr_final_orig',
+      retiredManagerGeneration: 1,
+      retiredBoundResultDigest: misboundDigest,
+      observedChildResultDigest: observedDigest,
+      retiredReasonDigest: parsedAuditNote.reasonDigest,
+      sourceUserMessageReceiptId: 'msg_user_post_restart',
+      evidenceAttestationId: attestationId,
+      replacementCandidateFingerprint: replacementCandidate,
+    };
+
+    // Fail-closed checks:
+    // 1. Wrong waitReferenceId
+    expect(
+      newStore.mutate(root, evidenceRes.revision, {
+        type: 'supersede_external_handoff',
+        ...baseSupersedeParams,
+        waitReferenceId: 'wrong_ref',
+      }).success,
+    ).toBe(false);
+
+    // 2. Wrong retiredCheckpointId
+    expect(
+      newStore.mutate(root, evidenceRes.revision, {
+        type: 'supersede_external_handoff',
+        ...baseSupersedeParams,
+        retiredCheckpointId: 'wrong_cp',
+      }).success,
+    ).toBe(false);
+
+    // 3. Wrong observedChildResultDigest
+    expect(
+      newStore.mutate(root, evidenceRes.revision, {
+        type: 'supersede_external_handoff',
+        ...baseSupersedeParams,
+        observedChildResultDigest: hash('other_observed'),
+      }).success,
+    ).toBe(false);
+
+    // 4. Oversized reason (> 512 characters)
+    expect(
+      newStore.mutate(root, evidenceRes.revision, {
+        type: 'supersede_external_handoff',
+        ...baseSupersedeParams,
+        reason: 'x'.repeat(513),
+      }).success,
+    ).toBe(false);
+
+    // Successful supersede_external_handoff mutation
+    const supersedeRes = newStore.mutate(root, evidenceRes.revision, {
+      type: 'supersede_external_handoff',
+      ...baseSupersedeParams,
+    });
+    expectSuccess(supersedeRes);
+
+    const rec = supersedeRes.data;
+    expect(rec.waitCondition).toBeUndefined(); // Wait is cleared!
+    expect(rec.checkpoint?.state).toBe('retired'); // Retired checkpoint preserved!
+    expect(rec.checkpoint?.resultDigest).toBe(misboundDigest);
+    expect(rec.receipts.handoffSupersessions).toHaveLength(1);
+    expect(rec.receipts.handoffSupersessions[0].waitReferenceId).toBe(
+      wait.referenceId,
+    );
+    expect(rec.receipts.handoffSupersessions[0].payloadDigest).toBe(
+      computeOutcomeHandoffSupersessionDigest(
+        rec.receipts.handoffSupersessions[0],
+      ),
+    );
+    expect(rec.phase).toBe('active');
+
+    // Exact idempotent retry returns noop
+    const exactRetry = newStore.mutate(root, supersedeRes.revision, {
+      type: 'supersede_external_handoff',
+      ...baseSupersedeParams,
+    });
+    expectSuccess(exactRetry);
+    expect(exactRetry.status).toBe('noop');
+    expect(exactRetry.revision).toBe(supersedeRes.revision);
+
+    // Changed parameters on retry fails
+    const changedRetry = newStore.mutate(root, supersedeRes.revision, {
+      type: 'supersede_external_handoff',
+      ...baseSupersedeParams,
+      reason: 'Different reason on retry',
+    });
+    expect(changedRetry.success).toBe(false);
+
+    // Reload validation after opening a fresh checkpoint (replacing retired checkpoint)
+    const freshOpened = openCheckpoint(
+      newStore,
+      root,
+      supersedeRes.revision,
+      'token-fresh',
+      'decision',
+    );
+    expectSuccess(freshOpened.result);
+    const reloaded = newStore.read(root);
+    expectSuccess(reloaded);
+    expect(reloaded.data.checkpoint?.kind).toBe('decision');
+    expect(reloaded.data.checkpoint?.state).toBe('claimed');
+    expect(reloaded.data.receipts.handoffSupersessions).toHaveLength(1);
+
+    // Tamper tests for newly bound proof fields plus core provenance/candidate/epoch/revision fields
+    const validRaw = fs.readFileSync(newStore.recordPath(root), 'utf8');
+    const tamperFields: Array<[string, unknown]> = [
+      ['retiredDispatchCallId', 'call_tampered'],
+      ['retiredManagerTaskId', 'mgr_tampered'],
+      ['retiredManagerGeneration', 99],
+      ['retiredBoundResultDigest', hash('tampered_bound')],
+      ['observedChildResultDigest', hash('tampered_observed')],
+      ['retiredReasonDigest', hash('tampered_reason_digest')],
+      ['payloadDigest', hash('tampered_payload_digest')],
+      ['sourceUserMessageReceiptId', 'msg_missing_tampered'],
+      ['evidenceAttestationId', 'att_missing_tampered'],
+      ['replacementCandidateFingerprint', hash('tampered_candidate')],
+      ['supersededRevision', 999],
+      ['serverEpoch', 'epoch_tampered'],
+      ['waitRestartObservedRevision', 1],
+      ['expectedPostRestartCheck', 'tampered check without checkpoint id'],
+    ];
+    for (const [field, tamperedValue] of tamperFields) {
+      const tamperedJson = JSON.parse(validRaw);
+      tamperedJson.receipts.handoffSupersessions[0][field] = tamperedValue;
+      fs.writeFileSync(
+        newStore.recordPath(root),
+        `${JSON.stringify(tamperedJson, null, 2)}\n`,
+      );
+      const tamperedRead = newStore.read(root);
+      expect(tamperedRead.success).toBe(false);
+      expect(
+        ['corrupt', 'invalid_transition'].includes(tamperedRead.code as string),
+      ).toBe(true);
+    }
+    fs.writeFileSync(newStore.recordPath(root), validRaw);
+  });
+
+  test('complete_external_handoff direct-store mutation independently enforces restart/user/evidence checks under lock', () => {
+    const rootComp = 'root_store_complete_handoff_bypass';
+    const compStoreOld = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_comp_old',
+      clock: () => 100,
+    });
+    expectSuccess(compStoreOld.init(rootComp, { contract: contract() }));
+    const compWaitRes = compStoreOld.mutate(rootComp, 1, {
+      type: 'set_wait',
+      wait: {
+        kind: 'external_handoff',
+        referenceId: 'ext_comp',
+        reason: 'Restarting',
+        createdAt: 100,
+        createdRevision: 2,
+        originatingServerEpoch: 'epoch_comp_old',
+        expectedPostRestartCheck: 'Confirm restarted version',
+      },
+    });
+    expectSuccess(compWaitRes);
+
+    // Direct complete_external_handoff in SAME epoch is rejected
+    expect(
+      compStoreOld.mutate(rootComp, 2, {
+        type: 'complete_external_handoff',
+        waitReferenceId: 'ext_comp',
+        waitCreatedRevision: 2,
+        waitOriginatingServerEpoch: 'epoch_comp_old',
+        waitRestartObservedRevision: 3,
+        expectedPostRestartCheck: 'Confirm restarted version',
+        sourceUserMessageReceiptId: 'msg_none',
+        evidenceAttestationId: 'att_none',
+      }).success,
+    ).toBe(false);
+
+    // Restart to new epoch
+    const compStoreNew = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_comp_new',
+      clock: () => 200,
+    });
+    const compRecovered = compStoreNew.recover(rootComp);
+    expectSuccess(compRecovered);
+
+    // User receipt in new epoch
+    const compUser = compStoreNew.mutate(rootComp, compRecovered.revision, {
+      type: 'append_user_message',
+      receipt: {
+        id: 'msg_comp_u',
+        messageId: 'msg_comp_host',
+        contentDigest: hash('comp_u_content'),
+        provenance: 'external_user',
+        observedEpoch: 'epoch_comp_new',
+        observedAt: 250,
+        createdRevision: compRecovered.revision + 1,
+      },
+    });
+    expectSuccess(compUser);
+
+    // Evidence in new epoch
+    const compEvidencePayload: import('./controller-schema').OutcomeEvidenceAttestation =
+      {
+        id: 'att_comp_ev',
+        kind: 'orchestrator_attestation',
+        description: 'Confirm restarted version',
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: hash('comp_cand'),
+        payloadDigest: '',
+        createdRevision: compUser.revision + 1,
+        createdAt: 260,
+      };
+    compEvidencePayload.payloadDigest =
+      computeOutcomeEvidenceAttestationDigest(compEvidencePayload);
+    const compEvidence = compStoreNew.mutate(rootComp, compUser.revision, {
+      type: 'append_evidence',
+      entry: compEvidencePayload,
+    });
+    expectSuccess(compEvidence);
+
+    const compWait = compRecovered.data.waitCondition;
+    if (!compWait?.restartObservedRevision) {
+      throw new Error('wait restart observation missing');
+    }
+
+    const compValidParams = {
+      type: 'complete_external_handoff' as const,
+      waitReferenceId: 'ext_comp',
+      waitCreatedRevision: 2,
+      waitOriginatingServerEpoch: 'epoch_comp_old',
+      waitRestartObservedRevision: compWait.restartObservedRevision,
+      expectedPostRestartCheck: 'Confirm restarted version',
+      sourceUserMessageReceiptId: 'msg_comp_u',
+      evidenceAttestationId: 'att_comp_ev',
+    };
+
+    // Direct-store bypass rejections:
+    // 1. Wrong waitReferenceId
+    expect(
+      compStoreNew.mutate(rootComp, compEvidence.revision, {
+        ...compValidParams,
+        waitReferenceId: 'wrong_ref',
+      }).success,
+    ).toBe(false);
+
+    // 2. Wrong waitCreatedRevision
+    expect(
+      compStoreNew.mutate(rootComp, compEvidence.revision, {
+        ...compValidParams,
+        waitCreatedRevision: 99,
+      }).success,
+    ).toBe(false);
+
+    // 3. Wrong originating epoch
+    expect(
+      compStoreNew.mutate(rootComp, compEvidence.revision, {
+        ...compValidParams,
+        waitOriginatingServerEpoch: 'wrong_epoch',
+      }).success,
+    ).toBe(false);
+
+    // 4. Missing/invalid user receipt
+    expect(
+      compStoreNew.mutate(rootComp, compEvidence.revision, {
+        ...compValidParams,
+        sourceUserMessageReceiptId: 'msg_wrong',
+      }).success,
+    ).toBe(false);
+
+    // 5. Missing/invalid evidence
+    expect(
+      compStoreNew.mutate(rootComp, compEvidence.revision, {
+        ...compValidParams,
+        evidenceAttestationId: 'att_wrong',
+      }).success,
+    ).toBe(false);
+
+    // Valid direct completion succeeds and clears wait
+    const compSuccess = compStoreNew.mutate(
+      rootComp,
+      compEvidence.revision,
+      compValidParams,
+    );
+    expectSuccess(compSuccess);
+    expect(compSuccess.data.waitCondition).toBeUndefined();
+    expect(compSuccess.data.phase).toBe('active');
   });
 });

@@ -9,6 +9,7 @@ import {
   computeOutcomeAuthorizationDigest,
   computeOutcomeCheckpointFingerprint,
   computeOutcomeContractDigest,
+  computeOutcomeHandoffSupersessionDigest,
   initialActionArchiveChainDigest,
   MAX_OUTCOME_RECORD_BYTES,
   OUTCOME_RECORD_SCHEMA,
@@ -21,6 +22,7 @@ import {
   type OutcomeDecisionReceipt,
   type OutcomeEvidenceEntry,
   type OutcomeFinalCertificate,
+  type OutcomeHandoffSupersessionReceipt,
   type OutcomeKickoffGate,
   type OutcomeManagerReviewSummary,
   type OutcomePendingOperation,
@@ -255,6 +257,36 @@ export type OutcomeRecordMutation =
       observedResultDigest: string;
       reason: string;
     }
+  | {
+      type: 'complete_external_handoff';
+      waitReferenceId: string;
+      waitCreatedRevision: number;
+      waitOriginatingServerEpoch: string;
+      waitRestartObservedRevision: number;
+      expectedPostRestartCheck?: string;
+      sourceUserMessageReceiptId: string;
+      evidenceAttestationId: string;
+    }
+  | {
+      type: 'supersede_external_handoff';
+      reason: string;
+      waitReferenceId: string;
+      waitCreatedRevision: number;
+      waitOriginatingServerEpoch: string;
+      waitRestartObservedRevision: number;
+      expectedPostRestartCheck: string;
+      retiredCheckpointId: string;
+      retiredClaimGeneration: number;
+      retiredDispatchCallId: string;
+      retiredManagerTaskId: string;
+      retiredManagerGeneration: number;
+      retiredBoundResultDigest: string;
+      observedChildResultDigest: string;
+      retiredReasonDigest: string;
+      sourceUserMessageReceiptId: string;
+      evidenceAttestationId: string;
+      replacementCandidateFingerprint: string;
+    }
   | { type: 'append_action'; action: OutcomeActionRequired }
   | {
       type: 'resolve_action';
@@ -299,6 +331,22 @@ export function formatMisboundRetirementNote(
       ? normalizedReason.slice(0, remaining)
       : normalizedReason;
   return `${prefix}${trailingReason}`;
+}
+
+export function parseMisboundRetirementNote(note: string): {
+  boundDigest: string;
+  observedDigest: string;
+  reasonDigest: string;
+} | null {
+  const match = note.match(
+    /^Misbound result retired \[bound=(sha256:[a-f0-9]{64}) observed=(sha256:[a-f0-9]{64}) reason=(sha256:[a-f0-9]{64})\]:/,
+  );
+  if (!match) return null;
+  return {
+    boundDigest: match[1],
+    observedDigest: match[2],
+    reasonDigest: match[3],
+  };
 }
 
 interface LockOwner {
@@ -427,6 +475,7 @@ export class OutcomeStore {
           userMessages: [],
           decisions: [],
           authorizations: [],
+          handoffSupersessions: [],
         },
         reviewSummaries: [],
         operations: [],
@@ -591,6 +640,85 @@ export class OutcomeStore {
               { rootSessionId: session },
             ),
           );
+        }
+      } else if (mutation.type === 'set_wait') {
+        if (current.waitCondition && mutation.wait) {
+          const currentWaitDigest = canonicalDigest(
+            'omos/outcome-wait/v1',
+            current.waitCondition,
+          );
+          const nextWaitDigest = canonicalDigest(
+            'omos/outcome-wait/v1',
+            mutation.wait,
+          );
+          if (currentWaitDigest === nextWaitDigest) {
+            return {
+              success: true,
+              data: current,
+              revision: current.revision,
+              status: 'noop',
+            };
+          }
+        }
+      } else if (mutation.type === 'supersede_external_handoff') {
+        if (current.waitCondition === undefined) {
+          const existing = current.receipts.handoffSupersessions?.find(
+            (entry) =>
+              entry.waitReferenceId === mutation.waitReferenceId &&
+              entry.waitCreatedRevision === mutation.waitCreatedRevision &&
+              entry.retiredCheckpointId === mutation.retiredCheckpointId &&
+              entry.retiredClaimGeneration === mutation.retiredClaimGeneration,
+          );
+          if (existing) {
+            const expectedDigest = computeOutcomeHandoffSupersessionDigest({
+              ...mutation,
+              id: existing.id,
+              kind: existing.kind,
+              supersededAt: existing.supersededAt,
+              supersededRevision: existing.supersededRevision,
+              serverEpoch: existing.serverEpoch,
+            });
+            if (
+              existing.waitOriginatingServerEpoch ===
+                mutation.waitOriginatingServerEpoch &&
+              existing.waitRestartObservedRevision ===
+                mutation.waitRestartObservedRevision &&
+              existing.expectedPostRestartCheck ===
+                mutation.expectedPostRestartCheck &&
+              existing.retiredDispatchCallId ===
+                mutation.retiredDispatchCallId &&
+              existing.retiredManagerTaskId === mutation.retiredManagerTaskId &&
+              existing.retiredManagerGeneration ===
+                mutation.retiredManagerGeneration &&
+              existing.retiredBoundResultDigest ===
+                mutation.retiredBoundResultDigest &&
+              existing.observedChildResultDigest ===
+                mutation.observedChildResultDigest &&
+              existing.retiredReasonDigest === mutation.retiredReasonDigest &&
+              existing.sourceUserMessageReceiptId ===
+                mutation.sourceUserMessageReceiptId &&
+              existing.evidenceAttestationId ===
+                mutation.evidenceAttestationId &&
+              existing.replacementCandidateFingerprint ===
+                mutation.replacementCandidateFingerprint &&
+              existing.reason.trim() === mutation.reason.trim() &&
+              existing.payloadDigest === expectedDigest
+            ) {
+              return {
+                success: true,
+                data: current,
+                revision: current.revision,
+                status: 'noop',
+              };
+            }
+            return failure(
+              new OutcomeStoreError(
+                'invalid_transition',
+                'External handoff was already superseded with different parameters',
+                { rootSessionId: session },
+              ),
+            );
+          }
         }
       }
 
@@ -1329,6 +1457,8 @@ function applyMutation(
   let next = structuredClone(current);
   switch (mutation.type) {
     case 'revise_contract': {
+      if (current.waitCondition)
+        throw new Error('Contract cannot change while a wait condition exists');
       if (current.checkpoint && !isReviewed(current.checkpoint.state))
         throw new Error('Contract cannot change while a checkpoint exists');
       const contract = OutcomeContractSchema.parse(mutation.contract);
@@ -1979,6 +2109,8 @@ function applyMutation(
     }
     case 'set_wait':
       if (!mutation.wait) throw new Error('Wait condition is required');
+      if (current.waitCondition)
+        throw new Error('Cannot replace unresolved wait condition');
       if (mutation.wait.createdRevision !== revision)
         throw new Error(
           'Wait createdRevision must equal its persisted revision',
@@ -1990,11 +2122,279 @@ function applyMutation(
           : 'waiting_external';
       break;
     case 'clear_wait':
+      if (next.waitCondition?.kind === 'external_handoff')
+        throw new Error('Generic clear_wait cannot clear external_handoff');
       if (next.waitCondition?.referenceId !== mutation.referenceId)
         throw new Error('Wait reference mismatch');
       delete next.waitCondition;
       next.phase = 'active';
       break;
+    case 'complete_external_handoff': {
+      if (!next.waitCondition) {
+        throw new Error('No wait condition to complete');
+      }
+      if (next.waitCondition.kind !== 'external_handoff') {
+        throw new Error('Wait condition is not an external handoff');
+      }
+      const wait = next.waitCondition;
+      if (wait.referenceId !== mutation.waitReferenceId) {
+        throw new Error('Wait reference ID mismatch');
+      }
+      if (wait.createdRevision !== mutation.waitCreatedRevision) {
+        throw new Error('Wait created revision mismatch');
+      }
+      if (wait.originatingServerEpoch !== mutation.waitOriginatingServerEpoch) {
+        throw new Error('Wait originating server epoch mismatch');
+      }
+      if (
+        wait.restartObservedRevision !== mutation.waitRestartObservedRevision
+      ) {
+        throw new Error('Wait restart observed revision mismatch');
+      }
+      if (wait.expectedPostRestartCheck !== mutation.expectedPostRestartCheck) {
+        throw new Error('Wait expected post restart check mismatch');
+      }
+      if (wait.originatingServerEpoch === epoch) {
+        throw new Error(
+          'External handoff completion requires a different Controller server epoch',
+        );
+      }
+      if (
+        wait.restartObservedRevision === undefined ||
+        wait.restartObservedRevision <= wait.createdRevision
+      ) {
+        throw new Error('Wait restart observation must follow creation');
+      }
+
+      const userReceipt = next.receipts.userMessages.find(
+        (entry) => entry.id === mutation.sourceUserMessageReceiptId,
+      );
+      if (
+        userReceipt?.provenance !== 'external_user' ||
+        userReceipt.createdRevision <= wait.restartObservedRevision ||
+        userReceipt.createdRevision > revision ||
+        userReceipt.observedEpoch !== epoch
+      ) {
+        throw new Error(
+          'External handoff completion requires a subsequent external_user receipt in current epoch',
+        );
+      }
+
+      const evidence = next.receipts.evidence.find(
+        (entry) => entry.id === mutation.evidenceAttestationId,
+      );
+      if (
+        evidence?.kind !== 'orchestrator_attestation' ||
+        evidence.createdRevision <= wait.restartObservedRevision ||
+        evidence.createdRevision <= userReceipt.createdRevision ||
+        evidence.createdRevision > revision ||
+        evidence.assertedStatus !== 'passed' ||
+        evidence.assertedFreshness !== 'fresh' ||
+        (wait.expectedPostRestartCheck &&
+          evidence.description !== wait.expectedPostRestartCheck)
+      ) {
+        throw new Error(
+          'External handoff completion requires matching fresh passed post-restart evidence',
+        );
+      }
+
+      delete next.waitCondition;
+      next.phase = 'active';
+      break;
+    }
+    case 'supersede_external_handoff': {
+      if (!next.waitCondition) {
+        throw new Error('No wait condition to supersede');
+      }
+      if (next.waitCondition.kind !== 'external_handoff') {
+        throw new Error('Wait condition is not an external handoff');
+      }
+      const wait = next.waitCondition;
+      if (wait.referenceId !== mutation.waitReferenceId) {
+        throw new Error('Wait reference ID mismatch');
+      }
+      if (wait.createdRevision !== mutation.waitCreatedRevision) {
+        throw new Error('Wait created revision mismatch');
+      }
+      if (wait.originatingServerEpoch !== mutation.waitOriginatingServerEpoch) {
+        throw new Error('Wait originating server epoch mismatch');
+      }
+      if (
+        wait.restartObservedRevision !== mutation.waitRestartObservedRevision
+      ) {
+        throw new Error('Wait restart observed revision mismatch');
+      }
+      if (wait.expectedPostRestartCheck !== mutation.expectedPostRestartCheck) {
+        throw new Error('Wait expected post restart check mismatch');
+      }
+      if (wait.originatingServerEpoch === epoch) {
+        throw new Error(
+          'Superseding external handoff requires a different current server epoch',
+        );
+      }
+      if (
+        wait.restartObservedRevision === undefined ||
+        wait.restartObservedRevision <= wait.createdRevision
+      ) {
+        throw new Error('Wait restart observation must follow creation');
+      }
+      if (
+        !mutation.expectedPostRestartCheck.includes(
+          mutation.retiredCheckpointId,
+        )
+      ) {
+        throw new Error(
+          'Expected post restart check must contain retired checkpoint ID',
+        );
+      }
+
+      if (!next.checkpoint) {
+        throw new Error('Missing retired checkpoint');
+      }
+      const claim = next.checkpoint;
+      if (claim.checkpointId !== mutation.retiredCheckpointId) {
+        throw new Error('Retired checkpoint ID mismatch');
+      }
+      if (claim.claimGeneration !== mutation.retiredClaimGeneration) {
+        throw new Error('Retired claim generation mismatch');
+      }
+      if (claim.kind !== 'final') {
+        throw new Error(
+          'Superseded handoff requires a retired final checkpoint',
+        );
+      }
+      if (claim.state !== 'retired') {
+        throw new Error(
+          'Checkpoint must be retired to supersede external handoff',
+        );
+      }
+      if (
+        !claim.dispatchCallId ||
+        !claim.managerTaskId ||
+        claim.managerGeneration === undefined ||
+        !claim.resultDigest
+      ) {
+        throw new Error(
+          'Retired checkpoint lacks complete Manager identity or result digest',
+        );
+      }
+      if (claim.dispatchCallId !== mutation.retiredDispatchCallId) {
+        throw new Error('Retired dispatch call ID mismatch');
+      }
+      if (claim.managerTaskId !== mutation.retiredManagerTaskId) {
+        throw new Error('Retired manager task ID mismatch');
+      }
+      if (claim.managerGeneration !== mutation.retiredManagerGeneration) {
+        throw new Error('Retired manager generation mismatch');
+      }
+      if (claim.resultDigest !== mutation.retiredBoundResultDigest) {
+        throw new Error('Retired bound result digest mismatch');
+      }
+      if (!claim.recoveryNote) {
+        throw new Error('Retired checkpoint lacks recovery note');
+      }
+      const parsedNote = parseMisboundRetirementNote(claim.recoveryNote);
+      if (!parsedNote) {
+        throw new Error(
+          'Retired checkpoint lacks a valid misbound retirement audit note',
+        );
+      }
+      if (parsedNote.boundDigest !== claim.resultDigest) {
+        throw new Error(
+          'Audit bound digest does not match claim result digest',
+        );
+      }
+      if (parsedNote.observedDigest === parsedNote.boundDigest) {
+        throw new Error('Audit observed digest must differ from bound digest');
+      }
+      if (parsedNote.reasonDigest !== mutation.retiredReasonDigest) {
+        throw new Error('Audit reason digest mismatch');
+      }
+      if (mutation.observedChildResultDigest !== parsedNote.observedDigest) {
+        throw new Error(
+          'Authoritative child result digest does not match audit observed digest',
+        );
+      }
+
+      const userReceipt = next.receipts.userMessages.find(
+        (entry) => entry.id === mutation.sourceUserMessageReceiptId,
+      );
+      if (
+        userReceipt?.provenance !== 'external_user' ||
+        userReceipt.createdRevision <= wait.restartObservedRevision ||
+        userReceipt.createdRevision > revision ||
+        userReceipt.observedEpoch !== epoch
+      ) {
+        throw new Error(
+          'Superseding external handoff requires a fresh external_user receipt minted after restart observation in current epoch',
+        );
+      }
+
+      const evidence = next.receipts.evidence.find(
+        (entry) => entry.id === mutation.evidenceAttestationId,
+      );
+      if (
+        evidence?.kind !== 'orchestrator_attestation' ||
+        evidence.createdRevision <= userReceipt.createdRevision ||
+        evidence.createdRevision > revision ||
+        evidence.assertedStatus !== 'passed' ||
+        evidence.assertedFreshness !== 'fresh' ||
+        evidence.candidateFingerprint !==
+          mutation.replacementCandidateFingerprint
+      ) {
+        throw new Error(
+          'Superseding external handoff requires fresh passed evidence minted after user receipt matching replacement candidate',
+        );
+      }
+
+      if (
+        !mutation.reason ||
+        typeof mutation.reason !== 'string' ||
+        mutation.reason.trim() === ''
+      ) {
+        throw new Error('Supersession reason must be a non-empty string');
+      }
+      const trimmedReason = mutation.reason.trim();
+      if (trimmedReason.length > 512) {
+        throw new Error(
+          'Supersession reason exceeds maximum length of 512 characters',
+        );
+      }
+
+      delete next.waitCondition;
+      const receipt: OutcomeHandoffSupersessionReceipt = {
+        id: `sup_${randomId().replace(/-/g, '').slice(0, 16)}`,
+        kind: 'external_handoff_supersession',
+        waitReferenceId: mutation.waitReferenceId,
+        waitCreatedRevision: mutation.waitCreatedRevision,
+        waitOriginatingServerEpoch: mutation.waitOriginatingServerEpoch,
+        waitRestartObservedRevision: mutation.waitRestartObservedRevision,
+        expectedPostRestartCheck: mutation.expectedPostRestartCheck,
+        retiredCheckpointId: mutation.retiredCheckpointId,
+        retiredClaimGeneration: mutation.retiredClaimGeneration,
+        retiredDispatchCallId: mutation.retiredDispatchCallId,
+        retiredManagerTaskId: mutation.retiredManagerTaskId,
+        retiredManagerGeneration: mutation.retiredManagerGeneration,
+        retiredBoundResultDigest: mutation.retiredBoundResultDigest,
+        observedChildResultDigest: mutation.observedChildResultDigest,
+        retiredReasonDigest: mutation.retiredReasonDigest,
+        sourceUserMessageReceiptId: mutation.sourceUserMessageReceiptId,
+        evidenceAttestationId: mutation.evidenceAttestationId,
+        replacementCandidateFingerprint:
+          mutation.replacementCandidateFingerprint,
+        reason: trimmedReason,
+        payloadDigest: '',
+        supersededAt: now,
+        supersededRevision: revision,
+        serverEpoch: epoch,
+      };
+      receipt.payloadDigest = computeOutcomeHandoffSupersessionDigest(receipt);
+      next.receipts.handoffSupersessions = [
+        ...(next.receipts.handoffSupersessions ?? []),
+        receipt,
+      ];
+      break;
+    }
     case 'start_operation':
       compactUnreferencedToolHistory(next);
       if (
