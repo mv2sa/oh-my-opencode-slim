@@ -542,4 +542,246 @@ describe('outcome_control tool', () => {
       ),
     ).rejects.toThrow('Repository waiver reference must contain');
   });
+
+  describe('reconcile_uncertain tool action', () => {
+    test('strictly validates resolution variant and successfully awaits retire_misbound_result', async () => {
+      const root = 'ses_root';
+      const oldEpoch = 'epoch_tool_old';
+      const newEpoch = 'epoch_tool_new';
+
+      const oldController = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: oldEpoch,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_tool_task',
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'running',
+        }),
+      });
+      const beginRes = oldController.begin(root, sampleContract());
+      expect(beginRes.success).toBe(true);
+      const checkpointId = beginRes.data.checkpoint.checkpointId;
+
+      const nudge = oldController.getPendingNudge(root);
+      if (nudge?.kind !== 'dispatch') throw new Error('dispatch nudge missing');
+
+      oldController.validateAndMarkDispatching(
+        root,
+        'call_tool_dispatch',
+        nudge.instruction,
+      );
+      oldController.bindManagerTask(
+        root,
+        'call_tool_dispatch',
+        'mgr_tool_task',
+        1,
+      );
+
+      const visibleText = `<outcome_review>\n${JSON.stringify(validKickoffReview(sampleContract(), 'CONTINUE'), null, 2)}\n</outcome_review>`;
+      const reasoningText = `<thinking>\nreasoning trace\n</thinking>\n${visibleText}`;
+      const boundDigest = canonicalDigest(
+        'omos/manager-result/v1',
+        reasoningText,
+      );
+
+      const newCtrl = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: visibleText,
+          empty: false,
+          terminal: true,
+        }),
+      });
+      newCtrl.readRecord(root); // recovers to review_uncertain
+
+      // Mark result_available
+      await newCtrl.reconcileUncertain(root, {
+        checkpointId,
+        resolution: {
+          kind: 'result_available',
+          dispatchCallId: 'call_tool_dispatch',
+          managerTaskId: 'mgr_tool_task',
+          managerGeneration: 1,
+          resultDigest: boundDigest,
+        },
+      });
+
+      const tool = createOutcomeControlTool({
+        controller: newCtrl,
+        shouldManageSession: (id) => id === root,
+      }).outcome_control;
+
+      // 1. Strict validation: missing boundResultDigest
+      await expect(
+        tool.execute(
+          {
+            action: 'reconcile_uncertain',
+            checkpointId,
+            resolution: {
+              kind: 'retire_misbound_result',
+              reason: 'Missing digest',
+              dispatchCallId: 'call_tool_dispatch',
+              managerTaskId: 'mgr_tool_task',
+              managerGeneration: 1,
+            } as never,
+          },
+          { sessionID: root, agent: 'orchestrator' } as never,
+        ),
+      ).rejects.toThrow();
+
+      // 2. Strict validation: invalid digest format (not sha256:64-hex)
+      await expect(
+        tool.execute(
+          {
+            action: 'reconcile_uncertain',
+            checkpointId,
+            resolution: {
+              kind: 'retire_misbound_result',
+              reason: 'Invalid digest format',
+              dispatchCallId: 'call_tool_dispatch',
+              managerTaskId: 'mgr_tool_task',
+              managerGeneration: 1,
+              boundResultDigest: 'not_a_sha256',
+            } as never,
+          },
+          { sessionID: root, agent: 'orchestrator' } as never,
+        ),
+      ).rejects.toThrow();
+
+      // 3. Strict validation: negative generation
+      await expect(
+        tool.execute(
+          {
+            action: 'reconcile_uncertain',
+            checkpointId,
+            resolution: {
+              kind: 'retire_misbound_result',
+              reason: 'Negative gen',
+              dispatchCallId: 'call_tool_dispatch',
+              managerTaskId: 'mgr_tool_task',
+              managerGeneration: -1,
+              boundResultDigest: boundDigest,
+            } as never,
+          },
+          { sessionID: root, agent: 'orchestrator' } as never,
+        ),
+      ).rejects.toThrow();
+
+      // 4. Strict validation: empty reason
+      await expect(
+        tool.execute(
+          {
+            action: 'reconcile_uncertain',
+            checkpointId,
+            resolution: {
+              kind: 'retire_misbound_result',
+              reason: '   ',
+              dispatchCallId: 'call_tool_dispatch',
+              managerTaskId: 'mgr_tool_task',
+              managerGeneration: 1,
+              boundResultDigest: boundDigest,
+            } as never,
+          },
+          { sessionID: root, agent: 'orchestrator' } as never,
+        ),
+      ).rejects.toThrow();
+
+      // 5. Strict validation: oversized reason (> 512 characters)
+      await expect(
+        tool.execute(
+          {
+            action: 'reconcile_uncertain',
+            checkpointId,
+            resolution: {
+              kind: 'retire_misbound_result',
+              reason: 'a'.repeat(513),
+              dispatchCallId: 'call_tool_dispatch',
+              managerTaskId: 'mgr_tool_task',
+              managerGeneration: 1,
+              boundResultDigest: boundDigest,
+            } as never,
+          },
+          { sessionID: root, agent: 'orchestrator' } as never,
+        ),
+      ).rejects.toThrow();
+
+      // 6. Successful retirement via outcome_control tool
+      const output = await tool.execute(
+        {
+          action: 'reconcile_uncertain',
+          checkpointId,
+          resolution: {
+            kind: 'retire_misbound_result',
+            reason: 'Tool retirement of misbound reasoning digest',
+            dispatchCallId: 'call_tool_dispatch',
+            managerTaskId: 'mgr_tool_task',
+            managerGeneration: 1,
+            boundResultDigest: boundDigest,
+          },
+        },
+        { sessionID: root, agent: 'orchestrator' } as never,
+      );
+      const parsed = JSON.parse(String(output));
+      expect(parsed.checkpoint?.state).toBe('retired');
+      expect(parsed.checkpoint?.recoveryNote).toContain(boundDigest);
+    });
+
+    test('preserves existing retire and result_available resolution variants', async () => {
+      const root = 'ses_root';
+      const oldEpoch = 'epoch_tool_variants_old';
+      const newEpoch = 'epoch_tool_variants_new';
+
+      const oldCtrl = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: oldEpoch,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_v',
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'running',
+        }),
+      });
+      const beginRes = oldCtrl.begin(root, sampleContract());
+      expect(beginRes.success).toBe(true);
+      const checkpointId = beginRes.data.checkpoint.checkpointId;
+      const nudge = oldCtrl.getPendingNudge(root);
+      if (nudge?.kind !== 'dispatch') throw new Error('nudge missing');
+      oldCtrl.validateAndMarkDispatching(root, 'call_v', nudge.instruction);
+      oldCtrl.bindManagerTask(root, 'call_v', 'mgr_v', 1);
+
+      const newCtrl = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: newEpoch,
+      });
+      newCtrl.readRecord(root); // review_uncertain
+
+      const tool = createOutcomeControlTool({
+        controller: newCtrl,
+        shouldManageSession: (id) => id === root,
+      }).outcome_control;
+
+      // Existing variant 1: plain retire on review_uncertain
+      const retireOutput = await tool.execute(
+        {
+          action: 'reconcile_uncertain',
+          checkpointId,
+          resolution: {
+            kind: 'retire',
+            reason: 'Plain retire of uncertain dispatch',
+          },
+        },
+        { sessionID: root, agent: 'orchestrator' } as never,
+      );
+      const retireParsed = JSON.parse(String(retireOutput));
+      expect(retireParsed.checkpoint?.state).toBe('retired');
+      expect(retireParsed.checkpoint?.recoveryNote).toBe(
+        'Plain retire of uncertain dispatch',
+      );
+    });
+  });
 });

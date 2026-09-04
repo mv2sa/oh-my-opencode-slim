@@ -3406,7 +3406,7 @@ describe('OutcomeController service over frozen store', () => {
   });
 
   describe('prior-epoch boardless recovery for restart resilience', () => {
-    function setupPriorEpochResultAvailable(
+    async function setupPriorEpochResultAvailable(
       root: string,
       options: {
         oldEpoch?: string;
@@ -3464,16 +3464,19 @@ describe('OutcomeController service over frozen store', () => {
         `<outcome_review>\n${JSON.stringify(review, null, 2)}\n</outcome_review>`;
       const digest = canonicalDigest('omos/manager-result/v1', text);
 
-      const reconcileUncertainRes = newController.reconcileUncertain(root, {
-        checkpointId,
-        resolution: {
-          kind: 'result_available',
-          dispatchCallId: callId,
-          managerTaskId: taskId,
-          managerGeneration: generation,
-          resultDigest: digest,
+      const reconcileUncertainRes = await newController.reconcileUncertain(
+        root,
+        {
+          checkpointId,
+          resolution: {
+            kind: 'result_available',
+            dispatchCallId: callId,
+            managerTaskId: taskId,
+            managerGeneration: generation,
+            resultDigest: digest,
+          },
         },
-      });
+      );
       if (!reconcileUncertainRes.success) {
         throw new Error(
           `reconcileUncertain failed: ${reconcileUncertainRes.error}`,
@@ -3495,7 +3498,7 @@ describe('OutcomeController service over frozen store', () => {
 
     test('successful prior-epoch boardless recovery reconciles review and skips consumeManagerTask', async () => {
       const root = 'ses_boardless_success';
-      const setup = setupPriorEpochResultAvailable(root);
+      const setup = await setupPriorEpochResultAvailable(root);
 
       let consumeCalls = 0;
       const controller = new OutcomeController({
@@ -3536,7 +3539,9 @@ describe('OutcomeController service over frozen store', () => {
 
     test('boardless recovery rejects omitted or mismatched caller managerGeneration', async () => {
       const root = 'ses_boardless_gen';
-      const setup = setupPriorEpochResultAvailable(root, { generation: 2 });
+      const setup = await setupPriorEpochResultAvailable(root, {
+        generation: 2,
+      });
 
       const controller = new OutcomeController({
         storeDirectory: tempDir,
@@ -3571,7 +3576,7 @@ describe('OutcomeController service over frozen store', () => {
 
     test('boardless recovery rejects bound manager task mismatch', async () => {
       const root = 'ses_boardless_task_mismatch';
-      const setup = setupPriorEpochResultAvailable(root);
+      const setup = await setupPriorEpochResultAvailable(root);
 
       const controller = new OutcomeController({
         storeDirectory: tempDir,
@@ -3595,7 +3600,7 @@ describe('OutcomeController service over frozen store', () => {
 
     test('boardless recovery rejects changed child result digest', async () => {
       const root = 'ses_boardless_digest_mismatch';
-      const setup = setupPriorEpochResultAvailable(root);
+      const setup = await setupPriorEpochResultAvailable(root);
 
       const controller = new OutcomeController({
         storeDirectory: tempDir,
@@ -3619,7 +3624,7 @@ describe('OutcomeController service over frozen store', () => {
 
     test('boardless recovery enforces terminal, nonempty, and present child result', async () => {
       const root = 'ses_boardless_result_states';
-      const setup = setupPriorEpochResultAvailable(root);
+      const setup = await setupPriorEpochResultAvailable(root);
 
       let childResult:
         | { text: string; empty: boolean; terminal: boolean }
@@ -3761,7 +3766,7 @@ describe('OutcomeController service over frozen store', () => {
 
     test('old claim with existing invalid board record follows normal checks', async () => {
       const root = 'ses_prior_with_invalid_board';
-      const setup = setupPriorEpochResultAvailable(root);
+      const setup = await setupPriorEpochResultAvailable(root);
 
       let boardRecord: ManagerTaskVerification = {
         taskID: setup.taskId,
@@ -3843,7 +3848,7 @@ describe('OutcomeController service over frozen store', () => {
 
     test('boardless recovery retry after persistence failure succeeds with exact result and rejects changed result', async () => {
       const root = 'ses_boardless_persist_retry';
-      const setup = setupPriorEpochResultAvailable(root);
+      const setup = await setupPriorEpochResultAvailable(root);
 
       let failOnce = true;
       let childText = setup.text;
@@ -3921,7 +3926,7 @@ describe('OutcomeController service over frozen store', () => {
 
     test('boardless recovery still requires verifier to be configured', async () => {
       const root = 'ses_boardless_verifier_required';
-      const setup = setupPriorEpochResultAvailable(root);
+      const setup = await setupPriorEpochResultAvailable(root);
 
       const controller = new OutcomeController({
         storeDirectory: tempDir,
@@ -3941,6 +3946,1054 @@ describe('OutcomeController service over frozen store', () => {
       });
       expect(res.success).toBe(false);
       expect(res.code).toBe('verifier_unconfigured');
+    });
+  });
+
+  describe('retire_misbound_result fail-closed retirement path', () => {
+    async function setupMisboundResultAvailable(
+      root: string,
+      options: {
+        oldEpoch?: string;
+        newEpoch?: string;
+        taskId?: string;
+        generation?: number;
+        callId?: string;
+        visibleText?: string;
+        reasoningText?: string;
+      } = {},
+    ) {
+      const oldEpoch = options.oldEpoch ?? 'epoch_misbound_old';
+      const newEpoch = options.newEpoch ?? 'epoch_misbound_new';
+      const taskId = options.taskId ?? 'mgr_misbound_task';
+      const generation = options.generation ?? 1;
+      const callId = options.callId ?? 'call_misbound_dispatch';
+
+      const oldController = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: oldEpoch,
+        getManagerTaskRecord: () => ({
+          taskID: taskId,
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation,
+          state: 'running',
+        }),
+      });
+
+      const beginRes = oldController.begin(root, testContract());
+      if (!beginRes.success) throw new Error('begin failed');
+      const checkpointId = beginRes.data.checkpoint?.checkpointId;
+      if (!checkpointId) throw new Error('checkpointId missing');
+
+      oldController.validateAndMarkDispatching(
+        root,
+        callId,
+        dispatchInstruction(oldController, root),
+      );
+      const bindRes = oldController.bindManagerTask(
+        root,
+        callId,
+        taskId,
+        generation,
+      );
+      if (!bindRes.success) throw new Error(`bind failed: ${bindRes.error}`);
+
+      const newController = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: newEpoch,
+      });
+      newController.readRecord(root); // recovers running to review_uncertain
+
+      const review = validReviewFor(newController, root, 'CONTINUE');
+      const visibleReviewText =
+        options.visibleText ??
+        `<outcome_review>\n${JSON.stringify(review, null, 2)}\n</outcome_review>`;
+      const reasoningText =
+        options.reasoningText ??
+        '<thinking>\nInternal draft reasoning trace\n</thinking>';
+
+      // In production: durable bound digest was computed from visible review text only
+      const boundDigest = canonicalDigest(
+        'omos/manager-result/v1',
+        visibleReviewText,
+      );
+
+      // In production: authoritative child session reader returns reasoning plus visible review joined with \n\n
+      const childReaderOutput = `${reasoningText}\n\n${visibleReviewText}`;
+      const authoritativeChildDigest = canonicalDigest(
+        'omos/manager-result/v1',
+        childReaderOutput,
+      );
+
+      const reconcileUncertainRes = await newController.reconcileUncertain(
+        root,
+        {
+          checkpointId,
+          resolution: {
+            kind: 'result_available',
+            dispatchCallId: callId,
+            managerTaskId: taskId,
+            managerGeneration: generation,
+            resultDigest: boundDigest,
+          },
+        },
+      );
+      expect(reconcileUncertainRes.success).toBe(true);
+      if (!reconcileUncertainRes.success) {
+        throw new Error(
+          `reconcileUncertain failed: ${reconcileUncertainRes.error}`,
+        );
+      }
+
+      return {
+        checkpointId,
+        taskId,
+        generation,
+        callId,
+        boundDigest,
+        authoritativeChildDigest,
+        visibleReviewText,
+        reasoningText,
+        childReaderOutput,
+        review,
+        oldEpoch,
+        newEpoch,
+      };
+    }
+
+    test('live visible-text-vs-reasoning+text mismatch retirement succeeds, retains identity/digest, records no summary, and permits fresh checkpoint/contract revision', async () => {
+      const root = 'ses_live_mismatch_retirement';
+      const setup = await setupMisboundResultAvailable(root);
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined, // boardless
+        readChildSessionResult: async (id) =>
+          id === setup.taskId
+            ? { text: setup.childReaderOutput, empty: false, terminal: true }
+            : undefined,
+      });
+
+      // 1. reconcileReview rejects with result_digest_mismatch and never auto-retires
+      const recRes = await controller.reconcileReview(root, {
+        checkpointId: setup.checkpointId,
+        managerTaskId: setup.taskId,
+        managerGeneration: setup.generation,
+      });
+      expect(recRes.success).toBe(false);
+      expect(recRes.code).toBe('result_digest_mismatch');
+      let rec = controller.readRecord(root);
+      expect(rec.success && rec.data.checkpoint?.state).toBe(
+        'result_available',
+      );
+
+      // 2. Explicit retire_misbound_result succeeds
+      const retireRes = await controller.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason:
+            'Manager child session result digest mismatch with reasoning output',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(retireRes.success).toBe(true);
+      if (!retireRes.success) return;
+
+      rec = controller.readRecord(root);
+      expect(rec.success).toBe(true);
+      if (!rec.success) return;
+
+      // Assert identity and digest retention
+      expect(rec.data.checkpoint?.state).toBe('retired');
+      expect(rec.data.checkpoint?.dispatchCallId).toBe(setup.callId);
+      expect(rec.data.checkpoint?.managerTaskId).toBe(setup.taskId);
+      expect(rec.data.checkpoint?.managerGeneration).toBe(setup.generation);
+      expect(rec.data.checkpoint?.resultDigest).toBe(setup.boundDigest);
+      expect(rec.data.checkpoint?.recoveryNote).toContain(setup.boundDigest);
+      expect(rec.data.checkpoint?.recoveryNote).toContain(
+        setup.authoritativeChildDigest,
+      );
+      expect(rec.data.checkpoint?.recoveryNote).toContain(
+        'Manager child session result digest mismatch',
+      );
+
+      // Assert no review summary written
+      expect(rec.data.reviewSummaries).toHaveLength(0);
+
+      // Kickoff attempts count preserved without refund (1/2), gate remains required, phase active
+      expect(rec.data.kickoffGate.attempts).toBe(1);
+      expect(rec.data.kickoffGate.state).toBe('required');
+      expect(rec.data.phase).toBe('active');
+
+      // 3. Permits fresh checkpoint
+      const retryKickoff = controller.checkpoint(root, {
+        kind: 'kickoff',
+        reason: 'Retry kickoff after misbound retirement',
+      });
+      expect(retryKickoff.success).toBe(true);
+      const afterRetryRec = controller.readRecord(root);
+      expect(
+        afterRetryRec.success && afterRetryRec.data.kickoffGate.attempts,
+      ).toBe(2);
+
+      // 4. Also permits contract revision when a checkpoint is retired
+      const rootRevise = 'ses_retire_contract_revision';
+      const setupRevise = await setupMisboundResultAvailable(rootRevise);
+      const ctrlRevise = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setupRevise.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: `<outcome_review>\n${JSON.stringify({ ...setup.review, summary: 'Changed summary digest' }, null, 2)}\n</outcome_review>`,
+          empty: false,
+          terminal: true,
+        }),
+      });
+      await ctrlRevise.reconcileUncertain(rootRevise, {
+        checkpointId: setupRevise.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Retire to allow revision',
+          dispatchCallId: setupRevise.callId,
+          managerTaskId: setupRevise.taskId,
+          managerGeneration: setupRevise.generation,
+          boundResultDigest: setupRevise.boundDigest,
+        },
+      });
+      const reviseRes = ctrlRevise.reviseContract(rootRevise, {
+        contract: testContract({ constraints: ['Revised after retirement'] }),
+      });
+      expect(reviseRes.success).toBe(true);
+    });
+
+    test('retire_misbound_result rejects wrong/current/nonterminal/equal-digest cases', async () => {
+      const root = 'ses_retire_misbound_rejections';
+      const setup = await setupMisboundResultAvailable(root);
+
+      let childResult:
+        | { text: string; empty: boolean; terminal: boolean }
+        | undefined = {
+        text: setup.childReaderOutput,
+        empty: false,
+        terminal: true,
+      };
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => childResult,
+      });
+
+      // 1. Wrong dispatchCallId
+      const wrongCallRes = await controller.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Wrong call',
+          dispatchCallId: 'call_wrong_id',
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(wrongCallRes.success).toBe(false);
+      expect(wrongCallRes.code).toBe('dispatch_call_mismatch');
+
+      // 2. Wrong managerTaskId
+      const wrongTaskRes = await controller.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Wrong task',
+          dispatchCallId: setup.callId,
+          managerTaskId: 'mgr_wrong_id',
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(wrongTaskRes.success).toBe(false);
+      expect(wrongTaskRes.code).toBe('manager_task_mismatch');
+
+      // 3. Wrong managerGeneration
+      const wrongGenRes = await controller.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Wrong gen',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: 99,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(wrongGenRes.success).toBe(false);
+      expect(wrongGenRes.code).toBe('generation_mismatch');
+
+      // 4. Wrong boundResultDigest
+      const wrongBoundRes = await controller.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Wrong bound',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: hash(
+            'other_digest_value_for_testing_purposes_only',
+          ),
+        },
+      });
+      expect(wrongBoundRes.success).toBe(false);
+      expect(wrongBoundRes.code).toBe('bound_digest_mismatch');
+
+      // 5. Current-epoch claim rejection
+      const rootCurr = 'ses_retire_curr_epoch';
+      const currEpoch = 'epoch_curr_only';
+      const currController = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: currEpoch,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_curr',
+          parentSessionID: rootCurr,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'running',
+        }),
+        readChildSessionResult: async () => ({
+          text: setup.visibleText,
+          empty: false,
+          terminal: true,
+        }),
+      });
+      const beg = currController.begin(rootCurr, testContract());
+      expect(beg.success).toBe(true);
+      const nudge = currController.getPendingNudge(rootCurr);
+      if (nudge?.kind !== 'dispatch') throw new Error('dispatch nudge missing');
+      const markDisp = currController.validateAndMarkDispatching(
+        rootCurr,
+        'call_c',
+        nudge.instruction,
+      );
+      expect(markDisp.success).toBe(true);
+      const bindRes = currController.bindManagerTask(
+        rootCurr,
+        'call_c',
+        'mgr_curr',
+        1,
+      );
+      expect(bindRes.success).toBe(true);
+      const curRec = currController.readRecord(rootCurr);
+      expect(curRec.success).toBe(true);
+      if (!curRec.success) return;
+      const mutateRes = currController.store.mutate(
+        rootCurr,
+        curRec.data.revision,
+        {
+          type: 'mark_result_available',
+          checkpointId: beg.data.checkpoint.checkpointId,
+          claimGeneration: 1,
+          claimToken: nudge.marker.claimToken,
+          resultDigest: setup.boundDigest,
+        },
+      );
+      expect(mutateRes.success).toBe(true);
+      const currRej = await currController.reconcileUncertain(rootCurr, {
+        checkpointId: beg.data.checkpoint.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Current epoch retire attempt',
+          dispatchCallId: 'call_c',
+          managerTaskId: 'mgr_curr',
+          managerGeneration: 1,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(currRej.success).toBe(false);
+      expect(currRej.code).toBe('current_epoch_retirement_forbidden');
+
+      // 6. Non-terminal child output
+      childResult = { text: setup.visibleText, empty: false, terminal: false };
+      const nonTermRes = await controller.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Non-terminal test',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(nonTermRes.success).toBe(false);
+      expect(nonTermRes.code).toBe('result_not_terminal');
+
+      // 7. Empty child output
+      childResult = { text: '', empty: true, terminal: true };
+      const emptyRes = await controller.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Empty test',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(emptyRes.success).toBe(false);
+      expect(emptyRes.code).toBe('result_not_terminal');
+
+      // 8. Equal digest (authoritative matches bound)
+      childResult = {
+        text: setup.visibleReviewText,
+        empty: false,
+        terminal: true,
+      };
+      const equalRes = await controller.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Equal digest test',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(equalRes.success).toBe(false);
+      expect(equalRes.code).toBe('result_digest_matches');
+
+      // 9. Oversized reason (> 512 characters) rejection with unchanged claim / no retirement
+      const oversizedRes = await controller.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'a'.repeat(513),
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(oversizedRes.success).toBe(false);
+      expect(oversizedRes.code).toBe('invalid_parameter');
+      const recUnchanged = controller.readRecord(root);
+      expect(recUnchanged.success && recUnchanged.data.checkpoint?.state).toBe(
+        'result_available',
+      );
+      expect(
+        recUnchanged.success && recUnchanged.data.checkpoint?.recoveryNote,
+      ).not.toContain('Misbound result retired');
+    });
+
+    test('boardless verifier+reader requirements and no consumption in retire_misbound_result', async () => {
+      const root = 'ses_retire_boardless_reqs';
+      const setup = await setupMisboundResultAvailable(root);
+
+      // 1. Verifier missing
+      const noVerifier = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        readChildSessionResult: async () => ({
+          text: setup.visibleText,
+          empty: false,
+          terminal: true,
+        }),
+      });
+      const noVerRes = await noVerifier.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'No verifier',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(noVerRes.success).toBe(false);
+      expect(noVerRes.code).toBe('verifier_unconfigured');
+
+      // 2. Reader missing
+      const noReader = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+      });
+      const noReadRes = await noReader.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'No reader',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(noReadRes.success).toBe(false);
+      expect(noReadRes.code).toBe('reader_unconfigured');
+
+      // 3. Boardless with verifier and reader configured: consumeManagerTask is skipped
+      let consumeCalls = 0;
+      const boardlessCtrl = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: setup.childReaderOutput,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => {
+          consumeCalls++;
+          return true;
+        },
+      });
+      const successRes = await boardlessCtrl.reconcileUncertain(root, {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Boardless retire',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+      expect(successRes.success).toBe(true);
+      expect(consumeCalls).toBe(0);
+    });
+
+    test('existing invalid board checks in retire_misbound_result', async () => {
+      const root = 'ses_retire_invalid_board';
+      const setup = await setupMisboundResultAvailable(root);
+
+      let boardRecord: ManagerTaskVerification = {
+        taskID: setup.taskId,
+        parentSessionID: root,
+        agent: 'outcome-manager',
+        generation: setup.generation,
+        state: 'running', // invalid: not completed
+      };
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => boardRecord,
+        readChildSessionResult: async () => ({
+          text: setup.visibleText,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+
+      const makeParams = () => ({
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result' as const,
+          reason: 'Board check test',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      });
+
+      // 1. Task not completed
+      const notCompleted = await controller.reconcileUncertain(
+        root,
+        makeParams(),
+      );
+      expect(notCompleted.success).toBe(false);
+      expect(notCompleted.code).toBe('task_not_completed');
+
+      // 2. Wrong parent session
+      boardRecord = {
+        taskID: setup.taskId,
+        parentSessionID: 'other_parent',
+        agent: 'outcome-manager',
+        generation: setup.generation,
+        state: 'completed',
+      };
+      const wrongParent = await controller.reconcileUncertain(
+        root,
+        makeParams(),
+      );
+      expect(wrongParent.success).toBe(false);
+      expect(wrongParent.code).toBe('wrong_parent_session');
+
+      // 3. Wrong agent identity
+      boardRecord = {
+        taskID: setup.taskId,
+        parentSessionID: root,
+        agent: 'other-agent',
+        generation: setup.generation,
+        state: 'completed',
+      };
+      const wrongAgent = await controller.reconcileUncertain(
+        root,
+        makeParams(),
+      );
+      expect(wrongAgent.success).toBe(false);
+      expect(wrongAgent.code).toBe('wrong_agent_identity');
+
+      // 4. Generation mismatch on board
+      boardRecord = {
+        taskID: setup.taskId,
+        parentSessionID: root,
+        agent: 'outcome-manager',
+        generation: 99,
+        state: 'completed',
+      };
+      const genMismatch = await controller.reconcileUncertain(
+        root,
+        makeParams(),
+      );
+      expect(genMismatch.success).toBe(false);
+      expect(genMismatch.code).toBe('generation_mismatch');
+
+      // 5. Board taskID mismatch
+      boardRecord = {
+        taskID: 'mgr_different_task_id',
+        parentSessionID: root,
+        agent: 'outcome-manager',
+        generation: setup.generation,
+        state: 'completed',
+      };
+      const wrongTaskId = await controller.reconcileUncertain(
+        root,
+        makeParams(),
+      );
+      expect(wrongTaskId.success).toBe(false);
+      expect(wrongTaskId.code).toBe('manager_task_mismatch');
+      expect(wrongTaskId.error).toContain('does not match requested task ID');
+    });
+
+    test('valid-board consumption and persistence retry in retire_misbound_result', async () => {
+      const root = 'ses_retire_valid_board_retry';
+      const setup = await setupMisboundResultAvailable(root);
+
+      let failOnce = true;
+      let consumeCalls = 0;
+      let childText = setup.childReaderOutput;
+
+      const store = new OutcomeStore({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+      });
+      const originalMutate = store.mutate.bind(store);
+      store.mutate = ((session, rev, mutation) => {
+        if (mutation.type === 'retire_misbound_recovered_result' && failOnce) {
+          failOnce = false;
+          return {
+            success: false,
+            code: 'io_error',
+            error: new OutcomeStoreError(
+              'io_error',
+              'injected io_error during retirement',
+            ),
+          };
+        }
+        return originalMutate(session, rev, mutation);
+      }) as typeof store.mutate;
+
+      const controller = new OutcomeController({
+        store,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => ({
+          taskID: setup.taskId,
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: setup.generation,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: childText,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => {
+          consumeCalls++;
+          return true;
+        },
+      });
+
+      const params = {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result' as const,
+          reason: 'Testing valid-board consumption and persistence retry',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      };
+
+      // Attempt 1: fails on persistence
+      const first = await controller.reconcileUncertain(root, params);
+      expect(first.success).toBe(false);
+      expect(first.code).toBe('io_error');
+      expect(consumeCalls).toBe(1);
+
+      // Attempt 2: changed child text during retry
+      childText = `different_reasoning\n\n${setup.visibleReviewText}`;
+      const changed = await controller.reconcileUncertain(root, params);
+      expect(changed).toMatchObject({
+        success: false,
+        code: 'consumed_result_mismatch',
+      });
+
+      // Attempt 3: exact child text retry succeeds
+      childText = setup.childReaderOutput;
+      const retried = await controller.reconcileUncertain(root, params);
+      expect(retried.success).toBe(true);
+      expect(consumeCalls).toBe(2);
+
+      const record = controller.readRecord(root);
+      expect(record.success && record.data.checkpoint?.state).toBe('retired');
+    });
+
+    test('kickoff attempts and exhaustion bookkeeping are preserved without refund across multiple retirements', async () => {
+      const root = 'ses_retire_kickoff_exhaustion';
+
+      // 1. Kickoff attempt 1 misbound retirement
+      const setup1 = await setupMisboundResultAvailable(root);
+      const controller1 = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup1.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: setup1.childReaderOutput,
+          empty: false,
+          terminal: true,
+        }),
+      });
+      const res1 = await controller1.reconcileUncertain(root, {
+        checkpointId: setup1.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Attempt 1 misbound',
+          dispatchCallId: setup1.callId,
+          managerTaskId: setup1.taskId,
+          managerGeneration: setup1.generation,
+          boundResultDigest: setup1.boundDigest,
+        },
+      });
+      expect(res1.success).toBe(true);
+      const rec1 = controller1.readRecord(root);
+      expect(rec1.success).toBe(true);
+      if (!rec1.success) return;
+      expect(rec1.data.kickoffGate.attempts).toBe(1);
+      expect(rec1.data.kickoffGate.state).toBe('required');
+      expect(rec1.data.phase).toBe('active');
+
+      // 2. Open kickoff attempt 2
+      const retryKickoff = controller1.checkpoint(root, {
+        kind: 'kickoff',
+        reason: 'Kickoff attempt 2',
+      });
+      expect(retryKickoff.success).toBe(true);
+      if (!retryKickoff.success) return;
+      const cp2Id = retryKickoff.data.checkpointId;
+
+      const nudge = controller1.getPendingNudge(root);
+      if (nudge?.kind !== 'dispatch') throw new Error('dispatch nudge missing');
+      const markDisp2 = controller1.validateAndMarkDispatching(
+        root,
+        'call_k2',
+        nudge.instruction,
+      );
+      expect(markDisp2.success).toBe(true);
+
+      // Advance attempt 2 to result_available in epoch_retry_run
+      const epochRetryRun = 'epoch_retry_run';
+      const ctrlRetryRun = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: epochRetryRun,
+        getManagerTaskRecord: () => ({
+          taskID: 'mgr_k2',
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: 1,
+          state: 'running',
+        }),
+      });
+      const recRun = ctrlRetryRun.readRecord(root);
+      expect(recRun.success).toBe(true);
+      if (!recRun.success) return;
+
+      const recUncertainRes = await ctrlRetryRun.reconcileUncertain(root, {
+        checkpointId: cp2Id,
+        resolution: {
+          kind: 'result_available',
+          dispatchCallId: 'call_k2',
+          managerTaskId: 'mgr_k2',
+          managerGeneration: 1,
+          resultDigest: setup1.boundDigest,
+        },
+      });
+      expect(recUncertainRes.success).toBe(true);
+
+      const recAvail = ctrlRetryRun.readRecord(root);
+      expect(recAvail.success).toBe(true);
+      if (!recAvail.success) return;
+      expect(recAvail.data.checkpoint?.state).toBe('result_available');
+
+      // Restart to epochK2New (so claim is prior-epoch)
+      const epochK2New = 'epoch_k2_new';
+      const ctrlK2New = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: epochK2New,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: setup1.childReaderOutput,
+          empty: false,
+          terminal: true,
+        }),
+      });
+      const recNew = ctrlK2New.readRecord(root);
+      expect(recNew.success).toBe(true);
+      if (!recNew.success) return;
+      expect(recNew.data.checkpoint?.state).toBe('result_available');
+      expect(recNew.data.checkpoint?.serverEpoch).toBe(setup1.newEpoch);
+
+      // Now retire attempt 2: should exhaust kickoff gate (2/2)
+      const res2 = await ctrlK2New.reconcileUncertain(root, {
+        checkpointId: cp2Id,
+        resolution: {
+          kind: 'retire_misbound_result',
+          reason: 'Attempt 2 misbound',
+          dispatchCallId: 'call_k2',
+          managerTaskId: 'mgr_k2',
+          managerGeneration: 1,
+          boundResultDigest: setup1.boundDigest,
+        },
+      });
+      expect(res2.success).toBe(true);
+
+      const recFinal = ctrlK2New.readRecord(root);
+      expect(recFinal.success).toBe(true);
+      if (!recFinal.success) return;
+      expect(recFinal.data.kickoffGate.attempts).toBe(2);
+      expect(recFinal.data.kickoffGate.state).toBe('exhausted');
+      expect(recFinal.data.phase).toBe('failed');
+
+      // Attempt 3 kickoff is rejected with kickoff_retry_exhausted
+      const attempt3 = ctrlK2New.checkpoint(root, {
+        kind: 'kickoff',
+        reason: 'Attempt 3 should be rejected',
+      });
+      expect(attempt3.success).toBe(false);
+      expect(attempt3.code).toBe('kickoff_retry_exhausted');
+    });
+
+    test('post-rename directory-fsync failure returns durability_uncertain, leaves durable state retired, and allows exact idempotent retry', async () => {
+      const root = 'ses_durability_uncertain_retry';
+      const setup = await setupMisboundResultAvailable(root);
+
+      let failNextDirectoryFsync = false;
+      let consumeCalls = 0;
+      let childText = setup.childReaderOutput;
+
+      const store = new OutcomeStore({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        filesystem: {
+          renameSync: (oldPath, newPath) => {
+            fs.renameSync(oldPath, newPath);
+            if (typeof newPath === 'string' && newPath.endsWith('.json')) {
+              failNextDirectoryFsync = true;
+            }
+          },
+          fsyncSync: (descriptor) => {
+            if (
+              failNextDirectoryFsync &&
+              fs.fstatSync(descriptor).isDirectory()
+            ) {
+              failNextDirectoryFsync = false;
+              throw new Error(
+                'injected directory fsync failure after record rename',
+              );
+            }
+            fs.fsyncSync(descriptor);
+          },
+        },
+      });
+
+      const controller = new OutcomeController({
+        store,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => ({
+          taskID: setup.taskId,
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: setup.generation,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: childText,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => {
+          consumeCalls++;
+          return true;
+        },
+      });
+
+      const exactParams = {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result' as const,
+          reason: 'Testing durability uncertainty retry semantics',
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      };
+
+      // Attempt 1: fails after rename during directory fsync with durability_uncertain
+      const firstRes = await controller.reconcileUncertain(root, exactParams);
+      expect(firstRes.success).toBe(false);
+      expect(firstRes.code).toBe('durability_uncertain');
+      expect(consumeCalls).toBe(1);
+
+      // Durable state is already retired on disk
+      const recAfterFirst = controller.readRecord(root);
+      expect(recAfterFirst.success).toBe(true);
+      if (!recAfterFirst.success) return;
+      expect(recAfterFirst.data.checkpoint?.state).toBe('retired');
+
+      // Attempt 2: changed reason fails
+      const changedReasonRes = await controller.reconcileUncertain(root, {
+        ...exactParams,
+        resolution: {
+          ...exactParams.resolution,
+          reason: 'Changed reason should be rejected',
+        },
+      });
+      expect(changedReasonRes.success).toBe(false);
+
+      // Attempt 3: changed child result fails
+      childText = `different_reasoning\n\n${setup.visibleReviewText}`;
+      const changedResultRes = await controller.reconcileUncertain(
+        root,
+        exactParams,
+      );
+      expect(changedResultRes.success).toBe(false);
+
+      // Attempt 4: changed identity fails
+      childText = setup.childReaderOutput;
+      const changedIdRes = await controller.reconcileUncertain(root, {
+        ...exactParams,
+        resolution: {
+          ...exactParams.resolution,
+          dispatchCallId: 'call_different_id',
+        },
+      });
+      expect(changedIdRes.success).toBe(false);
+
+      // Attempt 5: exact retry succeeds idempotently
+      const retryRes = await controller.reconcileUncertain(root, exactParams);
+      expect(retryRes.success).toBe(true);
+      if (!retryRes.success) return;
+      expect(retryRes.data.checkpoint?.state).toBe('retired');
+
+      // Assert no duplicate summary or attempt refund occurred
+      const finalRec = controller.readRecord(root);
+      expect(finalRec.success).toBe(true);
+      if (!finalRec.success) return;
+      expect(finalRec.data.reviewSummaries).toHaveLength(0);
+      expect(finalRec.data.kickoffGate.attempts).toBe(1);
+    });
+
+    test('successful 512-character reason retains both full digests in durable state and exact retry recognition remains possible', async () => {
+      const root = 'ses_retire_512_char_reason';
+      const setup = await setupMisboundResultAvailable(root);
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: setup.childReaderOutput,
+          empty: false,
+          terminal: true,
+        }),
+      });
+
+      const maxReason = 'R'.repeat(512);
+      const expectedReasonDigest = canonicalDigest(
+        'omos/misbound-retirement-reason/v1',
+        maxReason,
+      );
+      const params512 = {
+        checkpointId: setup.checkpointId,
+        resolution: {
+          kind: 'retire_misbound_result' as const,
+          reason: maxReason,
+          dispatchCallId: setup.callId,
+          managerTaskId: setup.taskId,
+          managerGeneration: setup.generation,
+          boundResultDigest: setup.boundDigest,
+        },
+      };
+
+      // Retirement succeeds with 512-character reason
+      const retireRes = await controller.reconcileUncertain(root, params512);
+      expect(retireRes.success).toBe(true);
+
+      // Durable state contains retired claim and both full digests plus expected full normalized reason digest
+      const rec = controller.readRecord(root);
+      expect(rec.success).toBe(true);
+      if (!rec.success) return;
+      expect(rec.data.checkpoint?.state).toBe('retired');
+      expect(rec.data.checkpoint?.recoveryNote).toContain(setup.boundDigest);
+      expect(rec.data.checkpoint?.recoveryNote).toContain(
+        setup.authoritativeChildDigest,
+      );
+      expect(rec.data.checkpoint?.recoveryNote).toContain(expectedReasonDigest);
+      expect(rec.data.checkpoint?.recoveryNote?.length).toBeLessThanOrEqual(
+        512,
+      );
+
+      // Exact retry recognition remains possible
+      const exactRetryRes = await controller.reconcileUncertain(
+        root,
+        params512,
+      );
+      expect(exactRetryRes.success).toBe(true);
+
+      // Whitespace-normalized exact retry succeeds
+      const whitespaceRetryRes = await controller.reconcileUncertain(root, {
+        ...params512,
+        resolution: {
+          ...params512.resolution,
+          reason: `   ${maxReason}   `,
+        },
+      });
+      expect(whitespaceRetryRes.success).toBe(true);
+
+      // A 512-character reason differing ONLY in the final character fails exact retry
+      const lastCharDiffReason = `${'R'.repeat(511)}S`;
+      const changedRetryRes = await controller.reconcileUncertain(root, {
+        ...params512,
+        resolution: {
+          ...params512.resolution,
+          reason: lastCharDiffReason,
+        },
+      });
+      expect(changedRetryRes.success).toBe(false);
     });
   });
 });

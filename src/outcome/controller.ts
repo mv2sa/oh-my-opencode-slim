@@ -31,7 +31,11 @@ import type {
   RuleEnforcementStatus,
   RuleType,
 } from './schema';
-import { OutcomeStore, type OutcomeStoreResult } from './store';
+import {
+  formatMisboundRetirementNote,
+  OutcomeStore,
+  type OutcomeStoreResult,
+} from './store';
 
 const CLAIM_SECRETS_SYMBOL = Symbol.for('omos.outcome.claim_secrets');
 
@@ -456,6 +460,29 @@ export interface OutcomeReconcileReviewResult {
   verdict: OutcomeReview['verdict'];
   phase: OutcomePhase;
   summary: OutcomeManagerReviewSummary;
+}
+
+export type OutcomeReconcileUncertainResolution =
+  | { kind: 'retire'; reason: string }
+  | {
+      kind: 'result_available';
+      dispatchCallId: string;
+      managerTaskId: string;
+      managerGeneration: number;
+      resultDigest: string;
+    }
+  | {
+      kind: 'retire_misbound_result';
+      reason: string;
+      dispatchCallId: string;
+      managerTaskId: string;
+      managerGeneration: number;
+      boundResultDigest: string;
+    };
+
+export interface OutcomeReconcileUncertainParams {
+  checkpointId: string;
+  resolution: OutcomeReconcileUncertainResolution;
 }
 
 export interface OutcomeResolveUserDecisionParams {
@@ -1380,6 +1407,13 @@ export class OutcomeController {
     const taskRecord = this.#getManagerTaskRecord(params.managerTaskId);
     let isBoardlessRecovery = false;
     if (taskRecord) {
+      if (taskRecord.taskID !== params.managerTaskId) {
+        return {
+          success: false,
+          error: `Manager task board ID '${taskRecord.taskID}' does not match requested task ID '${params.managerTaskId}'`,
+          code: 'manager_task_mismatch',
+        };
+      }
       if (taskRecord.parentSessionID !== rootSessionId) {
         return {
           success: false,
@@ -2161,40 +2195,325 @@ export class OutcomeController {
       : { success: false, error: res.error.message };
   }
 
-  reconcileUncertain(
+  async reconcileUncertain(
     rootSessionId: string,
-    params: {
-      checkpointId: string;
-      resolution:
-        | { kind: 'retire'; reason: string }
-        | {
-            kind: 'result_available';
-            dispatchCallId: string;
-            managerTaskId: string;
-            managerGeneration: number;
-            resultDigest: string;
-          };
-    },
-  ): OutcomeControllerResult<OutcomeRecord> {
+    params: OutcomeReconcileUncertainParams,
+  ): Promise<OutcomeControllerResult<OutcomeRecord>> {
     const recRes = this.readRecord(rootSessionId);
-    if (!recRes.success) return { success: false, error: recRes.error.message };
+    if (!recRes.success) {
+      return { success: false, error: recRes.error.message, code: recRes.code };
+    }
     const record = recRes.data;
     const claim = record.checkpoint;
     if (!claim || claim.checkpointId !== params.checkpointId) {
       return {
         success: false,
         error: `Checkpoint '${params.checkpointId}' not found on record`,
+        code: 'checkpoint_not_found',
       };
     }
-    const res = this.#store.mutate(rootSessionId, record.revision, {
-      type: 'reconcile_uncertain_checkpoint',
-      checkpointId: params.checkpointId,
-      claimGeneration: claim.claimGeneration,
-      resolution: params.resolution,
-    });
-    return res.success
-      ? { success: true, data: res.data }
-      : { success: false, error: res.error.message };
+
+    if (
+      params.resolution.kind === 'retire' ||
+      params.resolution.kind === 'result_available'
+    ) {
+      const res = this.#store.mutate(rootSessionId, record.revision, {
+        type: 'reconcile_uncertain_checkpoint',
+        checkpointId: params.checkpointId,
+        claimGeneration: claim.claimGeneration,
+        resolution: params.resolution,
+      });
+      return res.success
+        ? { success: true, data: res.data }
+        : { success: false, error: res.error.message, code: res.code };
+    }
+
+    if (params.resolution.kind === 'retire_misbound_result') {
+      const resolution = params.resolution;
+      if (
+        !resolution.reason ||
+        typeof resolution.reason !== 'string' ||
+        resolution.reason.trim() === '' ||
+        resolution.reason.trim().length > 512
+      ) {
+        return {
+          success: false,
+          error:
+            'Retirement reason must be a non-empty string of at most 512 characters',
+          code: 'invalid_parameter',
+        };
+      }
+      if (
+        !resolution.dispatchCallId ||
+        typeof resolution.dispatchCallId !== 'string' ||
+        resolution.dispatchCallId.trim() === ''
+      ) {
+        return {
+          success: false,
+          error: 'dispatchCallId must be a non-empty string',
+          code: 'invalid_parameter',
+        };
+      }
+      if (
+        !resolution.managerTaskId ||
+        typeof resolution.managerTaskId !== 'string' ||
+        resolution.managerTaskId.trim() === ''
+      ) {
+        return {
+          success: false,
+          error: 'managerTaskId must be a non-empty string',
+          code: 'invalid_parameter',
+        };
+      }
+      if (
+        typeof resolution.managerGeneration !== 'number' ||
+        !Number.isInteger(resolution.managerGeneration) ||
+        resolution.managerGeneration <= 0
+      ) {
+        return {
+          success: false,
+          error: 'managerGeneration must be a positive integer',
+          code: 'invalid_parameter',
+        };
+      }
+      if (
+        !resolution.boundResultDigest ||
+        typeof resolution.boundResultDigest !== 'string' ||
+        !/^sha256:[a-f0-9]{64}$/.test(resolution.boundResultDigest)
+      ) {
+        return {
+          success: false,
+          error: 'boundResultDigest must be a valid sha256:<64-hex> digest',
+          code: 'invalid_parameter',
+        };
+      }
+
+      if (claim.state !== 'result_available' && claim.state !== 'retired') {
+        return {
+          success: false,
+          error: `Checkpoint state is '${claim.state}', expected 'result_available' for misbound result retirement`,
+          code: 'invalid_checkpoint_state',
+        };
+      }
+      if (claim.serverEpoch === this.#serverEpoch) {
+        return {
+          success: false,
+          error: 'Retiring misbound result requires a prior-epoch claim',
+          code: 'current_epoch_retirement_forbidden',
+        };
+      }
+      if (
+        !claim.dispatchCallId ||
+        !claim.managerTaskId ||
+        claim.managerGeneration === undefined ||
+        !claim.resultDigest
+      ) {
+        return {
+          success: false,
+          error:
+            'Checkpoint claim lacks complete durable Manager identity or result digest',
+          code: 'incomplete_claim_identity',
+        };
+      }
+      if (claim.dispatchCallId !== resolution.dispatchCallId) {
+        return {
+          success: false,
+          error: `Bound dispatch call ID mismatch: expected '${claim.dispatchCallId}', got '${resolution.dispatchCallId}'`,
+          code: 'dispatch_call_mismatch',
+        };
+      }
+      if (claim.managerTaskId !== resolution.managerTaskId) {
+        return {
+          success: false,
+          error: `Bound Manager task mismatch: expected '${claim.managerTaskId}', got '${resolution.managerTaskId}'`,
+          code: 'manager_task_mismatch',
+        };
+      }
+      if (claim.managerGeneration !== resolution.managerGeneration) {
+        return {
+          success: false,
+          error: `Manager generation mismatch: expected ${claim.managerGeneration}, got ${resolution.managerGeneration}`,
+          code: 'generation_mismatch',
+        };
+      }
+      if (claim.resultDigest !== resolution.boundResultDigest) {
+        return {
+          success: false,
+          error: `Bound result digest mismatch: expected '${claim.resultDigest}', got '${resolution.boundResultDigest}'`,
+          code: 'bound_digest_mismatch',
+        };
+      }
+
+      if (!this.#getManagerTaskRecord) {
+        return {
+          success: false,
+          error: 'Manager task verifier is not configured',
+          code: 'verifier_unconfigured',
+        };
+      }
+
+      const taskRecord = this.#getManagerTaskRecord(resolution.managerTaskId);
+      let isBoardless = false;
+      if (taskRecord) {
+        if (taskRecord.taskID !== resolution.managerTaskId) {
+          return {
+            success: false,
+            error: `Manager task board ID '${taskRecord.taskID}' does not match requested task ID '${resolution.managerTaskId}'`,
+            code: 'manager_task_mismatch',
+          };
+        }
+        if (taskRecord.parentSessionID !== rootSessionId) {
+          return {
+            success: false,
+            error: `Manager task '${resolution.managerTaskId}' is parented by '${taskRecord.parentSessionID}', not root session '${rootSessionId}'`,
+            code: 'wrong_parent_session',
+          };
+        }
+        const resolvedAgent = this.#resolveAgentName(taskRecord.agent);
+        if (resolvedAgent !== 'outcome-manager') {
+          return {
+            success: false,
+            error: `Task '${resolution.managerTaskId}' agent is '${taskRecord.agent}' (${resolvedAgent}), expected 'outcome-manager'`,
+            code: 'wrong_agent_identity',
+          };
+        }
+        if (taskRecord.generation !== claim.managerGeneration) {
+          return {
+            success: false,
+            error: `Task board generation ${taskRecord.generation} does not match claim managerGeneration ${claim.managerGeneration}`,
+            code: 'generation_mismatch',
+          };
+        }
+        const isCompleted =
+          taskRecord.state === 'completed' ||
+          (taskRecord.state === 'reconciled' &&
+            taskRecord.terminalState === 'completed');
+        if (!isCompleted) {
+          return {
+            success: false,
+            error: `Manager task '${resolution.managerTaskId}' state is '${taskRecord.state}' and is not confirmed terminal completed`,
+            code: 'task_not_completed',
+          };
+        }
+      } else {
+        isBoardless = true;
+      }
+
+      if (!this.#readChildSessionResult) {
+        return {
+          success: false,
+          error:
+            'readChildSessionResult reader not configured on OutcomeController',
+          code: 'reader_unconfigured',
+        };
+      }
+      if (!isBoardless && !this.#consumeManagerTask) {
+        return {
+          success: false,
+          error: 'Manager task consumer is not configured',
+          code: 'consumer_unconfigured',
+        };
+      }
+
+      const sessionResult = await this.#readChildSessionResult(
+        resolution.managerTaskId,
+      );
+      if (sessionResult?.terminal !== true || sessionResult.empty === true) {
+        return {
+          success: false,
+          error: `Manager child session '${resolution.managerTaskId}' has not produced a non-empty terminal completed output`,
+          code: 'result_not_terminal',
+        };
+      }
+      const authoritativeDigest = canonicalDigest(
+        'omos/manager-result/v1',
+        sessionResult.text,
+      );
+      if (authoritativeDigest === claim.resultDigest) {
+        return {
+          success: false,
+          error:
+            'Authoritative Manager result matches bound digest; retirement for misbound result rejected',
+          code: 'result_digest_matches',
+        };
+      }
+
+      const expectedNote = formatMisboundRetirementNote(
+        resolution.boundResultDigest,
+        authoritativeDigest,
+        resolution.reason,
+      );
+      if (claim.state === 'retired') {
+        if (claim.recoveryNote !== expectedNote) {
+          return {
+            success: false,
+            error:
+              'Checkpoint is already retired and does not match the exact misbound retirement transition',
+            code: 'invalid_checkpoint_state',
+          };
+        }
+      }
+
+      const reconciliationKey = `${rootSessionId}:${resolution.managerTaskId}:${claim.managerGeneration}`;
+      const previouslyConsumedDigest =
+        this.#consumedReviewDigests.get(reconciliationKey);
+      if (
+        previouslyConsumedDigest !== undefined &&
+        previouslyConsumedDigest !== authoritativeDigest
+      ) {
+        return {
+          success: false,
+          error:
+            'Manager result changed after its task generation was consumed; exact-result retry is required',
+          code: 'consumed_result_mismatch',
+        };
+      }
+
+      if (!isBoardless) {
+        if (
+          !this.#consumeManagerTask?.(
+            rootSessionId,
+            resolution.managerTaskId,
+            claim.managerGeneration,
+          )
+        ) {
+          return {
+            success: false,
+            error: 'Manager task completion could not be consumed consistently',
+            code: 'manager_consumption_failed',
+          };
+        }
+        this.#consumedReviewDigests.set(reconciliationKey, authoritativeDigest);
+      }
+
+      const res = this.#store.mutate(rootSessionId, record.revision, {
+        type: 'retire_misbound_recovered_result',
+        checkpointId: params.checkpointId,
+        claimGeneration: claim.claimGeneration,
+        dispatchCallId: resolution.dispatchCallId,
+        managerTaskId: resolution.managerTaskId,
+        managerGeneration: resolution.managerGeneration,
+        boundResultDigest: resolution.boundResultDigest,
+        observedResultDigest: authoritativeDigest,
+        reason: resolution.reason,
+      });
+      if (!res.success) {
+        return {
+          success: false,
+          error: res.error.message,
+          code: res.code,
+        };
+      }
+      this.#consumedReviewDigests.delete(reconciliationKey);
+      return { success: true, data: res.data };
+    }
+
+    const unreachable: never = params.resolution;
+    return {
+      success: false,
+      error: `Unknown reconcile_uncertain resolution kind: ${String((unreachable as { kind?: unknown }).kind)}`,
+      code: 'invalid_parameter',
+    };
   }
 
   acknowledgeOperation(

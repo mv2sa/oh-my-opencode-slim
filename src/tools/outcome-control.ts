@@ -9,6 +9,34 @@ export interface OutcomeControlToolOptions {
   resolveAgentName?: (agent: string) => string;
 }
 
+const OutcomeControlResolutionSchema = z.discriminatedUnion('kind', [
+  z
+    .object({
+      kind: z.literal('retire'),
+      reason: z.string().trim().min(1).max(512),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('result_available'),
+      dispatchCallId: z.string().trim().min(1),
+      managerTaskId: z.string().trim().min(1),
+      managerGeneration: z.number().int().positive(),
+      resultDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('retire_misbound_result'),
+      reason: z.string().trim().min(1).max(512),
+      dispatchCallId: z.string().trim().min(1),
+      managerTaskId: z.string().trim().min(1),
+      managerGeneration: z.number().int().positive(),
+      boundResultDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    })
+    .strict(),
+]);
+
 export function createOutcomeControlTool(
   options: OutcomeControlToolOptions,
 ): Record<'outcome_control', ToolDefinition> {
@@ -154,10 +182,9 @@ Use this tool to establish durable outcome contracts (begin), open checkpoint re
         .array(z.string())
         .optional()
         .describe('Evidence provenance for action resolution'),
-      resolution: z
-        .any()
-        .optional()
-        .describe('Resolution object for reconcile_uncertain'),
+      resolution: OutcomeControlResolutionSchema.optional().describe(
+        'Resolution object for reconcile_uncertain',
+      ),
     },
     async execute(args, toolContext) {
       const sessionID = toolContext?.sessionID;
@@ -405,9 +432,17 @@ Use this tool to establish durable outcome contracts (begin), open checkpoint re
               'outcome_control action="reconcile_uncertain" requires checkpointId and resolution',
             );
           }
-          const res = controller.reconcileUncertain(sessionID, {
+          const parseRes = OutcomeControlResolutionSchema.safeParse(
+            args.resolution,
+          );
+          if (!parseRes.success) {
+            throw new Error(
+              `Invalid resolution for reconcile_uncertain: ${parseRes.error.message}`,
+            );
+          }
+          const res = await controller.reconcileUncertain(sessionID, {
             checkpointId: args.checkpointId,
-            resolution: args.resolution,
+            resolution: parseRes.data,
           });
           if (!res.success) {
             throw new Error(`reconcile_uncertain failed: ${res.error}`);

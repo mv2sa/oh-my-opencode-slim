@@ -3717,4 +3717,416 @@ describe('OutcomeStore protocol and integrity', () => {
     expect(malformedRead.success).toBe(false);
     expect(malformedRead.code).toBe('corrupt');
   });
+
+  test('retire_misbound_recovered_result enforces state, prior epoch, identity, bound digest equality, observed inequality, bounded reason, and mirrors kickoff failure/exhaustion', () => {
+    const root = 'root_store_retire_misbound';
+    const oldStore = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_old_store',
+      clock: () => 100,
+    });
+    const initRes = oldStore.init(root, { contract: contract() });
+    expectSuccess(initRes);
+
+    const opened = openCheckpoint(oldStore, root, 1, 'lost-token', 'kickoff');
+    let current = oldStore.mutate(root, 2, {
+      type: 'mark_dispatching',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      claimToken: 'lost-token',
+      dispatchCallId: 'call_retire_orig',
+    });
+    expectSuccess(current);
+    current = oldStore.mutate(root, 3, {
+      type: 'bind_manager',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      claimToken: 'lost-token',
+      managerTaskId: 'mgr_retire_task',
+      managerGeneration: 1,
+    });
+    expectSuccess(current);
+
+    const boundDigest = hash('bound_content_store');
+    current = oldStore.mutate(root, 4, {
+      type: 'mark_result_available',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      claimToken: 'lost-token',
+      resultDigest: boundDigest,
+    });
+    expectSuccess(current);
+
+    // Current epoch store cannot retire prior epoch misbound result if executed under the old epoch
+    const sameEpochRejection = oldStore.mutate(root, current.revision, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_retire_orig',
+      managerTaskId: 'mgr_retire_task',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: hash('observed_diff_store'),
+      reason: 'Should reject in same epoch',
+    });
+    expect(sameEpochRejection.success).toBe(false);
+
+    // Switch to new server epoch and recover record
+    const newStore = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_new_store',
+      clock: () => 200,
+    });
+    const recovered = newStore.recover(root);
+    expectSuccess(recovered);
+    const revBefore = recovered.revision;
+
+    // 1. Rejection on dispatch call mismatch
+    const wrongCall = newStore.mutate(root, revBefore, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_wrong',
+      managerTaskId: 'mgr_retire_task',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: hash('observed_diff_store'),
+      reason: 'Wrong call',
+    });
+    expect(wrongCall.success).toBe(false);
+
+    // 2. Rejection on manager task mismatch
+    const wrongTask = newStore.mutate(root, revBefore, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_retire_orig',
+      managerTaskId: 'mgr_wrong',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: hash('observed_diff_store'),
+      reason: 'Wrong task',
+    });
+    expect(wrongTask.success).toBe(false);
+
+    // 3. Rejection on manager generation mismatch
+    const wrongGen = newStore.mutate(root, revBefore, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_retire_orig',
+      managerTaskId: 'mgr_retire_task',
+      managerGeneration: 99,
+      boundResultDigest: boundDigest,
+      observedResultDigest: hash('observed_diff_store'),
+      reason: 'Wrong gen',
+    });
+    expect(wrongGen.success).toBe(false);
+
+    // 4. Rejection on bound digest mismatch
+    const wrongBoundDigest = newStore.mutate(root, revBefore, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_retire_orig',
+      managerTaskId: 'mgr_retire_task',
+      managerGeneration: 1,
+      boundResultDigest: hash('different_bound'),
+      observedResultDigest: hash('observed_diff_store'),
+      reason: 'Wrong bound digest',
+    });
+    expect(wrongBoundDigest.success).toBe(false);
+
+    // 5. Rejection on observed digest matching bound digest (equal digest)
+    const equalDigest = newStore.mutate(root, revBefore, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_retire_orig',
+      managerTaskId: 'mgr_retire_task',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: boundDigest,
+      reason: 'Equal digest',
+    });
+    expect(equalDigest.success).toBe(false);
+
+    // 6. Rejection on empty or whitespace reason
+    const emptyReason = newStore.mutate(root, revBefore, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_retire_orig',
+      managerTaskId: 'mgr_retire_task',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: hash('observed_diff_store'),
+      reason: '   ',
+    });
+    expect(emptyReason.success).toBe(false);
+
+    // 6b. Rejection on oversized reason (> 512 characters) with unchanged claim and no retirement
+    const oversizedReason = newStore.mutate(root, revBefore, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_retire_orig',
+      managerTaskId: 'mgr_retire_task',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: hash('observed_diff_store'),
+      reason: 'a'.repeat(513),
+    });
+    expect(oversizedReason.success).toBe(false);
+    const readAfterOversized = newStore.read(root);
+    expectSuccess(readAfterOversized);
+    expect(readAfterOversized.data.checkpoint?.state).toBe('result_available');
+    expect(readAfterOversized.data.checkpoint?.recoveryNote).toBeUndefined();
+
+    // 7. Successful retirement for kickoff attempt 1
+    const observedDigest = hash('observed_diff_store');
+    const retiredRes = newStore.mutate(root, revBefore, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_retire_orig',
+      managerTaskId: 'mgr_retire_task',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: observedDigest,
+      reason: 'Visible text does not match reasoning bound digest',
+    });
+    expectSuccess(retiredRes);
+
+    const retiredRecord = retiredRes.data;
+    expect(retiredRecord.checkpoint?.state).toBe('retired');
+    expect(retiredRecord.checkpoint?.dispatchCallId).toBe('call_retire_orig');
+    expect(retiredRecord.checkpoint?.managerTaskId).toBe('mgr_retire_task');
+    expect(retiredRecord.checkpoint?.managerGeneration).toBe(1);
+    expect(retiredRecord.checkpoint?.resultDigest).toBe(boundDigest);
+    expect(retiredRecord.checkpoint?.recoveryNote).toContain(boundDigest);
+    expect(retiredRecord.checkpoint?.recoveryNote).toContain(observedDigest);
+    expect(retiredRecord.checkpoint?.recoveryNote).toContain(
+      'Visible text does not match reasoning',
+    );
+    expect(retiredRecord.reviewSummaries).toHaveLength(0);
+
+    // Kickoff attempts are never refunded: attempt count remains 1 out of 2, gate state remains required
+    expect(retiredRecord.kickoffGate.attempts).toBe(1);
+    expect(retiredRecord.kickoffGate.state).toBe('required');
+    expect(retiredRecord.phase).toBe('active');
+
+    // 8. Rejection when attempting retire_misbound_recovered_result on non-result_available state (already retired)
+    const alreadyRetired = newStore.mutate(root, retiredRes.revision, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_retire_orig',
+      managerTaskId: 'mgr_retire_task',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: observedDigest,
+      reason: 'Attempt on already retired',
+    });
+    expect(alreadyRetired.success).toBe(false);
+
+    // 9. Advance to store2, open kickoff retry checkpoint (attempt 2), dispatch, bind manager, and mark result available in prior epoch
+    const store2 = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_retry_prior',
+      clock: () => 300,
+    });
+    const rec2 = store2.recover(root);
+    expectSuccess(rec2);
+
+    const opened2 = openCheckpoint(
+      store2,
+      root,
+      rec2.revision,
+      'token2',
+      'kickoff',
+    );
+    expect(opened2.result.data.kickoffGate.attempts).toBe(2);
+
+    let cur2 = store2.mutate(root, opened2.result.revision, {
+      type: 'mark_dispatching',
+      checkpointId: opened2.claim.checkpointId,
+      claimGeneration: 2,
+      claimToken: 'token2',
+      dispatchCallId: 'call_retire_2',
+    });
+    expectSuccess(cur2);
+    cur2 = store2.mutate(root, cur2.revision, {
+      type: 'bind_manager',
+      checkpointId: opened2.claim.checkpointId,
+      claimGeneration: 2,
+      claimToken: 'token2',
+      managerTaskId: 'mgr_retire_task_2',
+      managerGeneration: 1,
+    });
+    expectSuccess(cur2);
+    const boundDigest2 = hash('bound_content_2');
+    cur2 = store2.mutate(root, cur2.revision, {
+      type: 'mark_result_available',
+      checkpointId: opened2.claim.checkpointId,
+      claimGeneration: 2,
+      claimToken: 'token2',
+      resultDigest: boundDigest2,
+    });
+    expectSuccess(cur2);
+
+    // Reopen in third epoch and retire attempt 2: should exhaust kickoff attempts (2/2) and fail phase
+    const store3 = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_retry_third',
+      clock: () => 400,
+    });
+    const recovered3 = store3.recover(root);
+    expectSuccess(recovered3);
+    const exhaustRes = store3.mutate(root, recovered3.revision, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened2.claim.checkpointId,
+      claimGeneration: 2,
+      dispatchCallId: 'call_retire_2',
+      managerTaskId: 'mgr_retire_task_2',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest2,
+      observedResultDigest: hash('observed_diff_2'),
+      reason: 'Second kickoff misbound result',
+    });
+    expectSuccess(exhaustRes);
+    expect(exhaustRes.data.kickoffGate.attempts).toBe(2);
+    expect(exhaustRes.data.kickoffGate.state).toBe('exhausted');
+    expect(exhaustRes.data.phase).toBe('failed');
+  });
+
+  test('retire_misbound_recovered_result supports 512-char reason with reason digest, exact idempotent retry, whitespace normalization, and rejects last-character mismatch', () => {
+    const root = 'root_store_retire_512';
+    const oldStore = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_old_512',
+      clock: () => 100,
+    });
+    expectSuccess(oldStore.init(root, { contract: contract() }));
+
+    const opened = openCheckpoint(oldStore, root, 1, 'token-512', 'kickoff');
+    expectSuccess(
+      oldStore.mutate(root, 2, {
+        type: 'mark_dispatching',
+        checkpointId: opened.claim.checkpointId,
+        claimGeneration: 1,
+        claimToken: 'token-512',
+        dispatchCallId: 'call_512',
+      }),
+    );
+    expectSuccess(
+      oldStore.mutate(root, 3, {
+        type: 'bind_manager',
+        checkpointId: opened.claim.checkpointId,
+        claimGeneration: 1,
+        claimToken: 'token-512',
+        managerTaskId: 'mgr_512',
+        managerGeneration: 1,
+      }),
+    );
+    const boundDigest = hash('bound_512');
+    expectSuccess(
+      oldStore.mutate(root, 4, {
+        type: 'mark_result_available',
+        checkpointId: opened.claim.checkpointId,
+        claimGeneration: 1,
+        claimToken: 'token-512',
+        resultDigest: boundDigest,
+      }),
+    );
+
+    const newStore = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_new_512',
+      clock: () => 200,
+    });
+    const recovered = newStore.recover(root);
+    expectSuccess(recovered);
+
+    const reasonBase = 'A'.repeat(511);
+    const reason512A = `${reasonBase}1`;
+    const reason512B = `${reasonBase}2`; // differs only in the final character
+    const observedDigest = hash('observed_512');
+
+    const expectedReasonDigest = canonicalDigest(
+      'omos/misbound-retirement-reason/v1',
+      reason512A,
+    );
+
+    // Initial retirement with 512-char reason succeeds
+    const retiredRes = newStore.mutate(root, recovered.revision, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_512',
+      managerTaskId: 'mgr_512',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: observedDigest,
+      reason: reason512A,
+    });
+    expectSuccess(retiredRes);
+
+    const retiredRecord = retiredRes.data;
+    expect(retiredRecord.checkpoint?.state).toBe('retired');
+    expect(retiredRecord.checkpoint?.recoveryNote).toContain(boundDigest);
+    expect(retiredRecord.checkpoint?.recoveryNote).toContain(observedDigest);
+    expect(retiredRecord.checkpoint?.recoveryNote).toContain(
+      expectedReasonDigest,
+    );
+    expect(retiredRecord.checkpoint?.recoveryNote?.length).toBeLessThanOrEqual(
+      512,
+    );
+
+    // Exact idempotent retry succeeds (noop)
+    const exactRetry = newStore.mutate(root, retiredRes.revision, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_512',
+      managerTaskId: 'mgr_512',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: observedDigest,
+      reason: reason512A,
+    });
+    expectSuccess(exactRetry);
+    expect(exactRetry.status).toBe('noop');
+    expect(exactRetry.revision).toBe(retiredRes.revision);
+
+    // Whitespace-padded exact retry also succeeds idempotently due to consistent trim normalization
+    const whitespaceRetry = newStore.mutate(root, retiredRes.revision, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_512',
+      managerTaskId: 'mgr_512',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: observedDigest,
+      reason: `   ${reason512A}   `,
+    });
+    expectSuccess(whitespaceRetry);
+    expect(whitespaceRetry.status).toBe('noop');
+
+    // A 512-character reason differing ONLY in the final character fails exact retry
+    const mismatchRetry = newStore.mutate(root, retiredRes.revision, {
+      type: 'retire_misbound_recovered_result',
+      checkpointId: opened.claim.checkpointId,
+      claimGeneration: 1,
+      dispatchCallId: 'call_512',
+      managerTaskId: 'mgr_512',
+      managerGeneration: 1,
+      boundResultDigest: boundDigest,
+      observedResultDigest: observedDigest,
+      reason: reason512B,
+    });
+    expect(mismatchRetry.success).toBe(false);
+    expect(mismatchRetry.code).toBe('invalid_transition');
+  });
 });

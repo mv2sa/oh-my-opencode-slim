@@ -244,6 +244,17 @@ export type OutcomeRecordMutation =
             resultDigest: string;
           };
     }
+  | {
+      type: 'retire_misbound_recovered_result';
+      checkpointId: string;
+      claimGeneration: number;
+      dispatchCallId: string;
+      managerTaskId: string;
+      managerGeneration: number;
+      boundResultDigest: string;
+      observedResultDigest: string;
+      reason: string;
+    }
   | { type: 'append_action'; action: OutcomeActionRequired }
   | {
       type: 'resolve_action';
@@ -269,6 +280,25 @@ export interface OutcomeReviewPersistence {
   review?: OutcomeReview;
   reason?: string;
   recovered?: boolean;
+}
+
+export function formatMisboundRetirementNote(
+  boundDigest: string,
+  observedDigest: string,
+  reason: string,
+): string {
+  const normalizedReason = reason.trim();
+  const reasonDigest = canonicalDigest(
+    'omos/misbound-retirement-reason/v1',
+    normalizedReason,
+  );
+  const prefix = `Misbound result retired [bound=${boundDigest} observed=${observedDigest} reason=${reasonDigest}]: `;
+  const remaining = Math.max(0, 512 - prefix.length);
+  const trailingReason =
+    normalizedReason.length > remaining
+      ? normalizedReason.slice(0, remaining)
+      : normalizedReason;
+  return `${prefix}${trailingReason}`;
 }
 
 interface LockOwner {
@@ -522,6 +552,42 @@ export class OutcomeStore {
             new OutcomeStoreError(
               'invalid_transition',
               `User message '${canonicalMessageId}' was already recorded with different content`,
+              { rootSessionId: session },
+            ),
+          );
+        }
+      } else if (mutation.type === 'retire_misbound_recovered_result') {
+        const claim = current.checkpoint;
+        if (
+          claim &&
+          claim.checkpointId === mutation.checkpointId &&
+          claim.claimGeneration === mutation.claimGeneration &&
+          claim.state === 'retired'
+        ) {
+          const expectedNote = formatMisboundRetirementNote(
+            mutation.boundResultDigest,
+            mutation.observedResultDigest,
+            mutation.reason,
+          );
+          if (
+            claim.dispatchCallId === mutation.dispatchCallId &&
+            claim.managerTaskId === mutation.managerTaskId &&
+            claim.managerGeneration === mutation.managerGeneration &&
+            claim.resultDigest === mutation.boundResultDigest &&
+            mutation.observedResultDigest !== mutation.boundResultDigest &&
+            claim.recoveryNote === expectedNote
+          ) {
+            return {
+              success: true,
+              data: current,
+              revision: current.revision,
+              status: 'noop',
+            };
+          }
+          return failure(
+            new OutcomeStoreError(
+              'invalid_transition',
+              'Checkpoint is already retired and does not match the exact misbound retirement transition',
               { rootSessionId: session },
             ),
           );
@@ -2012,6 +2078,72 @@ function applyMutation(
           managerGeneration: mutation.resolution.managerGeneration,
           resultDigest: mutation.resolution.resultDigest,
         };
+      }
+      resolveMatchingRecoveryActions(next, claim.checkpointId, now);
+      break;
+    }
+    case 'retire_misbound_recovered_result': {
+      const claim = requireClaim(next, mutation);
+      if (claim.state !== 'result_available') {
+        throw new Error(
+          'Retiring misbound result requires a result_available checkpoint',
+        );
+      }
+      if (claim.serverEpoch === epoch) {
+        throw new Error('Recovery transition requires a prior-epoch claim');
+      }
+      if (claim.dispatchCallId !== mutation.dispatchCallId) {
+        throw new Error('Dispatch call ID mismatch');
+      }
+      if (claim.managerTaskId !== mutation.managerTaskId) {
+        throw new Error('Manager task ID mismatch');
+      }
+      if (claim.managerGeneration !== mutation.managerGeneration) {
+        throw new Error('Manager generation mismatch');
+      }
+      if (claim.resultDigest !== mutation.boundResultDigest) {
+        throw new Error('Bound result digest mismatch');
+      }
+      if (mutation.observedResultDigest === mutation.boundResultDigest) {
+        throw new Error(
+          'Observed result digest must differ from bound result digest to retire misbound result',
+        );
+      }
+      if (
+        !mutation.reason ||
+        typeof mutation.reason !== 'string' ||
+        mutation.reason.trim() === ''
+      ) {
+        throw new Error('Retirement reason must be a non-empty string');
+      }
+      const trimmedReason = mutation.reason.trim();
+      if (trimmedReason.length > 512) {
+        throw new Error(
+          'Retirement reason exceeds maximum length of 512 characters',
+        );
+      }
+      const recoveryNote = formatMisboundRetirementNote(
+        mutation.boundResultDigest,
+        mutation.observedResultDigest,
+        trimmedReason,
+      );
+      next.checkpoint = {
+        ...claim,
+        state: 'retired',
+        recoveryNote,
+      };
+      if (claim.kind === 'kickoff') {
+        next.kickoffGate = {
+          ...next.kickoffGate,
+          failureReason: recoveryNote,
+          state:
+            next.kickoffGate.attempts >= next.kickoffGate.maxAttempts
+              ? 'exhausted'
+              : next.kickoffGate.state,
+        };
+        if (next.kickoffGate.state === 'exhausted') {
+          next.phase = 'failed';
+        }
       }
       resolveMatchingRecoveryActions(next, claim.checkpointId, now);
       break;
