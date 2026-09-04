@@ -2198,6 +2198,7 @@ function recordParsedReview(
   persistedRevision: number,
   randomId: () => string,
 ): void {
+  const boundedReviewReason = boundedText(review.summary);
   if (claim.kind === 'kickoff') {
     assertKickoffReviewReconcilable(record, claim);
   }
@@ -2241,7 +2242,7 @@ function recordParsedReview(
     } else {
       record.kickoffGate = {
         ...record.kickoffGate,
-        failureReason: review.summary,
+        failureReason: boundedReviewReason,
         state:
           record.kickoffGate.attempts >= record.kickoffGate.maxAttempts
             ? 'exhausted'
@@ -2285,12 +2286,17 @@ function recordParsedReview(
         `action_${summary.reviewId}`,
         'manual_intervention',
         summary.reviewId,
-        review.summary,
+        boundedReviewReason,
         evaluatedAt,
         persistedRevision,
       ),
     );
   }
+}
+
+function boundedText(value: string, maxLength = 512): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 3)}...`;
 }
 
 function authenticateReview(

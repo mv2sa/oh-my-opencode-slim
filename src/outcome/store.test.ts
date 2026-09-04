@@ -185,6 +185,7 @@ function completeReview(
   startRevision: number,
   token: string,
   verdict: OutcomeReview['verdict'],
+  options: { review?: OutcomeReview } = {},
 ) {
   let current = store.read(root);
   expectSuccess(current);
@@ -216,7 +217,7 @@ function completeReview(
     resultDigest,
   });
   expectSuccess(current);
-  const parsedReview = reviewFor(current.data, verdict);
+  const parsedReview = options.review ?? reviewFor(current.data, verdict);
   current = store.mutate(root, startRevision + 3, {
     type: 'record_review',
     checkpointId: claim.checkpointId,
@@ -722,6 +723,38 @@ describe('OutcomeStore protocol and integrity', () => {
       const reviewed = completeReview(store, root, 2, 'token', verdict);
       expect(reviewed.data.checkpoint?.state).toBe(expected);
     }
+  });
+
+  test('bounds long valid review summaries when deriving action and kickoff failure reasons', () => {
+    const root = 'root_long_review_summary';
+    const store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_long_summary',
+      randomId: () => root,
+      clock: () => 100,
+    });
+    const created = store.init(root, { contract: contract() });
+    expectSuccess(created);
+    openCheckpoint(store, root, 1, 'token', 'kickoff');
+    const current = store.read(root);
+    expectSuccess(current);
+    const review = reviewFor(current.data, 'CORRECT_DRIFT');
+    review.summary = 'x'.repeat(1024);
+    const reviewed = completeReview(
+      store,
+      root,
+      current.revision,
+      'token',
+      'CORRECT_DRIFT',
+      { review },
+    );
+    expect(reviewed.data.reviewSummaries.at(-1)?.summary).toHaveLength(1024);
+    expect(reviewed.data.kickoffGate.failureReason).toHaveLength(512);
+    expect(reviewed.data.kickoffGate.failureReason?.endsWith('...')).toBe(true);
+    expect(reviewed.data.actionsRequired.at(-1)?.reason).toHaveLength(512);
+    expect(reviewed.data.actionsRequired.at(-1)?.reason.endsWith('...')).toBe(
+      true,
+    );
   });
 
   test('finalizes only satisfied contract with completed kickoff and matching final attestations', () => {
