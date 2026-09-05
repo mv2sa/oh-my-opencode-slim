@@ -975,5 +975,41 @@ describe('outcome_control tool', () => {
       const parsed = JSON.parse(String(toolOutput));
       expect(parsed.phase).toBe('active');
     });
+
+    test('status exposes generation, pending successor, and historical generation status', async () => {
+      const root = 'ses_root';
+      await toolInstance.execute(
+        { action: 'begin', contract: sampleContract() },
+        { sessionID: root, agent: 'orchestrator' } as never,
+      );
+
+      // Status exposes generation 1
+      const statusRaw = await toolInstance.execute({ action: 'status' }, {
+        sessionID: root,
+        agent: 'orchestrator',
+      } as never);
+      const status = JSON.parse(String(statusRaw));
+      expect(status.isManaged).toBe(true);
+      expect(status.generation).toBe(1);
+      expect(status.pendingSuccessor).toBeUndefined();
+
+      // Historical status for generation 1
+      const histRaw = await toolInstance.execute(
+        { action: 'status', generation: 1 },
+        { sessionID: root, agent: 'orchestrator' } as never,
+      );
+      const hist = JSON.parse(String(histRaw));
+      expect(hist.isManaged).toBe(true);
+      expect(hist.generation).toBe(1);
+
+      // Historical status for non-existent generation
+      const missingRaw = await toolInstance.execute(
+        { action: 'status', generation: 5 },
+        { sessionID: root, agent: 'orchestrator' } as never,
+      );
+      const missing = JSON.parse(String(missingRaw));
+      expect(missing.isManaged).toBe(false);
+      expect(missing.blocked?.code).toBe('missing');
+    });
   });
 });

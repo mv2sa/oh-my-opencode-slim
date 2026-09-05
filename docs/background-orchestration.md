@@ -482,6 +482,32 @@ task ID and board generation. Manager-result consumption is retry-safe only for
 that exact `(root session, task ID, generation)` after completed reconciliation;
 a different parent, generation, or terminal outcome is rejected.
 
+### Successor Outcomes
+
+Once an outcome is accepted and certified, its durable record and certificate
+remain byte-for-byte immutable. Later external user messages continue through
+normal orchestration without altering the prior certificate.
+
+- Ordinary post-accept dialogue and tool calls proceed without mutating the
+  accepted predecessor.
+- The first eligible external user message after acceptance creates a durable
+  pending generation N+1 intake, linked backward by predecessor outcome ID,
+  generation, accepted revision, and domain-separated certificate digest. Later
+  eligible messages append idempotently to that intake.
+- When the user requests further non-trivial work, the orchestrator begins a
+  governed successor outcome via `outcome_control(action: "begin", contract: ...)`.
+  This promotes the pending intake in place to an active successor generation,
+  preserving user receipts and establishing explicit backward lineage.
+- Bounded session manifest (`<sessionHash>.manifest.json`) routes to the active
+  generation and tracks pending successor intake; historical generations
+  (`<sessionHash>.json`, `<sessionHash>.gNNNNNNNN.json`) remain accessible for
+  read-only inspection.
+- Retained history & no-GC policy: all accepted historical generation records
+  are retained permanently on disk; no deletion or garbage collection is performed.
+  The manifest is the sole authoritative routing source for active work.
+  Missing historical records fail closed across the entire generation chain,
+  as full lineage auditing is an explicit invariant.
+
 ### Background Job Board Injection
 
 By default, each prompt uses the `latest` board strategy. The hook removes prior

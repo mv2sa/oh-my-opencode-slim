@@ -8,17 +8,21 @@ import {
   computeOutcomeCheckpointFingerprint,
   computeOutcomeContractDigest,
   computeOutcomeEvidenceAttestationDigest,
+  computeOutcomeFinalCertificateDigest,
   computeOutcomeHandoffSupersessionDigest,
+  computeOutcomeSuccessorLineageDigest,
   initialActionArchiveChainDigest,
   MAX_OUTCOME_RECORD_BYTES,
   type OutcomeContract,
   type OutcomeRecord,
   OutcomeRecordSchema,
+  serializeOutcomeIntake,
   serializeOutcomeRecord,
 } from './controller-schema';
 import type { OutcomeReview } from './schema';
 import {
   OutcomeStore,
+  OutcomeStoreError,
   type OutcomeStoreResult,
   parseMisboundRetirementNote,
 } from './store';
@@ -4620,5 +4624,924 @@ describe('OutcomeStore protocol and integrity', () => {
     expectSuccess(compSuccess);
     expect(compSuccess.data.waitCondition).toBeUndefined();
     expect(compSuccess.data.phase).toBe('active');
+  });
+
+  describe('Successor outcomes and session manifest lifecycle', () => {
+    function setupAcceptedSession(store: OutcomeStore, root: string): string {
+      const init = store.init(root, {
+        contract: contract({
+          goals: [
+            {
+              id: 'goal_protocol',
+              description: 'Implement the outcome protocol',
+              status: 'satisfied',
+            },
+          ],
+        }),
+      });
+      expectSuccess(init);
+      const token = 'token_kickoff';
+      openCheckpoint(store, root, init.data.revision, token, 'kickoff', {
+        expiresAt: 20_000,
+      });
+      let cur = store.read(root);
+      expectSuccess(cur);
+      cur = completeReview(store, root, cur.data.revision, token, 'CONTINUE');
+
+      const appendRes = store.mutate(root, cur.data.revision, {
+        type: 'append_user_message',
+        receipt: {
+          id: 'usr_g1_init',
+          messageId: 'msg_root',
+          contentDigest: hash('user initial turn'),
+          observedEpoch: store.serverEpoch,
+          observedAt: 100,
+          createdRevision: cur.data.revision + 1,
+          provenance: 'external_user',
+        },
+      });
+      expectSuccess(appendRes);
+      cur = appendRes;
+
+      const candidate = hash('cand_final');
+      const entry = {
+        id: 'att_final_evidence',
+        kind: 'orchestrator_attestation' as const,
+        description: 'bun test final',
+        assertedStatus: 'passed' as const,
+        assertedFreshness: 'fresh' as const,
+        candidateFingerprint: candidate,
+        payloadDigest: '',
+        createdRevision: cur.data.revision + 1,
+        createdAt: 100,
+      };
+      entry.payloadDigest = attestationDigest(entry);
+      cur = store.mutate(root, cur.data.revision, {
+        type: 'append_evidence',
+        entry,
+      });
+      expectSuccess(cur);
+      openCheckpoint(store, root, cur.data.revision, 'token_final', 'final', {
+        candidateFingerprint: candidate,
+        evidenceAttestationIds: [entry.id],
+        expiresAt: 20_000,
+      });
+      cur = store.read(root);
+      expectSuccess(cur);
+      cur = completeReview(
+        store,
+        root,
+        cur.data.revision,
+        'token_final',
+        'ACCEPT',
+      );
+      const finalizeRes = store.mutate(root, cur.data.revision, {
+        type: 'finalize',
+        summary: 'Deliverable complete and accepted',
+      });
+      expectSuccess(finalizeRes);
+      return candidate;
+    }
+
+    test('accepted outcome records/certificates remain byte-for-byte immutable across successor operations', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_immutable_test';
+      setupAcceptedSession(store, root);
+
+      const gen1Path = store.recordPath(root, 1);
+      const gen1RawBefore = fs.readFileSync(gen1Path, 'utf8');
+
+      // Append external message to pending intake
+      const appendRes = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_post_accept_1',
+        messageId: 'msg_user_next_1',
+        contentDigest: hash('start successor task'),
+        observedEpoch: store.serverEpoch,
+        observedAt: 1000,
+        createdRevision: 1,
+        provenance: 'external_user',
+      });
+      expectSuccess(appendRes);
+
+      // Verify gen 1 file is untouched
+      expect(fs.readFileSync(gen1Path, 'utf8')).toBe(gen1RawBefore);
+
+      // Append second message
+      const appendRes2 = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_post_accept_2',
+        messageId: 'msg_user_next_2',
+        contentDigest: hash('additional context'),
+        observedEpoch: store.serverEpoch,
+        observedAt: 1001,
+        createdRevision: 2,
+        provenance: 'external_user',
+      });
+      expectSuccess(appendRes2);
+      expect(fs.readFileSync(gen1Path, 'utf8')).toBe(gen1RawBefore);
+
+      // Promote to successor generation 2
+      const succContract = contract({
+        objective: 'Implement successor feature',
+        sourceMessageIds: ['msg_user_next_1', 'msg_user_next_2'],
+      });
+      const promoteRes = store.promotePendingIntake(root, {
+        contract: succContract,
+      });
+      expectSuccess(promoteRes);
+      expect(promoteRes.data.generation).toBe(2);
+
+      // Verify gen 1 file is still byte-for-byte immutable
+      expect(fs.readFileSync(gen1Path, 'utf8')).toBe(gen1RawBefore);
+
+      // Mutate generation 2
+      const mutateRes = store.mutate(root, 1, {
+        type: 'append_user_message',
+        receipt: {
+          id: 'usr_gen2_later',
+          messageId: 'msg_gen2_later',
+          contentDigest: hash('gen2 progress'),
+          observedEpoch: store.serverEpoch,
+          observedAt: 1002,
+          createdRevision: 2,
+          provenance: 'external_user',
+        },
+      });
+      expectSuccess(mutateRes);
+      expect(mutateRes.data.generation).toBe(2);
+
+      // Verify gen 1 file remains completely untouched
+      expect(fs.readFileSync(gen1Path, 'utf8')).toBe(gen1RawBefore);
+    });
+
+    test('manifest routes to active generation, assigns generation 1 to <hash>.json and successors to <hash>.gNNNNNNNN.json', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_manifest_routing';
+      setupAcceptedSession(store, root);
+
+      const manifestRes = store.readManifest(root);
+      expectSuccess(manifestRes);
+      expect(manifestRes.data.currentGeneration).toBe(1);
+      expect(manifestRes.data.pendingSuccessor).toBeUndefined();
+
+      expect(fs.existsSync(store.recordPath(root, 1))).toBe(true);
+      expect(fs.existsSync(store.recordPath(root, 2))).toBe(false);
+
+      // Append to intake
+      expectSuccess(
+        store.appendPendingIntakeUserMessage(root, {
+          id: 'usr_succ',
+          messageId: 'msg_succ_start',
+          contentDigest: hash('successor objective'),
+          observedEpoch: store.serverEpoch,
+          observedAt: 2000,
+          createdRevision: 1,
+          provenance: 'external_user',
+        }),
+      );
+
+      const manifestWithPending = store.readManifest(root);
+      expectSuccess(manifestWithPending);
+      expect(manifestWithPending.data.pendingSuccessor).toMatchObject({
+        generation: 2,
+        boundaryMessageId: 'msg_succ_start',
+        userMessageCount: 1,
+      });
+
+      // Promote
+      const promoteRes = store.promotePendingIntake(root, {
+        contract: contract({
+          objective: 'Phase 2 objective',
+          sourceMessageIds: ['msg_succ_start'],
+        }),
+      });
+      expectSuccess(promoteRes);
+
+      // Manifest updated
+      const manifestAfterPromote = store.readManifest(root);
+      expectSuccess(manifestAfterPromote);
+      expect(manifestAfterPromote.data.currentGeneration).toBe(2);
+      expect(manifestAfterPromote.data.pendingSuccessor).toBeUndefined();
+
+      // Generation 2 record exists at g00000002.json
+      expect(fs.existsSync(store.recordPath(root, 2))).toBe(true);
+      expect(store.recordPath(root, 2)).toMatch(/\.g00000002\.json$/);
+
+      // Active read resolves generation 2
+      const activeRead = store.read(root);
+      expectSuccess(activeRead);
+      expect(activeRead.data.generation).toBe(2);
+      expect(activeRead.data.contract.objective).toBe('Phase 2 objective');
+
+      // Historical read resolves generation 1
+      const histRead = store.readGeneration(root, 1);
+      expectSuccess(histRead);
+      expect(histRead.data.generation).toBe(1);
+      expect(histRead.data.phase).toBe('accepted');
+
+      // Out of bounds generation returns missing error
+      const outOfBounds = store.readGeneration(root, 3);
+      expect(outOfBounds.success).toBe(false);
+      expect(outOfBounds.code).toBe('missing');
+    });
+
+    test('lazy compatibility creates manifest for existing record without rewriting accepted bytes', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_lazy_compat';
+      setupAcceptedSession(store, root);
+
+      const gen1File = store.recordPath(root, 1);
+      const manifestFile = store.manifestPath(root);
+      const rawBefore = fs.readFileSync(gen1File, 'utf8');
+
+      // Delete manifest
+      fs.unlinkSync(manifestFile);
+      expect(fs.existsSync(manifestFile)).toBe(false);
+
+      // Fresh store instance reads without mutating disk (read APIs are read-only)
+      const freshStore = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const readRes = freshStore.read(root);
+      expectSuccess(readRes);
+      expect(readRes.data.phase).toBe('accepted');
+      expect(readRes.data.generation).toBe(1);
+      expect(fs.existsSync(manifestFile)).toBe(false);
+
+      // Explicit recovery path lazily creates manifest under lock without rewriting record bytes
+      expectSuccess(freshStore.recover(root));
+      expect(fs.existsSync(manifestFile)).toBe(true);
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+      expect(manifest.currentGeneration).toBe(1);
+
+      // gen 1 bytes were NOT rewritten
+      expect(fs.readFileSync(gen1File, 'utf8')).toBe(rawBefore);
+    });
+
+    test('intake idempotency, conflict detection, and provenance validation', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_intake_rules';
+      setupAcceptedSession(store, root);
+
+      // Non-external user provenance fails
+      const unverifiedRes = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_bad',
+        messageId: 'msg_bad',
+        contentDigest: hash('content'),
+        observedEpoch: store.serverEpoch,
+        observedAt: 3000,
+        createdRevision: 1,
+        provenance: 'legacy_unverified' as never,
+      });
+      expect(unverifiedRes.success).toBe(false);
+      expect(unverifiedRes.code).toBe('invalid_transition');
+
+      // First valid external message creates intake
+      const firstRes = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_valid_1',
+        messageId: 'msg_user_idempotent',
+        contentDigest: hash('original text'),
+        observedEpoch: store.serverEpoch,
+        observedAt: 3001,
+        createdRevision: 1,
+        provenance: 'external_user',
+      });
+      expectSuccess(firstRes);
+      expect(firstRes.status).toBe('created');
+
+      // Exact duplicate messageId and contentDigest returns noop
+      const dupRes = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_dup',
+        messageId: 'msg_user_idempotent',
+        contentDigest: hash('original text'),
+        observedEpoch: store.serverEpoch,
+        observedAt: 3002,
+        createdRevision: 2,
+        provenance: 'external_user',
+      });
+      expectSuccess(dupRes);
+      expect(dupRes.status).toBe('noop');
+      expect(dupRes.data.intake?.userMessages).toHaveLength(1);
+      expect(dupRes.data.receipt.messageId).toBe('msg_user_idempotent');
+      expect(dupRes.data.stagedInPendingIntake).toBe(true);
+
+      // Conflicting messageId fails closed
+      const conflictRes = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_conflict',
+        messageId: 'msg_user_idempotent',
+        contentDigest: hash('conflicting different text'),
+        observedEpoch: store.serverEpoch,
+        observedAt: 3003,
+        createdRevision: 3,
+        provenance: 'external_user',
+      });
+      expect(conflictRes.success).toBe(false);
+      expect(conflictRes.code).toBe('invalid_transition');
+    });
+
+    test('promotion requires contract sourceMessageIds to resolve to retained intake receipts and boundary message', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_promote_validation';
+      setupAcceptedSession(store, root);
+
+      expectSuccess(
+        store.appendPendingIntakeUserMessage(root, {
+          id: 'usr_bound',
+          messageId: 'msg_bound_id',
+          contentDigest: hash('boundary instruction'),
+          observedEpoch: store.serverEpoch,
+          observedAt: 4000,
+          createdRevision: 1,
+          provenance: 'external_user',
+        }),
+      );
+
+      // 1. Contract omits boundary message ID
+      const missingBoundary = store.promotePendingIntake(root, {
+        contract: contract({
+          sourceMessageIds: ['some_other_msg'],
+        }),
+      });
+      expect(missingBoundary.success).toBe(false);
+      expect(missingBoundary.code).toBe('invalid_transition');
+
+      // 2. Contract includes boundary message ID plus an unrecorded message ID
+      const unknownMsg = store.promotePendingIntake(root, {
+        contract: contract({
+          sourceMessageIds: ['msg_bound_id', 'msg_not_in_intake'],
+        }),
+      });
+      expect(unknownMsg.success).toBe(false);
+      expect(unknownMsg.code).toBe('invalid_transition');
+
+      // 3. Valid contract referencing boundary message ID promotes successfully
+      const validPromote = store.promotePendingIntake(root, {
+        contract: contract({
+          objective: 'Promoted feature',
+          sourceMessageIds: ['msg_bound_id'],
+        }),
+      });
+      expectSuccess(validPromote);
+      expect(validPromote.data.generation).toBe(2);
+      expect(validPromote.data.lineage).toBeDefined();
+      expect(validPromote.data.lineage?.boundaryMessageId).toBe('msg_bound_id');
+      expect(validPromote.data.lineage?.predecessorGeneration).toBe(1);
+    });
+
+    test('session-wide external message identity checks all predecessor generations and prevents historical replay as boundary', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_session_wide_identity';
+      setupAcceptedSession(store, root);
+
+      // The accepted generation 1 has a user message:
+      const gen1 = store.read(root);
+      expectSuccess(gen1);
+      expect(gen1.data.receipts.userMessages.length).toBeGreaterThan(0);
+      const histMsg = gen1.data.receipts.userMessages[0];
+
+      // 1. Replay of generation 1 user message immediately after gen 1 acceptance
+      // Exact duplicate messageId and contentDigest is a true no-op and CANNOT create intake or become boundary
+      const replayRes = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_replay_attempt',
+        messageId: histMsg.messageId,
+        contentDigest: histMsg.contentDigest,
+        observedEpoch: store.serverEpoch,
+        observedAt: 1500,
+        createdRevision: 1,
+        provenance: 'external_user',
+      });
+      expectSuccess(replayRes);
+      expect(replayRes.status).toBe('noop');
+
+      // Verify no pending intake was created and manifest has no pendingSuccessor
+      const manifestAfterReplay = store.readManifest(root);
+      expectSuccess(manifestAfterReplay);
+      expect(manifestAfterReplay.data.pendingSuccessor).toBeUndefined();
+      expect(fs.existsSync(store.intakePath(root, 2))).toBe(false);
+
+      // 2. Conflicting content for generation 1 user message fails closed
+      const conflictHistRes = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_conflict_attempt',
+        messageId: histMsg.messageId,
+        contentDigest: hash('conflicting text for gen 1 message'),
+        observedEpoch: store.serverEpoch,
+        observedAt: 1501,
+        createdRevision: 1,
+        provenance: 'external_user',
+      });
+      expect(conflictHistRes.success).toBe(false);
+      expect(conflictHistRes.code).toBe('invalid_transition');
+
+      // Now create a valid intake and promote to generation 2
+      expectSuccess(
+        store.appendPendingIntakeUserMessage(root, {
+          id: 'usr_gen2_init',
+          messageId: 'msg_gen2_valid',
+          contentDigest: hash('gen2 boundary text'),
+          observedEpoch: store.serverEpoch,
+          observedAt: 1502,
+          createdRevision: 1,
+          provenance: 'external_user',
+        }),
+      );
+      const promoteRes = store.promotePendingIntake(root, {
+        contract: contract({
+          objective: 'Generation 2 objective',
+          sourceMessageIds: ['msg_gen2_valid'],
+          goals: [
+            {
+              id: 'goal_gen2',
+              description: 'Goal for gen 2',
+              status: 'satisfied',
+            },
+          ],
+        }),
+      });
+      expectSuccess(promoteRes);
+
+      // Accept generation 2
+      openCheckpoint(store, root, 1, 'tok_k2', 'kickoff', {
+        expiresAt: 20_000,
+      });
+      completeReview(store, root, 2, 'tok_k2', 'CONTINUE');
+      const candidate2 = hash('cand_final_gen2');
+      const entry2 = {
+        id: 'att_final_gen2',
+        kind: 'orchestrator_attestation' as const,
+        description: 'bun test final gen2',
+        assertedStatus: 'passed' as const,
+        assertedFreshness: 'fresh' as const,
+        candidateFingerprint: candidate2,
+        payloadDigest: '',
+        createdRevision: 7,
+        createdAt: 100,
+      };
+      entry2.payloadDigest = attestationDigest(entry2);
+      expectSuccess(
+        store.mutate(root, 6, { type: 'append_evidence', entry: entry2 }),
+      );
+      openCheckpoint(store, root, 7, 'tok_f2', 'final', {
+        candidateFingerprint: candidate2,
+        evidenceAttestationIds: [entry2.id],
+        expiresAt: 20_000,
+      });
+      completeReview(store, root, 8, 'tok_f2', 'ACCEPT');
+      expectSuccess(
+        store.mutate(root, 12, {
+          type: 'finalize',
+          summary: 'Gen 2 accepted',
+        }),
+      );
+
+      // 3. Now we have multiple accepted generations (1 and 2).
+      // Test replay of message from Gen 1:
+      const replayGen1After2 = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_replay_g1',
+        messageId: histMsg.messageId,
+        contentDigest: histMsg.contentDigest,
+        observedEpoch: store.serverEpoch,
+        observedAt: 2500,
+        createdRevision: 1,
+        provenance: 'external_user',
+      });
+      expectSuccess(replayGen1After2);
+      expect(replayGen1After2.status).toBe('noop');
+      expect(store.readManifest(root).data?.pendingSuccessor).toBeUndefined();
+
+      // Test replay of message from Gen 2:
+      const replayGen2 = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_replay_g2',
+        messageId: 'msg_gen2_valid',
+        contentDigest: hash('gen2 boundary text'),
+        observedEpoch: store.serverEpoch,
+        observedAt: 2501,
+        createdRevision: 1,
+        provenance: 'external_user',
+      });
+      expectSuccess(replayGen2);
+      expect(replayGen2.status).toBe('noop');
+      expect(store.readManifest(root).data?.pendingSuccessor).toBeUndefined();
+
+      // Conflicting replay for Gen 2 message fails closed
+      const conflictGen2 = store.appendPendingIntakeUserMessage(root, {
+        id: 'usr_conflict_g2',
+        messageId: 'msg_gen2_valid',
+        contentDigest: hash('conflicting text for gen 2'),
+        observedEpoch: store.serverEpoch,
+        observedAt: 2502,
+        createdRevision: 1,
+        provenance: 'external_user',
+      });
+      expect(conflictGen2.success).toBe(false);
+      expect(conflictGen2.code).toBe('invalid_transition');
+    });
+
+    test('normal read, readGeneration, readManifest, and readPendingIntake are strictly read-only', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_readonly_api_test';
+      setupAcceptedSession(store, root);
+
+      // Stage an intake
+      expectSuccess(
+        store.appendPendingIntakeUserMessage(root, {
+          id: 'usr_ro_test',
+          messageId: 'msg_ro_1',
+          contentDigest: hash('ro text'),
+          observedEpoch: store.serverEpoch,
+          observedAt: 3000,
+          createdRevision: 1,
+          provenance: 'external_user',
+        }),
+      );
+
+      const gen1File = store.recordPath(root, 1);
+      const manifestFile = store.manifestPath(root);
+      const intakeFile = store.intakePath(root, 2);
+
+      const gen1BytesBefore = fs.readFileSync(gen1File, 'utf8');
+      const manifestBytesBefore = fs.readFileSync(manifestFile, 'utf8');
+      const intakeBytesBefore = fs.readFileSync(intakeFile, 'utf8');
+
+      // Call all read APIs repeatedly
+      const r1 = store.read(root);
+      expectSuccess(r1);
+      const r2 = store.readGeneration(root, 1);
+      expectSuccess(r2);
+      const r3 = store.readManifest(root);
+      expectSuccess(r3);
+      const r4 = store.readPendingIntake(root);
+      expectSuccess(r4);
+
+      // Verify zero byte mutations
+      expect(fs.readFileSync(gen1File, 'utf8')).toBe(gen1BytesBefore);
+      expect(fs.readFileSync(manifestFile, 'utf8')).toBe(manifestBytesBefore);
+      expect(fs.readFileSync(intakeFile, 'utf8')).toBe(intakeBytesBefore);
+    });
+
+    test('intake/manifest crash consistency: repairs out-of-date manifest from validated intake and fails on ambiguity', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_crash_consistency_test';
+      setupAcceptedSession(store, root);
+
+      const nextGen = 2;
+      const rootRec = store.read(root);
+      expectSuccess(rootRec);
+      if (!rootRec.data.finalCertificate) return;
+      const certDigest = computeOutcomeFinalCertificateDigest(
+        rootRec.data.finalCertificate,
+      );
+
+      // Scenario A: First-intake-create crash: intake file exists on disk, but manifest has no pendingSuccessor
+      const intake1: import('./controller-schema').OutcomePendingIntake = {
+        schema: 'omos_outcome_intake',
+        schemaVersion: 1,
+        rootSessionId: root,
+        generation: nextGen,
+        predecessorOutcomeId: rootRec.data.outcomeId,
+        predecessorGeneration: 1,
+        predecessorAcceptedRevision: rootRec.data.revision,
+        predecessorCertificateDigest: certDigest,
+        boundaryMessageId: 'msg_crash_1',
+        createdAt: 4000,
+        updatedAt: 4000,
+        userMessages: [
+          {
+            id: 'usr_c1',
+            messageId: 'msg_crash_1',
+            contentDigest: hash('crash text 1'),
+            observedEpoch: store.serverEpoch,
+            observedAt: 4000,
+            createdRevision: 1,
+            provenance: 'external_user',
+          },
+        ],
+      };
+      fs.writeFileSync(
+        store.intakePath(root, nextGen),
+        serializeOutcomeIntake(intake1),
+      );
+
+      // Recovery under lock repairs manifest pendingSuccessor from validated intake
+      const recoverRes = store.recover(root);
+      expectSuccess(recoverRes);
+
+      const manifestAfterRepair = store.readManifest(root);
+      expectSuccess(manifestAfterRepair);
+      expect(manifestAfterRepair.data.pendingSuccessor).toMatchObject({
+        generation: 2,
+        boundaryMessageId: 'msg_crash_1',
+        userMessageCount: 1,
+      });
+
+      // A complete stale summary is replaced, not merely its count/timestamp.
+      const staleManifest = JSON.parse(
+        fs.readFileSync(store.manifestPath(root), 'utf8'),
+      );
+      staleManifest.pendingSuccessor = {
+        ...staleManifest.pendingSuccessor,
+        predecessorOutcomeId: 'out_stale_predecessor',
+        predecessorGeneration: 99,
+        predecessorAcceptedRevision: 99,
+        predecessorCertificateDigest: hash('stale-certificate'),
+        createdAt: 3999,
+      };
+      fs.writeFileSync(store.manifestPath(root), JSON.stringify(staleManifest));
+      expectSuccess(store.recover(root));
+      const repairedFullSummary = store.readManifest(root);
+      expectSuccess(repairedFullSummary);
+      expect(repairedFullSummary.data.pendingSuccessor).toMatchObject({
+        predecessorOutcomeId: rootRec.data.outcomeId,
+        predecessorGeneration: 1,
+        predecessorAcceptedRevision: rootRec.data.revision,
+        predecessorCertificateDigest: certDigest,
+        createdAt: 4000,
+      });
+
+      // Scenario B: Later-append crash: intake file updated with message 2, but manifest still says userMessageCount 1
+      intake1.userMessages.push({
+        id: 'usr_c2',
+        messageId: 'msg_crash_2',
+        contentDigest: hash('crash text 2'),
+        observedEpoch: store.serverEpoch,
+        observedAt: 4001,
+        createdRevision: 2,
+        provenance: 'external_user',
+      });
+      intake1.updatedAt = 4001;
+      fs.writeFileSync(
+        store.intakePath(root, nextGen),
+        serializeOutcomeIntake(intake1),
+      );
+
+      // Explicit recovery under lock repairs manifest summary
+      const recoverRes2 = store.recover(root);
+      expectSuccess(recoverRes2);
+      const manifestAfterAppendRepair = store.readManifest(root);
+      expectSuccess(manifestAfterAppendRepair);
+      expect(
+        manifestAfterAppendRepair.data.pendingSuccessor?.userMessageCount,
+      ).toBe(2);
+
+      // Scenario C: Ambiguity: extra conflicting intake file exists (e.g. generation 3)
+      fs.writeFileSync(
+        store.intakePath(root, 3),
+        serializeOutcomeIntake(intake1),
+      );
+      const ambiguousRecover = store.recover(root);
+      expect(ambiguousRecover.success).toBe(false);
+      expect(ambiguousRecover.code).toBe('conflict');
+
+      fs.unlinkSync(store.intakePath(root, 3));
+    });
+
+    test('rejects caller-supplied successor outcomeId colliding with predecessor or any historical outcome', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_outcome_id_collision';
+      setupAcceptedSession(store, root);
+
+      const rootRes = store.read(root);
+      expectSuccess(rootRes);
+      const gen1OutcomeId = rootRes.data.outcomeId;
+
+      expectSuccess(
+        store.appendPendingIntakeUserMessage(root, {
+          id: 'usr_col_bound',
+          messageId: 'msg_col_bound',
+          contentDigest: hash('col text'),
+          observedEpoch: store.serverEpoch,
+          observedAt: 5000,
+          createdRevision: 1,
+          provenance: 'external_user',
+        }),
+      );
+
+      // Promoting with same outcomeId as generation 1 fails closed
+      const collideRes = store.promotePendingIntake(root, {
+        outcomeId: gen1OutcomeId,
+        contract: contract({
+          sourceMessageIds: ['msg_col_bound'],
+        }),
+      });
+      expect(collideRes.success).toBe(false);
+      expect(collideRes.code).toBe('invalid_transition');
+    });
+
+    test('preserves OutcomeStoreError codes through #withLock and write paths', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+        filesystem: {
+          writeSync: () => {
+            throw new OutcomeStoreError(
+              'durability_uncertain',
+              'Disk sync failed',
+            );
+          },
+        },
+      });
+      const root = 'root_error_code_preservation';
+      const initRes = store.init(root, { contract: contract() });
+      expect(initRes.success).toBe(false);
+      expect(initRes.code).toBe('durability_uncertain');
+    });
+
+    test('real promotion crash state adoption where old pending manifest remains', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_real_crash_adoption';
+      setupAcceptedSession(store, root);
+
+      // Append to intake: manifest now has currentGeneration: 1 and pendingSuccessor: generation 2
+      expectSuccess(
+        store.appendPendingIntakeUserMessage(root, {
+          id: 'usr_orphan_real',
+          messageId: 'msg_orphan_real',
+          contentDigest: hash('orphan real text'),
+          observedEpoch: store.serverEpoch,
+          observedAt: 6000,
+          createdRevision: 1,
+          provenance: 'external_user',
+        }),
+      );
+
+      const manifestBefore = store.readManifest(root);
+      expectSuccess(manifestBefore);
+      expect(manifestBefore.data.currentGeneration).toBe(1);
+      expect(manifestBefore.data.pendingSuccessor?.generation).toBe(2);
+
+      // Simulate real crash during promotion:
+      // Successor record for generation 2 is written to disk, intake file still exists,
+      // and manifest has NOT yet been updated (remains at currentGeneration: 1, pendingSuccessor: 2).
+      const predRes = store.read(root);
+      expectSuccess(predRes);
+      if (!predRes.data.finalCertificate) return;
+      const pred = predRes.data;
+      const certDigest = computeOutcomeFinalCertificateDigest(
+        pred.finalCertificate,
+      );
+      const lineageDigest = computeOutcomeSuccessorLineageDigest({
+        predecessorOutcomeId: pred.outcomeId,
+        predecessorGeneration: 1,
+        predecessorAcceptedRevision: pred.revision,
+        predecessorCertificateDigest: certDigest,
+        boundaryMessageId: 'msg_orphan_real',
+      });
+
+      const orphanGen2: OutcomeRecord = {
+        schema: 'omos_outcome_record',
+        schemaVersion: 2,
+        generation: 2,
+        lineage: {
+          predecessorOutcomeId: pred.outcomeId,
+          predecessorGeneration: 1,
+          predecessorAcceptedRevision: pred.revision,
+          predecessorCertificateDigest: certDigest,
+          boundaryMessageId: 'msg_orphan_real',
+          lineageDigest,
+        },
+        outcomeId: 'out_orphan_gen2_unique',
+        rootSessionId: root,
+        serverEpoch: store.serverEpoch,
+        revision: 1,
+        nextClaimGeneration: 1,
+        contractDigest: computeOutcomeContractDigest(
+          contract({ sourceMessageIds: ['msg_orphan_real'] }),
+        ),
+        createdAt: 6001,
+        updatedAt: 6001,
+        phase: 'active',
+        contract: contract({ sourceMessageIds: ['msg_orphan_real'] }),
+        kickoffGate: {
+          policyVersion: 1,
+          state: 'required',
+          contractDigest: computeOutcomeContractDigest(
+            contract({ sourceMessageIds: ['msg_orphan_real'] }),
+          ),
+          attempts: 0,
+          maxAttempts: 2,
+        },
+        resolvedActionArchive: {
+          count: 0,
+          chainDigest: initialActionArchiveChainDigest(),
+        },
+        receipts: {
+          evidence: [],
+          userMessages: [
+            {
+              id: 'usr_orphan_real',
+              messageId: 'msg_orphan_real',
+              contentDigest: hash('orphan real text'),
+              observedEpoch: store.serverEpoch,
+              observedAt: 6000,
+              createdRevision: 1,
+              provenance: 'external_user',
+            },
+          ],
+          decisions: [],
+          authorizations: [],
+          handoffSupersessions: [],
+        },
+        reviewSummaries: [],
+        operations: [],
+        actionsRequired: [],
+      };
+
+      fs.writeFileSync(
+        store.recordPath(root, 2),
+        serializeOutcomeRecord(orphanGen2),
+      );
+
+      // A promoted record must preserve the complete intake receipt set.
+      const mismatchedOrphan = structuredClone(orphanGen2);
+      mismatchedOrphan.receipts.userMessages[0].contentDigest = hash(
+        'tampered promoted receipt',
+      );
+      fs.writeFileSync(
+        store.recordPath(root, 2),
+        serializeOutcomeRecord(mismatchedOrphan),
+      );
+      const rejectedMismatch = store.recover(root);
+      expect(rejectedMismatch.success).toBe(false);
+      expect(rejectedMismatch.code).toBe('conflict');
+      fs.writeFileSync(
+        store.recordPath(root, 2),
+        serializeOutcomeRecord(orphanGen2),
+      );
+
+      // Reading through read() is read-only and does not mutate manifest
+      const roRead = store.read(root);
+      expectSuccess(roRead);
+      expect(roRead.data.generation).toBe(1); // Manifest still authoritative at gen 1
+
+      // Explicit recovery under lock adopts the orphan successor, advances manifest to gen 2, and deletes intake
+      const recoverRes = store.recover(root);
+      expectSuccess(recoverRes);
+
+      const manifestAfterRecovery = store.readManifest(root);
+      expectSuccess(manifestAfterRecovery);
+      expect(manifestAfterRecovery.data.currentGeneration).toBe(2);
+      expect(manifestAfterRecovery.data.pendingSuccessor).toBeUndefined();
+
+      // Intake file deleted
+      expect(fs.existsSync(store.intakePath(root, 2))).toBe(false);
+
+      // Active read now resolves generation 2
+      const activeRead = store.read(root);
+      expectSuccess(activeRead);
+      expect(activeRead.data.generation).toBe(2);
+      expect(activeRead.data.outcomeId).toBe('out_orphan_gen2_unique');
+    });
+
+    test('manifest-selected record must match its generation-qualified path', () => {
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        clock: () => 100,
+      });
+      const root = 'root_generation_path_identity';
+      setupAcceptedSession(store, root);
+      const generationOneBytes = fs.readFileSync(store.recordPath(root, 1));
+      fs.writeFileSync(store.recordPath(root, 2), generationOneBytes);
+      const manifest = JSON.parse(
+        fs.readFileSync(store.manifestPath(root), 'utf8'),
+      );
+      manifest.currentGeneration = 2;
+      fs.writeFileSync(store.manifestPath(root), JSON.stringify(manifest));
+
+      const read = store.read(root);
+      expect(read.success).toBe(false);
+      expect(read.code).toBe('corrupt');
+      expect(read.error.message).toContain(
+        'Generation 2 record contains generation 1',
+      );
+    });
   });
 });

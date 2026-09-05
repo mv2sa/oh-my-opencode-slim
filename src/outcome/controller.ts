@@ -15,9 +15,11 @@ import {
   type OutcomeFinalCertificate,
   type OutcomeKickoffGateState,
   type OutcomeManagerReviewSummary,
+  type OutcomePendingIntake,
   type OutcomePendingOperation,
   type OutcomePhase,
   type OutcomeRecord,
+  type OutcomeSessionManifest,
   type OutcomeToolObservation,
   type OutcomeUserMessageReceipt,
 } from './controller-schema';
@@ -349,6 +351,14 @@ export function buildOutcomeManagerInstruction(
 
 export interface OutcomeStatusProjection {
   isManaged: boolean;
+  generation?: number;
+  pendingSuccessor?: {
+    generation: number;
+    boundaryMessageId: string;
+    userMessageCount: number;
+    createdAt: number;
+    updatedAt: number;
+  };
   blocked?: {
     code: string;
     reason: string;
@@ -392,14 +402,16 @@ export type OutcomeControllerResult<T> =
 export interface OutcomeUserTurnResult {
   receipt: OutcomeUserMessageReceipt;
   receiptId: string;
-  status: 'written' | 'noop';
+  status: 'written' | 'noop' | 'created' | 'read' | 'recovered';
   noop: boolean;
+  stagedInPendingIntake?: boolean;
 }
 
 export interface OutcomeBeginResult {
   outcomeId: string;
   revision: number;
   phase: OutcomePhase;
+  generation?: number;
   kickoffGate?: {
     state: OutcomeKickoffGateState;
     attempts: number;
@@ -415,7 +427,8 @@ export interface OutcomeBeginResult {
     fingerprint: string;
   };
   dispatchNudgePending: boolean;
-  idempotent?: true;
+  idempotent?: boolean;
+  promotedFromPendingIntake?: boolean;
 }
 
 export interface OutcomeCheckpointParams {
@@ -676,6 +689,41 @@ export class OutcomeController {
     return readRes;
   }
 
+  readRecordGeneration(
+    rootSessionId: string,
+    generation: number,
+  ): OutcomeStoreResult<OutcomeRecord> {
+    return this.#store.readGeneration(rootSessionId, generation);
+  }
+
+  readManifest(
+    rootSessionId: string,
+  ): OutcomeStoreResult<OutcomeSessionManifest> {
+    return this.#store.readManifest(rootSessionId);
+  }
+
+  readPendingIntake(
+    rootSessionId: string,
+  ): OutcomeStoreResult<OutcomePendingIntake> {
+    return this.#store.readPendingIntake(rootSessionId);
+  }
+
+  getHistoricalGenerationStatus(
+    rootSessionId: string,
+    generation: number,
+  ): OutcomeStatusProjection {
+    const res = this.#store.readGeneration(rootSessionId, generation);
+    if (!res.success) {
+      return {
+        isManaged: false,
+        blocked: { code: res.code, reason: res.error.message },
+        actionsRequired: [],
+        activeOperations: [],
+      };
+    }
+    return this.#projectRecordStatus(res.data, undefined, generation);
+  }
+
   getStatus(rootSessionId: string): OutcomeStatusProjection {
     const res = this.readRecord(rootSessionId);
     if (!res.success) {
@@ -694,9 +742,33 @@ export class OutcomeController {
         activeOperations: [],
       };
     }
-    const record = res.data;
+    const manifestRes = this.#store.readManifest(rootSessionId);
+    const manifest = manifestRes.success ? manifestRes.data : undefined;
+    return this.#projectRecordStatus(res.data, manifest);
+  }
+
+  #projectRecordStatus(
+    record: OutcomeRecord,
+    manifest?: OutcomeSessionManifest,
+    generationOverride?: number,
+  ): OutcomeStatusProjection {
+    const pendingSuccessor = manifest?.pendingSuccessor
+      ? {
+          generation: manifest.pendingSuccessor.generation,
+          boundaryMessageId: manifest.pendingSuccessor.boundaryMessageId,
+          userMessageCount: manifest.pendingSuccessor.userMessageCount,
+          createdAt: manifest.pendingSuccessor.createdAt,
+          updatedAt: manifest.pendingSuccessor.updatedAt,
+        }
+      : undefined;
+
     return {
       isManaged: true,
+      generation:
+        generationOverride ??
+        record.generation ??
+        (manifest ? manifest.currentGeneration : 1),
+      pendingSuccessor,
       outcomeId: record.outcomeId,
       revision: record.revision,
       phase: record.phase,
@@ -753,8 +825,12 @@ export class OutcomeController {
     if (record.checkpoint && record.checkpoint.state === 'claimed') {
       const claim = record.checkpoint;
       const rawToken =
-        this.#claimSecrets.get(`${rootSessionId}:${claim.checkpointId}`) ??
-        this.#claimSecrets.get(`${rootSessionId}:${claim.claimGeneration}`);
+        this.#claimSecrets.get(
+          `${rootSessionId}:${record.outcomeId}:${claim.checkpointId}`,
+        ) ??
+        this.#claimSecrets.get(
+          `${rootSessionId}:${record.outcomeId}:${claim.claimGeneration}`,
+        );
 
       if (
         rawToken &&
@@ -909,26 +985,73 @@ export class OutcomeController {
     const validContract = parseRes.data;
 
     let record: OutcomeRecord;
+    let promotedFromPendingIntake = false;
     const existing = this.#store.read(rootSessionId);
     if (existing.success) {
-      const recovered = this.#store.recover(rootSessionId);
-      if (!recovered.success) {
-        return {
-          success: false,
-          error: `Failed to recover existing outcome record: ${recovered.error.message}`,
-          code: recovered.code,
-        };
-      }
-      record = recovered.data;
-      if (
-        record.contractDigest !== computeOutcomeContractDigest(validContract)
-      ) {
-        return {
-          success: false,
-          error:
-            'Existing managed outcome contract differs from the supplied contract',
-          code: 'contract_mismatch',
-        };
+      if (existing.data.phase === 'accepted') {
+        if (
+          existing.data.contractDigest ===
+          computeOutcomeContractDigest(validContract)
+        ) {
+          return {
+            success: true,
+            data: {
+              outcomeId: existing.data.outcomeId,
+              revision: existing.data.revision,
+              phase: existing.data.phase,
+              generation: existing.data.generation ?? 1,
+              kickoffGate: existing.data.kickoffGate
+                ? { ...existing.data.kickoffGate }
+                : undefined,
+              dispatchNudgePending: false,
+              idempotent: true,
+            },
+          };
+        }
+
+        const pendingRes = this.#store.readPendingIntake(rootSessionId);
+        if (pendingRes.success) {
+          const promoteRes = this.#store.promotePendingIntake(rootSessionId, {
+            outcomeId: options?.outcomeId,
+            contract: validContract,
+          });
+          if (!promoteRes.success) {
+            return {
+              success: false,
+              error: `Failed to begin successor outcome: ${promoteRes.error.message}`,
+              code: promoteRes.code,
+            };
+          }
+          record = promoteRes.data;
+          promotedFromPendingIntake = true;
+        } else {
+          return {
+            success: false,
+            error:
+              'A successor outcome requires fresh external user provenance staged in pending intake',
+            code: 'invalid_transition',
+          };
+        }
+      } else {
+        const recovered = this.#store.recover(rootSessionId);
+        if (!recovered.success) {
+          return {
+            success: false,
+            error: `Failed to recover existing outcome record: ${recovered.error.message}`,
+            code: recovered.code,
+          };
+        }
+        record = recovered.data;
+        if (
+          record.contractDigest !== computeOutcomeContractDigest(validContract)
+        ) {
+          return {
+            success: false,
+            error:
+              'Existing managed outcome contract differs from the supplied contract',
+            code: 'contract_mismatch',
+          };
+        }
       }
     } else if (existing.code === 'missing') {
       const initRes = this.#store.init(rootSessionId, {
@@ -980,6 +1103,7 @@ export class OutcomeController {
             outcomeId: record.outcomeId,
             revision: record.revision,
             phase: record.phase,
+            generation: record.generation ?? 1,
             kickoffGate: {
               state: record.kickoffGate.state,
               attempts: record.kickoffGate.attempts,
@@ -1000,6 +1124,7 @@ export class OutcomeController {
             outcomeId: record.outcomeId,
             revision: record.revision,
             phase: record.phase,
+            generation: record.generation ?? 1,
             kickoffGate: {
               state: record.kickoffGate.state,
               attempts: record.kickoffGate.attempts,
@@ -1032,11 +1157,11 @@ export class OutcomeController {
       record = mutateRes.data;
       const checkpoint = record.checkpoint as OutcomeCheckpointClaim;
       this.#claimSecrets.set(
-        `${rootSessionId}:${checkpoint.checkpointId}`,
+        `${rootSessionId}:${record.outcomeId}:${checkpoint.checkpointId}`,
         claimToken,
       );
       this.#claimSecrets.set(
-        `${rootSessionId}:${checkpoint.claimGeneration}`,
+        `${rootSessionId}:${record.outcomeId}:${checkpoint.claimGeneration}`,
         claimToken,
       );
 
@@ -1046,6 +1171,7 @@ export class OutcomeController {
           outcomeId: record.outcomeId,
           revision: record.revision,
           phase: record.phase,
+          generation: record.generation ?? 1,
           kickoffGate: {
             state: record.kickoffGate.state,
             attempts: record.kickoffGate.attempts,
@@ -1061,6 +1187,7 @@ export class OutcomeController {
             fingerprint: checkpoint.checkpointFingerprint,
           },
           dispatchNudgePending: true,
+          promotedFromPendingIntake,
         },
       };
     }
@@ -1264,11 +1391,11 @@ export class OutcomeController {
     const updated = mutateRes.data;
     const checkpoint = updated.checkpoint as OutcomeCheckpointClaim;
     this.#claimSecrets.set(
-      `${rootSessionId}:${checkpoint.checkpointId}`,
+      `${rootSessionId}:${updated.outcomeId}:${checkpoint.checkpointId}`,
       claimToken,
     );
     this.#claimSecrets.set(
-      `${rootSessionId}:${checkpoint.claimGeneration}`,
+      `${rootSessionId}:${updated.outcomeId}:${checkpoint.claimGeneration}`,
       claimToken,
     );
 
@@ -1611,8 +1738,12 @@ export class OutcomeController {
       };
     }
     const claimToken =
-      this.#claimSecrets.get(`${rootSessionId}:${claim.checkpointId}`) ??
-      this.#claimSecrets.get(`${rootSessionId}:${claim.claimGeneration}`) ??
+      this.#claimSecrets.get(
+        `${rootSessionId}:${record.outcomeId}:${claim.checkpointId}`,
+      ) ??
+      this.#claimSecrets.get(
+        `${rootSessionId}:${record.outcomeId}:${claim.claimGeneration}`,
+      ) ??
       '';
     const isRecoveredReview =
       claim.state === 'result_available' &&
@@ -2679,7 +2810,13 @@ export class OutcomeController {
       };
     }
     const claimToken =
-      this.#claimSecrets.get(`${rootSessionId}:${claim.checkpointId}`) ?? '';
+      this.#claimSecrets.get(
+        `${rootSessionId}:${record.outcomeId}:${claim.checkpointId}`,
+      ) ??
+      this.#claimSecrets.get(
+        `${rootSessionId}:${record.outcomeId}:${claim.claimGeneration}`,
+      ) ??
+      '';
     const res = this.#store.mutate(rootSessionId, record.revision, {
       type: 'expire_checkpoint',
       checkpointId: params.checkpointId,
@@ -3050,6 +3187,12 @@ export class OutcomeController {
       };
     }
     const record = recRes.data;
+    if (record.phase === 'accepted') {
+      return {
+        success: true,
+        data: { observationId: '', operationId: '' },
+      };
+    }
 
     const argumentDigest = canonicalDigest('omos/tool-args/v1', args);
     const now = this.#clock();
@@ -3122,6 +3265,12 @@ export class OutcomeController {
         };
       }
       const record = recRes.data;
+      if (record.phase === 'accepted') {
+        return {
+          success: true,
+          data: { observationId: '', operationId: '' },
+        };
+      }
 
       const completeRes = this.#store.mutate(rootSessionId, record.revision, {
         type: 'complete_tool_call',
@@ -3180,6 +3329,45 @@ export class OutcomeController {
       }
       const record = recRes.data;
 
+      if (record.phase === 'accepted') {
+        const receiptId = `usr_${this.#randomId().replace(/-/g, '').slice(0, 16)}`;
+        const now = this.#clock();
+        const receipt: OutcomeUserMessageReceipt = {
+          id: receiptId,
+          messageId: canonicalMessageId,
+          contentDigest,
+          observedEpoch: this.#serverEpoch,
+          observedAt: now,
+          createdRevision: 1,
+          provenance: 'external_user',
+        };
+
+        const intakeRes = this.#store.appendPendingIntakeUserMessage(
+          rootSessionId,
+          receipt,
+        );
+        if (intakeRes.success) {
+          return {
+            success: true,
+            data: {
+              receipt: intakeRes.data.receipt,
+              receiptId: intakeRes.data.receipt.id,
+              status: intakeRes.status,
+              noop: intakeRes.status === 'noop',
+              stagedInPendingIntake: intakeRes.data.stagedInPendingIntake,
+            },
+          };
+        }
+        if (intakeRes.code === 'conflict') {
+          continue;
+        }
+        return {
+          success: false,
+          error: intakeRes.error.message,
+          code: intakeRes.code,
+        };
+      }
+
       const receiptId = `usr_${this.#randomId().replace(/-/g, '').slice(0, 16)}`;
       const now = this.#clock();
       const receipt: OutcomeUserMessageReceipt = {
@@ -3199,16 +3387,29 @@ export class OutcomeController {
 
       if (mutateRes.success) {
         if (mutateRes.status === 'noop') {
-          const existing = mutateRes.data.receipts.userMessages.find(
-            (entry) => entry.messageId === canonicalMessageId,
+          const durable = this.#store.findUserMessageReceipt(
+            rootSessionId,
+            canonicalMessageId,
+            contentDigest,
           );
+          if (!durable.success) {
+            if (durable.code === 'missing') continue;
+            return {
+              success: false,
+              error: durable.error.message,
+              code: durable.code,
+            };
+          }
+          if (!durable.data.receipt) continue;
           return {
             success: true,
             data: {
-              receipt: existing ?? receipt,
-              receiptId: existing?.id ?? receipt.id,
+              receipt: durable.data.receipt,
+              receiptId: durable.data.receipt.id,
               status: 'noop',
               noop: true,
+              stagedInPendingIntake:
+                durable.data.stagedInPendingIntake || undefined,
             },
           };
         }
@@ -3292,6 +3493,12 @@ export class OutcomeController {
       };
     }
     const record = recRes.data;
+    if (marker.outcomeId !== record.outcomeId) {
+      return {
+        success: false,
+        error: `Dispatch marker outcomeId '${marker.outcomeId}' does not match active outcome '${record.outcomeId}'`,
+      };
+    }
     const claim = record.checkpoint;
     if (!claim) {
       return {
@@ -3383,8 +3590,12 @@ export class OutcomeController {
       );
     }
     const claimToken =
-      this.#claimSecrets.get(`${sessionID}:${claim.checkpointId}`) ??
-      this.#claimSecrets.get(`${sessionID}:${claim.claimGeneration}`) ??
+      this.#claimSecrets.get(
+        `${sessionID}:${claim.outcomeId}:${claim.checkpointId}`,
+      ) ??
+      this.#claimSecrets.get(
+        `${sessionID}:${claim.outcomeId}:${claim.claimGeneration}`,
+      ) ??
       '';
 
     if (claim.state === 'dispatching') {

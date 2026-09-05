@@ -775,9 +775,12 @@ describe('Outcome Controller plugin integration', () => {
       const files = await Array.fromAsync(
         new Bun.Glob('*.json').scan({ cwd: recordPath, absolute: true }),
       );
-      expect(files).toHaveLength(1);
+      const recordFiles = files.filter(
+        (f) => !f.endsWith('.manifest.json') && !f.endsWith('.intake.json'),
+      );
+      expect(recordFiles).toHaveLength(1);
       const record = JSON.parse(
-        await Bun.file(files[0]).text(),
+        await Bun.file(recordFiles[0]).text(),
       ) as OutcomeRecord;
       const checkpoint = record.checkpoint;
       expect(checkpoint).toBeDefined();
@@ -809,7 +812,7 @@ describe('Outcome Controller plugin integration', () => {
       record.operations = [];
       record.receipts.evidence = [];
       record.revision += 1;
-      await Bun.write(files[0], serializeOutcomeRecord(record));
+      await Bun.write(recordFiles[0], serializeOutcomeRecord(record));
 
       await expect(
         hooks['tool.execute.before']?.(
@@ -840,7 +843,7 @@ describe('Outcome Controller plugin integration', () => {
       });
 
       const rejectedRecord = JSON.parse(
-        await Bun.file(files[0]).text(),
+        await Bun.file(recordFiles[0]).text(),
       ) as OutcomeRecord;
       expect(rejectedRecord.operations).toEqual([]);
       expect(
@@ -897,8 +900,12 @@ describe('Outcome Controller plugin integration', () => {
       const files = await Array.fromAsync(
         new Bun.Glob('*.json').scan({ cwd: recordPath, absolute: true }),
       );
+      const recordFiles = files.filter(
+        (f) => !f.endsWith('.manifest.json') && !f.endsWith('.intake.json'),
+      );
+      expect(recordFiles).toHaveLength(1);
       const record = JSON.parse(
-        await Bun.file(files[0]).text(),
+        await Bun.file(recordFiles[0]).text(),
       ) as OutcomeRecord;
       expect(record.operations).toEqual([]);
       expect(record.checkpoint).toMatchObject({
@@ -906,6 +913,46 @@ describe('Outcome Controller plugin integration', () => {
         managerTaskId: 'mgr_success',
       });
       expect(record.checkpoint?.managerGeneration).toBeNumber();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('integration JSON enumeration distinguishes outcome records from both manifest and staged intake', async () => {
+    const { hooks, root } = await createOutcomeHooks();
+    try {
+      await hooks.tool?.outcome_control?.execute(
+        { action: 'begin', contract: contract('msg_enum_init') },
+        { sessionID: root, agent: 'orchestrator' } as never,
+      );
+
+      // Write a simulated staged intake file in outcomes directory
+      const recordDir = `${configDir}/.opencode/outcomes`;
+      const intakePath = `${recordDir}/fake_hash.g00000002.intake.json`;
+      await Bun.write(
+        intakePath,
+        JSON.stringify({
+          schema: 'omos_outcome_intake',
+          schemaVersion: 1,
+          rootSessionId: root,
+          generation: 2,
+          boundaryMessageId: 'msg_enum_init',
+          userMessages: [],
+        }),
+      );
+
+      const allFiles = await Array.fromAsync(
+        new Bun.Glob('*.json').scan({ cwd: recordDir, absolute: true }),
+      );
+      expect(allFiles.length).toBeGreaterThanOrEqual(3); // record, manifest, and intake
+
+      const outcomeRecordsOnly = allFiles.filter(
+        (f) => !f.endsWith('.manifest.json') && !f.endsWith('.intake.json'),
+      );
+      expect(outcomeRecordsOnly).toHaveLength(1);
+      expect(outcomeRecordsOnly[0]).toMatch(/\.json$/);
+      expect(outcomeRecordsOnly[0]).not.toContain('.manifest.');
+      expect(outcomeRecordsOnly[0]).not.toContain('.intake.');
     } finally {
       await hooks.dispose?.();
     }

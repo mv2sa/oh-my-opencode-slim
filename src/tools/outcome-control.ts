@@ -45,7 +45,7 @@ export function createOutcomeControlTool(
   const outcome_control = tool({
     description: `Authoritative outcome lifecycle and governance control tool for orchestrator.
 
-Use this tool to establish durable outcome contracts (begin), open checkpoint reviews (checkpoint), submit evidence attestations (submit_evidence), register bounded repository waiver references (register_repository_waiver), reconcile Outcome Manager reviews (reconcile_review), update goal progress (update_goal_status), revise contracts with user provenance (revise_contract), resolve user decisions or Controller actions, complete external handoffs, finalize certified completion (finalize), or inspect status (status). Outcome Manager is not permitted to call this tool.`,
+Use this tool to establish durable outcome contracts (begin, or begin after acceptance to promote pending intake into a successor outcome), open checkpoint reviews (checkpoint), submit evidence attestations (submit_evidence), register bounded repository waiver references (register_repository_waiver), reconcile Outcome Manager reviews (reconcile_review), update goal progress (update_goal_status), revise contracts with user provenance (revise_contract), resolve user decisions or Controller actions, complete external handoffs, finalize certified completion (finalize), or inspect status (status, optionally for a historical generation via generation argument). Outcome Manager is not permitted to call this tool.`,
     args: {
       action: z
         .enum([
@@ -72,6 +72,14 @@ Use this tool to establish durable outcome contracts (begin), open checkpoint re
         .any()
         .optional()
         .describe('Complete OutcomeContract object for begin action'),
+      generation: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          'Optional 1-based generation number for historical inspection with action="status"',
+        ),
       outcomeId: z.string().optional().describe('Optional custom outcome ID'),
       kind: z
         .enum(['kickoff', 'decision', 'exception', 'final'])
@@ -249,6 +257,18 @@ Use this tool to establish durable outcome contracts (begin), open checkpoint re
 
       switch (args.action) {
         case 'status': {
+          const generation =
+            typeof args.generation === 'number' &&
+            Number.isInteger(args.generation)
+              ? args.generation
+              : undefined;
+          if (generation !== undefined) {
+            const hist = controller.getHistoricalGenerationStatus(
+              sessionID,
+              generation,
+            );
+            return JSON.stringify(hist, null, 2);
+          }
           const status = controller.getStatus(sessionID);
           return JSON.stringify(status, null, 2);
         }

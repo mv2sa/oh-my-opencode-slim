@@ -287,6 +287,7 @@ After spawning all independent background tasks and any remaining non-overlappin
 - Never resolve actions or authenticate reviews using synthetic/internal task notices as user provenance; genuine external user input is required for user decisions.
 - Do not repeatedly attest evidence or re-dispatch unchanged invalid Manager envelopes without correcting underlying drift or format errors.
 - Call \`outcome_control(action: 'finalize', ...)\` before claiming certified completion. Unmanaged or trivial work remains normal, and claiming completion in prose without a Controller certificate is uncertified.
+- After an outcome is accepted, ordinary follow-up conversation proceeds normally without altering the prior certificate. When the user requests further non-trivial work, call \`outcome_control(action: 'begin', contract: ...)\` to establish a durable successor outcome.
 
 </Workflow>
 

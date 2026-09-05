@@ -5580,4 +5580,510 @@ describe('OutcomeController service over frozen store', () => {
       expect(changedCandidate.success).toBe(false);
     });
   });
+
+  describe('Successor outcome controller lifecycle', () => {
+    let reviewResultText = '';
+    let currentTaskId = 'mgr_task_1';
+    let currentGeneration = 1;
+
+    function createTestController(dir: string, root: string) {
+      return new OutcomeController({
+        storeDirectory: dir,
+        getManagerTaskRecord: (taskId) => ({
+          taskID: taskId,
+          parentSessionID: root,
+          agent: 'outcome-manager',
+          generation: currentGeneration,
+          state: 'completed',
+        }),
+        readChildSessionResult: async () => ({
+          text: reviewResultText,
+          empty: false,
+          terminal: true,
+        }),
+        consumeManagerTask: () => true,
+      });
+    }
+
+    async function setupAcceptedOutcome(
+      controller: OutcomeController,
+      root: string,
+    ): Promise<string> {
+      const beginRes = controller.begin(
+        root,
+        testContract({
+          goals: [
+            {
+              id: 'goal_protocol',
+              description: 'Implement the outcome protocol',
+              status: 'satisfied',
+            },
+          ],
+        }),
+      );
+      expect(beginRes.success).toBe(true);
+
+      const sourceTurn = controller.observeExternalUserTurn(
+        root,
+        'msg_initial_req',
+        'Initial request',
+      );
+      expect(sourceTurn.success).toBe(true);
+
+      const kickoffChkId = beginRes.data.checkpoint?.checkpointId;
+      if (!kickoffChkId) throw new Error('kickoff checkpoint missing');
+
+      currentTaskId = 'mgr_kickoff';
+      currentGeneration = 1;
+      reviewResultText = `<outcome_review>${JSON.stringify(
+        validReviewFor(controller, root, 'CONTINUE'),
+      )}</outcome_review>`;
+      controller.validateAndMarkDispatching(
+        root,
+        'call_k',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(
+        root,
+        'call_k',
+        currentTaskId,
+        currentGeneration,
+      );
+      const rKickoff = await controller.reconcileReview(root, {
+        checkpointId: kickoffChkId,
+        managerTaskId: currentTaskId,
+        managerGeneration: currentGeneration,
+      });
+      expect(rKickoff.success).toBe(true);
+
+      const candidate = hash('cand_ctrl_final');
+      const evSubmit = controller.submitEvidence(root, {
+        description: 'bun test final',
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: candidate,
+      });
+      expect(evSubmit.success).toBe(true);
+      if (!evSubmit.success) return '';
+
+      const finalChk = controller.checkpoint(root, {
+        kind: 'final',
+        reason: 'Final review',
+        candidateFingerprint: candidate,
+        evidenceAttestationIds: [evSubmit.data.attestationId],
+      });
+      expect(finalChk.success).toBe(true);
+      if (!finalChk.success) return '';
+
+      currentTaskId = 'mgr_final';
+      currentGeneration = 2;
+      reviewResultText = `<outcome_review>${JSON.stringify(
+        validReviewFor(controller, root, 'ACCEPT', {
+          candidateFingerprint: candidate,
+        }),
+      )}</outcome_review>`;
+      controller.validateAndMarkDispatching(
+        root,
+        'call_f',
+        dispatchInstruction(controller, root),
+      );
+      controller.bindManagerTask(
+        root,
+        'call_f',
+        currentTaskId,
+        currentGeneration,
+      );
+      const rFinal = await controller.reconcileReview(root, {
+        checkpointId: finalChk.data.checkpointId,
+        managerTaskId: currentTaskId,
+        managerGeneration: currentGeneration,
+      });
+      expect(rFinal.success).toBe(true);
+
+      const finRes = controller.finalize(root, {
+        summary: 'Outcome accepted successfully',
+      });
+      expect(finRes.success).toBe(true);
+      return candidate;
+    }
+
+    test('post-accept external user turns stage into pending intake with idempotency and conflict handling', async () => {
+      const root = 'ses_ctrl_post_accept';
+      const controller = createTestController(tempDir, root);
+      await setupAcceptedOutcome(controller, root);
+
+      // Status before follow-up user turn
+      const statusBefore = controller.getStatus(root);
+      expect(statusBefore.phase).toBe('accepted');
+      expect(statusBefore.generation).toBe(1);
+      expect(statusBefore.pendingSuccessor).toBeUndefined();
+
+      // First external user message post-accept
+      const turn1 = controller.observeExternalUserTurn(
+        root,
+        'msg_followup_1',
+        'Can we also implement phase 2?',
+      );
+      expect(turn1.success).toBe(true);
+      if (!turn1.success) return;
+      expect(turn1.data.stagedInPendingIntake).toBe(true);
+      expect(turn1.data.noop).toBe(false);
+
+      // Status now exposes pending successor intake
+      const statusAfter = controller.getStatus(root);
+      expect(statusAfter.phase).toBe('accepted');
+      expect(statusAfter.generation).toBe(1);
+      expect(statusAfter.pendingSuccessor).toMatchObject({
+        generation: 2,
+        boundaryMessageId: 'msg_followup_1',
+        userMessageCount: 1,
+      });
+
+      // Same message with same content returns noop
+      const turnDup = controller.observeExternalUserTurn(
+        root,
+        'msg_followup_1',
+        'Can we also implement phase 2?',
+      );
+      expect(turnDup.success).toBe(true);
+      if (!turnDup.success) return;
+      expect(turnDup.data.noop).toBe(true);
+
+      // Same message with conflicting content fails closed
+      const turnConflict = controller.observeExternalUserTurn(
+        root,
+        'msg_followup_1',
+        'Conflicting text for same ID',
+      );
+      expect(turnConflict.success).toBe(false);
+      expect(turnConflict.code).toBe('invalid_transition');
+    });
+
+    test('historical post-accept replay is a durable no-op and never stages successor authority', async () => {
+      const root = 'ses_ctrl_historical_replay';
+      const controller = createTestController(tempDir, root);
+      await setupAcceptedOutcome(controller, root);
+
+      const before = controller.readRecord(root);
+      expect(before.success).toBe(true);
+      if (!before.success) return;
+      const historical = before.data.contract.sourceMessageIds[0];
+      const receipt = before.data.receipts.userMessages.find(
+        (entry) => entry.messageId === historical,
+      );
+      expect(receipt).toBeDefined();
+      if (!receipt) return;
+
+      const replay = controller.observeExternalUserTurn(
+        root,
+        historical,
+        'Initial request',
+      );
+      expect(replay.success).toBe(true);
+      if (!replay.success) return;
+      expect(replay.data.receipt.id).toBe(receipt.id);
+      expect(replay.data.noop).toBe(true);
+      expect(replay.data.stagedInPendingIntake).toBe(false);
+      expect(controller.getStatus(root).pendingSuccessor).toBeUndefined();
+    });
+
+    test('external turn retries into the active successor when promotion wins the intake race', async () => {
+      const root = 'ses_ctrl_promotion_race';
+      const controller = createTestController(tempDir, root);
+      await setupAcceptedOutcome(controller, root);
+      expect(
+        controller.observeExternalUserTurn(
+          root,
+          'msg_race_boundary',
+          'Start successor',
+        ).success,
+      ).toBe(true);
+
+      const store = controller.store;
+      const originalAppend = store.appendPendingIntakeUserMessage.bind(store);
+      let injected = false;
+      store.appendPendingIntakeUserMessage = ((session, receipt) => {
+        if (!injected) {
+          injected = true;
+          const promoted = store.promotePendingIntake(session, {
+            contract: testContract({
+              objective: 'Race successor',
+              sourceMessageIds: ['msg_race_boundary'],
+            }),
+          });
+          expect(promoted.success).toBe(true);
+          return {
+            success: false,
+            error: new OutcomeStoreError(
+              'conflict',
+              'Active outcome changed while staging successor intake',
+            ),
+            code: 'conflict',
+          };
+        }
+        return originalAppend(session, receipt);
+      }) as typeof store.appendPendingIntakeUserMessage;
+
+      const racedTurn = controller.observeExternalUserTurn(
+        root,
+        'msg_arrived_during_promotion',
+        'More successor context',
+      );
+      expect(racedTurn.success).toBe(true);
+      if (!racedTurn.success) return;
+      expect(racedTurn.data.stagedInPendingIntake).toBeUndefined();
+      const active = controller.readRecord(root);
+      expect(active.success).toBe(true);
+      if (!active.success) return;
+      expect(active.data.generation).toBe(2);
+      expect(
+        active.data.receipts.userMessages.some(
+          (entry) => entry.messageId === 'msg_arrived_during_promotion',
+        ),
+      ).toBe(true);
+    });
+
+    test('successor begin promotes pending intake to active generation 2, preserving receipts and certificate history', async () => {
+      const root = 'ses_ctrl_successor_promote';
+      const controller = createTestController(tempDir, root);
+      await setupAcceptedOutcome(controller, root);
+
+      // Stage two external user messages in intake
+      expect(
+        controller.observeExternalUserTurn(
+          root,
+          'msg_succ_start',
+          'Let us start generation 2 work',
+        ).success,
+      ).toBe(true);
+      expect(
+        controller.observeExternalUserTurn(
+          root,
+          'msg_succ_details',
+          'Details for generation 2',
+        ).success,
+      ).toBe(true);
+
+      // Calling begin with contract referencing intake messages promotes intake to generation 2
+      const succContract = testContract({
+        objective: 'Phase 2 objective',
+        sourceMessageIds: ['msg_succ_start', 'msg_succ_details'],
+      });
+      const beginRes = controller.begin(root, succContract);
+      expect(beginRes.success).toBe(true);
+      if (!beginRes.success) return;
+      expect(beginRes.data.generation).toBe(2);
+      expect(beginRes.data.promotedFromPendingIntake).toBe(true);
+      expect(beginRes.data.dispatchNudgePending).toBe(true);
+
+      // Active status resolves generation 2
+      const activeStatus = controller.getStatus(root);
+      expect(activeStatus.generation).toBe(2);
+      expect(activeStatus.phase).toBe('checkpointing');
+      expect(activeStatus.pendingSuccessor).toBeUndefined();
+
+      // Generation 1 record remains untouched and accessible via readRecordGeneration
+      const gen1Res = controller.readRecordGeneration(root, 1);
+      expect(gen1Res.success).toBe(true);
+      if (!gen1Res.success) return;
+      expect(gen1Res.data.generation).toBe(1);
+      expect(gen1Res.data.phase).toBe('accepted');
+      expect(gen1Res.data.finalCertificate).toBeDefined();
+
+      // Historical status for generation 1
+      const histStatus = controller.getHistoricalGenerationStatus(root, 1);
+      expect(histStatus.isManaged).toBe(true);
+      expect(histStatus.generation).toBe(1);
+      expect(histStatus.phase).toBe('accepted');
+      expect(histStatus.finalCertificate).toBeDefined();
+    });
+
+    test('accepted outcome begin behavior: idempotent for same contract, rejected for different contract without intake', async () => {
+      const root = 'ses_ctrl_accepted_begin_rules';
+      const controller = createTestController(tempDir, root);
+      await setupAcceptedOutcome(controller, root);
+
+      // Same contract -> idempotent retry
+      const sameContractRes = controller.begin(
+        root,
+        testContract({
+          goals: [
+            {
+              id: 'goal_protocol',
+              description: 'Implement the outcome protocol',
+              status: 'satisfied',
+            },
+          ],
+        }),
+      );
+      expect(sameContractRes.success).toBe(true);
+      if (!sameContractRes.success) return;
+      expect(sameContractRes.data.idempotent).toBe(true);
+      expect(sameContractRes.data.generation).toBe(1);
+
+      // Different contract without pending intake -> rejected
+      const diffContractRes = controller.begin(
+        root,
+        testContract({
+          objective: 'Different un-staged objective',
+          sourceMessageIds: ['msg_random'],
+        }),
+      );
+      expect(diffContractRes.success).toBe(false);
+      expect(diffContractRes.code).toBe('invalid_transition');
+
+      // Now stage an external user message in pending intake
+      expect(
+        controller.observeExternalUserTurn(
+          root,
+          'msg_staged_boundary',
+          'Fresh successor request',
+        ).success,
+      ).toBe(true);
+
+      // Calling begin with the SAME accepted contract even when intake exists remains idempotent!
+      const sameWithIntake = controller.begin(
+        root,
+        testContract({
+          goals: [
+            {
+              id: 'goal_protocol',
+              description: 'Implement the outcome protocol',
+              status: 'satisfied',
+            },
+          ],
+        }),
+      );
+      expect(sameWithIntake.success).toBe(true);
+      expect(sameWithIntake.data?.idempotent).toBe(true);
+      expect(sameWithIntake.data?.generation).toBe(1);
+
+      // Caller-supplied successor outcomeId colliding with generation 1 fails
+      const gen1Rec = controller.readRecord(root);
+      expect(gen1Rec.success).toBe(true);
+      if (!gen1Rec.success) return;
+      const gen1OutcomeId = gen1Rec.data.outcomeId;
+      const collideRes = controller.begin(
+        root,
+        testContract({
+          objective: 'Different genuine objective',
+          sourceMessageIds: ['msg_staged_boundary'],
+        }),
+        { outcomeId: gen1OutcomeId },
+      );
+      expect(collideRes.success).toBe(false);
+      expect(collideRes.code).toBe('invalid_transition');
+
+      // Genuine successor with different contract and fresh boundary source promotes intake!
+      const genuineSuccessorRes = controller.begin(
+        root,
+        testContract({
+          objective: 'Different genuine objective',
+          sourceMessageIds: ['msg_staged_boundary'],
+        }),
+      );
+      expect(genuineSuccessorRes.success).toBe(true);
+      expect(genuineSuccessorRes.data?.generation).toBe(2);
+      expect(genuineSuccessorRes.data?.promotedFromPendingIntake).toBe(true);
+    });
+
+    test('ordinary tool calls post-accept succeed without mutating predecessor or intake, and resume observing after successor begin', async () => {
+      const root = 'ses_ctrl_tool_isolation';
+      const controller = createTestController(tempDir, root);
+      await setupAcceptedOutcome(controller, root);
+
+      // Ordinary tool calls while accepted
+      const beforeRes = controller.observeToolBefore(
+        root,
+        'call_ordinary_1',
+        'bash',
+        { command: 'ls' },
+      );
+      expect(beforeRes.success).toBe(true);
+
+      const afterRes = controller.observeToolAfter(
+        root,
+        'call_ordinary_1',
+        'bash',
+        'file1.txt',
+      );
+      expect(afterRes.success).toBe(true);
+
+      // Predecessor record has no recorded running/completed operations from this post-accept call
+      const gen1 = controller.readRecord(root);
+      expect(gen1.success).toBe(true);
+      if (!gen1.success) return;
+      expect(
+        gen1.data.operations.some((op) => op.callId === 'call_ordinary_1'),
+      ).toBe(false);
+
+      // Stage external turn and begin successor
+      expect(
+        controller.observeExternalUserTurn(
+          root,
+          'msg_succ_tool',
+          'Begin next phase',
+        ).success,
+      ).toBe(true);
+      const beginRes = controller.begin(
+        root,
+        testContract({
+          objective: 'Next phase with tools',
+          sourceMessageIds: ['msg_succ_tool'],
+        }),
+      );
+      expect(beginRes.success).toBe(true);
+
+      // Tool call on generation 2 is observed normally
+      const gen2ToolBefore = controller.observeToolBefore(
+        root,
+        'call_gen2_1',
+        'bash',
+        { command: 'npm test' },
+      );
+      expect(gen2ToolBefore.success).toBe(true);
+
+      const gen2Rec = controller.readRecord(root);
+      expect(gen2Rec.success).toBe(true);
+      if (!gen2Rec.success) return;
+      expect(gen2Rec.data.generation).toBe(2);
+      expect(
+        gen2Rec.data.operations.some((op) => op.callId === 'call_gen2_1'),
+      ).toBe(true);
+    });
+
+    test('dispatch marker outcomeId must match selected record and claim secrets include outcome identity', async () => {
+      const controller = new OutcomeController({ storeDirectory: tempDir });
+      const root = 'ses_ctrl_marker_outcome_id';
+      const beginRes = controller.begin(root, testContract());
+      expect(beginRes.success).toBe(true);
+
+      const rec = controller.readRecord(root);
+      expect(rec.success).toBe(true);
+      if (!rec.success) return;
+
+      const instruction = dispatchInstruction(controller, root);
+
+      // 1. Marker with wrong outcomeId fails validation
+      const wrongMarker = instruction.replace(
+        `outcomeId="${rec.data.outcomeId}"`,
+        'outcomeId="out_wrong_outcome_id"',
+      );
+      const invalidRes = controller.validateAndMarkDispatching(
+        root,
+        'call_m_wrong',
+        wrongMarker,
+      );
+      expect(invalidRes.success).toBe(false);
+      expect(invalidRes.error).toContain('does not match active outcome');
+
+      // 2. Marker with correct outcomeId succeeds
+      const validRes = controller.validateAndMarkDispatching(
+        root,
+        'call_m_correct',
+        instruction,
+      );
+      expect(validRes.success).toBe(true);
+    });
+  });
 });

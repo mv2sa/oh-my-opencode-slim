@@ -17,6 +17,14 @@ export const MAX_OUTCOME_OPERATIONS = 32 as const;
 export const MAX_OUTCOME_EVIDENCE = 64 as const;
 export const MAX_OUTCOME_ACTIONS = 16 as const;
 
+export const OUTCOME_MANIFEST_SCHEMA = 'omos_outcome_manifest' as const;
+export const OUTCOME_MANIFEST_VERSION = 1 as const;
+export const MAX_OUTCOME_MANIFEST_BYTES = 16 * 1024;
+
+export const OUTCOME_INTAKE_SCHEMA = 'omos_outcome_intake' as const;
+export const OUTCOME_INTAKE_VERSION = 1 as const;
+export const MAX_OUTCOME_INTAKE_BYTES = 32 * 1024;
+
 const Id = z
   .string()
   .trim()
@@ -825,6 +833,7 @@ const OutcomeRecordV1BaseSchema = z
     updatedAt: Timestamp,
     phase: OutcomePhaseSchema,
     contract: OutcomeContractSchema,
+    generation: z.number().int().positive().optional(),
     receipts: OutcomeReceiptsV1Schema,
     reviewSummaries: z.array(OutcomeManagerReviewSummarySchema).max(32),
     checkpoint: OutcomeCheckpointClaimSchema.optional(),
@@ -840,6 +849,105 @@ export const OutcomeRecordV1Schema = OutcomeRecordV1BaseSchema.superRefine(
 );
 export type OutcomeRecordV1 = z.infer<typeof OutcomeRecordV1Schema>;
 
+export const OutcomeSuccessorLineageSchema = z
+  .object({
+    predecessorOutcomeId: Id,
+    predecessorGeneration: z.number().int().positive(),
+    predecessorAcceptedRevision: Revision,
+    predecessorCertificateDigest: Digest,
+    boundaryMessageId: Id,
+    lineageDigest: Digest,
+  })
+  .strict();
+export type OutcomeSuccessorLineage = z.infer<
+  typeof OutcomeSuccessorLineageSchema
+>;
+
+export const OutcomePendingSuccessorSummarySchema = z
+  .object({
+    generation: z.number().int().positive(),
+    predecessorOutcomeId: Id,
+    predecessorGeneration: z.number().int().positive(),
+    predecessorAcceptedRevision: Revision,
+    predecessorCertificateDigest: Digest,
+    boundaryMessageId: Id,
+    createdAt: Timestamp,
+    updatedAt: Timestamp,
+    userMessageCount: z.number().int().positive().max(32),
+  })
+  .strict();
+export type OutcomePendingSuccessorSummary = z.infer<
+  typeof OutcomePendingSuccessorSummarySchema
+>;
+
+export const OutcomeSessionManifestSchema = z
+  .object({
+    schema: z.literal(OUTCOME_MANIFEST_SCHEMA),
+    schemaVersion: z.literal(OUTCOME_MANIFEST_VERSION),
+    rootSessionId: OutcomeSessionIdSchema,
+    currentGeneration: z.number().int().positive(),
+    pendingSuccessor: OutcomePendingSuccessorSummarySchema.optional(),
+    updatedAt: Timestamp,
+  })
+  .strict();
+export type OutcomeSessionManifest = z.infer<
+  typeof OutcomeSessionManifestSchema
+>;
+
+export const OutcomePendingIntakeSchema = z
+  .object({
+    schema: z.literal(OUTCOME_INTAKE_SCHEMA),
+    schemaVersion: z.literal(OUTCOME_INTAKE_VERSION),
+    rootSessionId: OutcomeSessionIdSchema,
+    generation: z.number().int().positive(),
+    predecessorOutcomeId: Id,
+    predecessorGeneration: z.number().int().positive(),
+    predecessorAcceptedRevision: Revision,
+    predecessorCertificateDigest: Digest,
+    boundaryMessageId: Id,
+    createdAt: Timestamp,
+    updatedAt: Timestamp,
+    userMessages: z.array(OutcomeUserMessageReceiptSchema).min(1).max(32),
+  })
+  .strict()
+  .superRefine((intake, ctx) => {
+    if (intake.generation !== intake.predecessorGeneration + 1) {
+      issue(
+        ctx,
+        ['generation'],
+        'Intake generation must be predecessor generation plus one',
+      );
+    }
+    addDuplicateIssues(intake.userMessages, 'id', ['userMessages'], ctx);
+    addDuplicateIssues(intake.userMessages, 'messageId', ['userMessages'], ctx);
+    const boundaryReceipt = intake.userMessages.find(
+      (msg) => msg.messageId === intake.boundaryMessageId,
+    );
+    if (!boundaryReceipt) {
+      issue(
+        ctx,
+        ['boundaryMessageId'],
+        'Boundary message ID must exist in intake user messages',
+      );
+    } else if (boundaryReceipt.provenance !== 'external_user') {
+      issue(
+        ctx,
+        ['boundaryMessageId'],
+        'Boundary message receipt must have external_user provenance',
+      );
+    }
+    for (const [index, msg] of intake.userMessages.entries()) {
+      if (msg.provenance !== 'external_user') {
+        issue(
+          ctx,
+          ['userMessages', index, 'provenance'],
+          'Intake user message must have external_user provenance',
+        );
+      }
+    }
+  });
+export type OutcomePendingIntake = z.infer<typeof OutcomePendingIntakeSchema>;
+
 const OutcomeRecordBaseSchema = z
   .object({
     schema: z.literal(OUTCOME_RECORD_SCHEMA),
@@ -854,6 +962,8 @@ const OutcomeRecordBaseSchema = z
     updatedAt: Timestamp,
     phase: OutcomePhaseSchema,
     contract: OutcomeContractSchema,
+    generation: z.number().int().positive().default(1),
+    lineage: OutcomeSuccessorLineageSchema.optional(),
     kickoffGate: OutcomeKickoffGateSchema,
     resolvedActionArchive: OutcomeResolvedActionArchiveSchema,
     receipts: OutcomeReceiptsSchema,
@@ -1023,6 +1133,58 @@ export function computeOutcomeCheckpointFingerprint(
   });
 }
 
+export function computeOutcomeSuccessorLineageDigest(lineage: {
+  predecessorOutcomeId: string;
+  predecessorGeneration: number;
+  predecessorAcceptedRevision: number;
+  predecessorCertificateDigest: string;
+  boundaryMessageId: string;
+}): string {
+  return canonicalDigest('omos/successor-lineage/v1', {
+    predecessorOutcomeId: lineage.predecessorOutcomeId,
+    predecessorGeneration: lineage.predecessorGeneration,
+    predecessorAcceptedRevision: lineage.predecessorAcceptedRevision,
+    predecessorCertificateDigest: lineage.predecessorCertificateDigest,
+    boundaryMessageId: lineage.boundaryMessageId,
+  });
+}
+
+export function computeOutcomeFinalCertificateDigest(
+  certificate: OutcomeFinalCertificate,
+): string {
+  return canonicalDigest('omos/final-certificate/v1', certificate);
+}
+
+export function parseOutcomeManifest(value: unknown): OutcomeSessionManifest {
+  return OutcomeSessionManifestSchema.parse(value);
+}
+
+export function serializeOutcomeManifest(
+  manifest: OutcomeSessionManifest,
+): string {
+  const parsed = parseOutcomeManifest(manifest);
+  const serialized = `${JSON.stringify(parsed, null, 2)}\n`;
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_OUTCOME_MANIFEST_BYTES) {
+    throw new Error(
+      `Outcome manifest exceeds ${MAX_OUTCOME_MANIFEST_BYTES} bytes`,
+    );
+  }
+  return serialized;
+}
+
+export function parseOutcomeIntake(value: unknown): OutcomePendingIntake {
+  return OutcomePendingIntakeSchema.parse(value);
+}
+
+export function serializeOutcomeIntake(intake: OutcomePendingIntake): string {
+  const parsed = parseOutcomeIntake(intake);
+  const serialized = `${JSON.stringify(parsed, null, 2)}\n`;
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_OUTCOME_INTAKE_BYTES) {
+    throw new Error(`Outcome intake exceeds ${MAX_OUTCOME_INTAKE_BYTES} bytes`);
+  }
+  return serialized;
+}
+
 export function parseOutcomeRecord(value: unknown): OutcomeRecord {
   if (
     typeof value === 'object' &&
@@ -1183,6 +1345,8 @@ export function normalizeRecordV1ToV2(v1: OutcomeRecordV1): OutcomeRecord {
     updatedAt: v1.updatedAt,
     phase,
     contract: v1.contract,
+    generation: 1,
+    lineage: undefined,
     kickoffGate,
     resolvedActionArchive: {
       count: 0,
@@ -1218,6 +1382,67 @@ function validateRecordRelations(
   record: OutcomeRecordBase,
   ctx: z.RefinementCtx,
 ): void {
+  if (record.generation > 1) {
+    if (!record.lineage) {
+      issue(ctx, ['lineage'], 'Successor generation requires lineage');
+    } else {
+      if (
+        record.lineage.lineageDigest !==
+        computeOutcomeSuccessorLineageDigest(record.lineage)
+      ) {
+        issue(ctx, ['lineage', 'lineageDigest'], 'Lineage digest mismatch');
+      }
+      if (record.generation !== record.lineage.predecessorGeneration + 1) {
+        issue(
+          ctx,
+          ['generation'],
+          'Successor generation must be predecessor generation plus one',
+        );
+      }
+      const boundaryReceipt = record.receipts.userMessages.find(
+        (m) => m.messageId === record.lineage?.boundaryMessageId,
+      );
+      if (!boundaryReceipt) {
+        issue(
+          ctx,
+          ['lineage', 'boundaryMessageId'],
+          'Successor boundary message ID must exist in user messages',
+        );
+      } else if (boundaryReceipt.provenance !== 'external_user') {
+        issue(
+          ctx,
+          ['lineage', 'boundaryMessageId'],
+          'Successor boundary message receipt must have external_user provenance',
+        );
+      }
+      if (
+        !record.contract.sourceMessageIds.includes(
+          record.lineage.boundaryMessageId,
+        )
+      ) {
+        issue(
+          ctx,
+          ['contract', 'sourceMessageIds'],
+          'Contract sourceMessageIds must include the boundary external message ID',
+        );
+      }
+      for (const srcId of record.contract.sourceMessageIds) {
+        const srcReceipt = record.receipts.userMessages.find(
+          (m) => m.messageId === srcId,
+        );
+        if (srcReceipt?.provenance !== 'external_user') {
+          issue(
+            ctx,
+            ['contract', 'sourceMessageIds'],
+            `Contract sourceMessageId '${srcId}' must resolve to a retained external_user receipt`,
+          );
+        }
+      }
+    }
+  } else if (record.lineage !== undefined) {
+    issue(ctx, ['lineage'], 'Generation 1 cannot carry lineage');
+  }
+
   if (record.contractDigest !== computeOutcomeContractDigest(record.contract)) {
     issue(
       ctx,

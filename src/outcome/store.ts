@@ -9,9 +9,17 @@ import {
   computeOutcomeAuthorizationDigest,
   computeOutcomeCheckpointFingerprint,
   computeOutcomeContractDigest,
+  computeOutcomeFinalCertificateDigest,
   computeOutcomeHandoffSupersessionDigest,
+  computeOutcomeSuccessorLineageDigest,
   initialActionArchiveChainDigest,
+  MAX_OUTCOME_INTAKE_BYTES,
+  MAX_OUTCOME_MANIFEST_BYTES,
   MAX_OUTCOME_RECORD_BYTES,
+  OUTCOME_INTAKE_SCHEMA,
+  OUTCOME_INTAKE_VERSION,
+  OUTCOME_MANIFEST_SCHEMA,
+  OUTCOME_MANIFEST_VERSION,
   OUTCOME_RECORD_SCHEMA,
   OUTCOME_RECORD_VERSION,
   type OutcomeActionRequired,
@@ -25,13 +33,20 @@ import {
   type OutcomeHandoffSupersessionReceipt,
   type OutcomeKickoffGate,
   type OutcomeManagerReviewSummary,
+  type OutcomePendingIntake,
   type OutcomePendingOperation,
   type OutcomeRecord,
   OutcomeRecordSchema,
   OutcomeSessionIdSchema,
+  type OutcomeSessionManifest,
+  type OutcomeSuccessorLineage,
   type OutcomeToolObservation,
   type OutcomeUserMessageReceipt,
+  parseOutcomeIntake,
+  parseOutcomeManifest,
   parseOutcomeRecord,
+  serializeOutcomeIntake,
+  serializeOutcomeManifest,
   serializeOutcomeRecord,
   validateVerdictForCheckpointKind,
 } from './controller-schema';
@@ -82,6 +97,17 @@ export type OutcomeStoreResult<T> =
       status: 'created' | 'read' | 'written' | 'recovered' | 'noop';
     }
   | { success: false; error: OutcomeStoreError; code: OutcomeStoreErrorCode };
+
+export interface OutcomePendingIntakeAppendResult {
+  intake?: OutcomePendingIntake;
+  receipt: OutcomeUserMessageReceipt;
+  stagedInPendingIntake: boolean;
+}
+
+export interface OutcomeUserMessageLookupResult {
+  receipt?: OutcomeUserMessageReceipt;
+  stagedInPendingIntake: boolean;
+}
 
 interface OutcomeStoreOptions {
   projectDirectory?: string;
@@ -375,6 +401,7 @@ export class OutcomeStore {
   readonly #rename: typeof fs.renameSync;
   readonly #write: typeof fs.writeSync;
   readonly #beforePersistReconciledReview?: () => void;
+  readonly #lockedSessions = new Set<string>();
 
   constructor(options: OutcomeStoreOptions = {}) {
     this.#projectDirectory = options.projectDirectory
@@ -406,9 +433,611 @@ export class OutcomeStore {
     return this.#storeDirectory;
   }
 
-  recordPath(rootSessionId: string): string {
+  recordPath(rootSessionId: string, generation = 1): string {
     const session = validateSession(rootSessionId);
-    return path.join(this.#storeDirectory, `${sessionHash(session)}.json`);
+    if (generation === 1) {
+      return path.join(this.#storeDirectory, `${sessionHash(session)}.json`);
+    }
+    return path.join(
+      this.#storeDirectory,
+      `${sessionHash(session)}.g${String(generation).padStart(8, '0')}.json`,
+    );
+  }
+
+  manifestPath(rootSessionId: string): string {
+    const session = validateSession(rootSessionId);
+    return path.join(
+      this.#storeDirectory,
+      `${sessionHash(session)}.manifest.json`,
+    );
+  }
+
+  intakePath(rootSessionId: string, generation: number): string {
+    const session = validateSession(rootSessionId);
+    return path.join(
+      this.#storeDirectory,
+      `${sessionHash(session)}.g${String(generation).padStart(8, '0')}.intake.json`,
+    );
+  }
+
+  #validateLineageAgreement(
+    lineage: OutcomeSuccessorLineage,
+    predRecord: OutcomeRecord,
+  ): boolean {
+    if (predRecord.phase !== 'accepted' || !predRecord.finalCertificate) {
+      return false;
+    }
+    const certDigest = computeOutcomeFinalCertificateDigest(
+      predRecord.finalCertificate,
+    );
+    return (
+      lineage.predecessorOutcomeId === predRecord.outcomeId &&
+      lineage.predecessorGeneration === (predRecord.generation ?? 1) &&
+      lineage.predecessorAcceptedRevision === predRecord.revision &&
+      lineage.predecessorCertificateDigest === certDigest &&
+      lineage.lineageDigest === computeOutcomeSuccessorLineageDigest(lineage)
+    );
+  }
+
+  #persistManifest(session: string, manifest: OutcomeSessionManifest): void {
+    const serialized = serializeOutcomeManifest(manifest);
+    this.#atomicReplace(this.manifestPath(session), serialized);
+  }
+
+  #readRecordDirect(session: string, generation: number): OutcomeRecord {
+    try {
+      const file = this.recordPath(session, generation);
+      const raw = readRegularFile(file, MAX_OUTCOME_RECORD_BYTES);
+      const record = parseOutcomeRecord(JSON.parse(raw));
+      if (record.rootSessionId !== session) {
+        throw new OutcomeStoreError(
+          'corrupt',
+          `Generation ${generation} record session identity mismatch`,
+          { rootSessionId: session },
+        );
+      }
+      if (record.generation !== generation) {
+        throw new OutcomeStoreError(
+          'corrupt',
+          `Generation ${generation} record contains generation ${record.generation}`,
+          { rootSessionId: session },
+        );
+      }
+      return record;
+    } catch (error) {
+      throw this.#readError(error, session);
+    }
+  }
+
+  #pendingSummary(
+    intake: OutcomePendingIntake,
+    predecessor: OutcomeRecord,
+  ): NonNullable<OutcomeSessionManifest['pendingSuccessor']> {
+    const certificateDigest = predecessor.finalCertificate
+      ? computeOutcomeFinalCertificateDigest(predecessor.finalCertificate)
+      : undefined;
+    if (
+      predecessor.phase !== 'accepted' ||
+      certificateDigest === undefined ||
+      intake.rootSessionId !== predecessor.rootSessionId ||
+      intake.generation !== predecessor.generation + 1 ||
+      intake.predecessorOutcomeId !== predecessor.outcomeId ||
+      intake.predecessorGeneration !== predecessor.generation ||
+      intake.predecessorAcceptedRevision !== predecessor.revision ||
+      intake.predecessorCertificateDigest !== certificateDigest
+    ) {
+      throw new OutcomeStoreError(
+        'corrupt',
+        'Pending successor intake lineage mismatch',
+        { rootSessionId: predecessor.rootSessionId },
+      );
+    }
+    return {
+      generation: intake.generation,
+      predecessorOutcomeId: intake.predecessorOutcomeId,
+      predecessorGeneration: intake.predecessorGeneration,
+      predecessorAcceptedRevision: intake.predecessorAcceptedRevision,
+      predecessorCertificateDigest: intake.predecessorCertificateDigest,
+      boundaryMessageId: intake.boundaryMessageId,
+      createdAt: intake.createdAt,
+      updatedAt: intake.updatedAt,
+      userMessageCount: intake.userMessages.length,
+    };
+  }
+
+  #intakeReceiptsMatchPromotedRecord(
+    intake: OutcomePendingIntake,
+    record: OutcomeRecord,
+  ): boolean {
+    if (record.receipts.userMessages.length !== intake.userMessages.length) {
+      return false;
+    }
+    const promoted = new Map(
+      record.receipts.userMessages.map((receipt) => [
+        receipt.messageId,
+        receipt,
+      ]),
+    );
+    return intake.userMessages.every((receipt) => {
+      const candidate = promoted.get(receipt.messageId);
+      return (
+        candidate !== undefined &&
+        candidate.id === receipt.id &&
+        candidate.contentDigest === receipt.contentDigest &&
+        candidate.observedEpoch === receipt.observedEpoch &&
+        candidate.observedAt === receipt.observedAt &&
+        candidate.provenance === receipt.provenance &&
+        candidate.createdRevision === 1
+      );
+    });
+  }
+
+  #pendingSummariesMatch(
+    left: OutcomeSessionManifest['pendingSuccessor'],
+    right: NonNullable<OutcomeSessionManifest['pendingSuccessor']>,
+  ): boolean {
+    return (
+      left !== undefined &&
+      left.generation === right.generation &&
+      left.predecessorOutcomeId === right.predecessorOutcomeId &&
+      left.predecessorGeneration === right.predecessorGeneration &&
+      left.predecessorAcceptedRevision === right.predecessorAcceptedRevision &&
+      left.predecessorCertificateDigest ===
+        right.predecessorCertificateDigest &&
+      left.boundaryMessageId === right.boundaryMessageId &&
+      left.createdAt === right.createdAt &&
+      left.updatedAt === right.updatedAt &&
+      left.userMessageCount === right.userMessageCount
+    );
+  }
+
+  #readSessionManifestOnly(session: string): {
+    initialized: boolean;
+    manifest: OutcomeSessionManifest;
+  } {
+    this.#assertSafePath();
+    if (!fs.existsSync(this.#storeDirectory)) {
+      return {
+        initialized: false,
+        manifest: undefined as never,
+      };
+    }
+    const manifestFile = this.manifestPath(session);
+    const hash = sessionHash(session);
+
+    if (fs.existsSync(manifestFile)) {
+      rejectSymlink(manifestFile);
+      const manifestRaw = readRegularFile(
+        manifestFile,
+        MAX_OUTCOME_MANIFEST_BYTES,
+      );
+      let manifest: OutcomeSessionManifest;
+      try {
+        manifest = parseOutcomeManifest(JSON.parse(manifestRaw));
+      } catch (err) {
+        throw new OutcomeStoreError(
+          'corrupt',
+          'Outcome session manifest is corrupt',
+          { rootSessionId: session, cause: err },
+        );
+      }
+      if (manifest.rootSessionId !== session) {
+        throw new OutcomeStoreError(
+          'corrupt',
+          'Session manifest identity mismatch',
+          { rootSessionId: session },
+        );
+      }
+      return { initialized: true, manifest };
+    }
+
+    const gen1File = this.recordPath(session, 1);
+    if (!fs.existsSync(gen1File)) {
+      return {
+        initialized: false,
+        manifest: undefined as never,
+      };
+    }
+
+    rejectSymlink(gen1File);
+    let gen1: OutcomeRecord;
+    try {
+      const raw = readRegularFile(gen1File, MAX_OUTCOME_RECORD_BYTES);
+      gen1 = parseOutcomeRecord(JSON.parse(raw));
+    } catch (err) {
+      throw new OutcomeStoreError('corrupt', 'Outcome record is corrupt', {
+        rootSessionId: session,
+        cause: err,
+      });
+    }
+
+    if (gen1.rootSessionId !== session) {
+      throw new OutcomeStoreError(
+        'corrupt',
+        'Outcome record session mismatch',
+        { rootSessionId: session },
+      );
+    }
+
+    const entries = fs.readdirSync(this.#storeDirectory);
+    const prefix = `${hash}.g`;
+    const hasOtherGenFiles = entries.some((e) => e.startsWith(prefix));
+    if (hasOtherGenFiles) {
+      throw new OutcomeStoreError(
+        'conflict',
+        'Ambiguous generation files found without a manifest',
+        { rootSessionId: session },
+      );
+    }
+
+    const manifest: OutcomeSessionManifest = {
+      schema: OUTCOME_MANIFEST_SCHEMA,
+      schemaVersion: OUTCOME_MANIFEST_VERSION,
+      rootSessionId: session,
+      currentGeneration: 1,
+      updatedAt: gen1.updatedAt,
+    };
+    return { initialized: true, manifest };
+  }
+
+  #authoritativeSessionStateUnderLock(session: string): {
+    initialized: boolean;
+    manifest: OutcomeSessionManifest;
+  } {
+    this.#ensureStoreDirectory();
+    const manifestFile = this.manifestPath(session);
+    const hash = sessionHash(session);
+
+    if (fs.existsSync(manifestFile)) {
+      rejectSymlink(manifestFile);
+      const manifestRaw = readRegularFile(
+        manifestFile,
+        MAX_OUTCOME_MANIFEST_BYTES,
+      );
+      let manifest: OutcomeSessionManifest;
+      try {
+        manifest = parseOutcomeManifest(JSON.parse(manifestRaw));
+      } catch (err) {
+        throw new OutcomeStoreError(
+          'corrupt',
+          'Outcome session manifest is corrupt',
+          { rootSessionId: session, cause: err },
+        );
+      }
+      if (manifest.rootSessionId !== session) {
+        throw new OutcomeStoreError(
+          'corrupt',
+          'Session manifest identity mismatch',
+          { rootSessionId: session },
+        );
+      }
+
+      this.#reconcileUnderLock(session, manifest);
+
+      return { initialized: true, manifest };
+    }
+
+    const gen1File = this.recordPath(session, 1);
+    if (!fs.existsSync(gen1File)) {
+      return {
+        initialized: false,
+        manifest: undefined as never,
+      };
+    }
+
+    rejectSymlink(gen1File);
+    let gen1: OutcomeRecord;
+    try {
+      const raw = readRegularFile(gen1File, MAX_OUTCOME_RECORD_BYTES);
+      gen1 = parseOutcomeRecord(JSON.parse(raw));
+    } catch (err) {
+      throw new OutcomeStoreError('corrupt', 'Outcome record is corrupt', {
+        rootSessionId: session,
+        cause: err,
+      });
+    }
+
+    if (gen1.rootSessionId !== session) {
+      throw new OutcomeStoreError(
+        'corrupt',
+        'Outcome record session mismatch',
+        { rootSessionId: session },
+      );
+    }
+
+    const entries = fs.readdirSync(this.#storeDirectory);
+    const prefix = `${hash}.g`;
+    const hasOtherGenFiles = entries.some((e) => e.startsWith(prefix));
+    if (hasOtherGenFiles) {
+      throw new OutcomeStoreError(
+        'conflict',
+        'Ambiguous generation files found without a manifest',
+        { rootSessionId: session },
+      );
+    }
+
+    const manifest: OutcomeSessionManifest = {
+      schema: OUTCOME_MANIFEST_SCHEMA,
+      schemaVersion: OUTCOME_MANIFEST_VERSION,
+      rootSessionId: session,
+      currentGeneration: 1,
+      updatedAt: this.#clock(),
+    };
+    this.#persistManifest(session, manifest);
+
+    return { initialized: true, manifest };
+  }
+
+  #reconcileUnderLock(session: string, manifest: OutcomeSessionManifest): void {
+    const hash = sessionHash(session);
+    const N = manifest.currentGeneration;
+    const entries = fs.readdirSync(this.#storeDirectory);
+
+    const recordRegex = new RegExp(`^${hash}\\.g(\\d{8})\\.json$`);
+    const intakeRegex = new RegExp(`^${hash}\\.g(\\d{8})\\.intake\\.json$`);
+
+    const successorRecords: number[] = [];
+    const intakeGens: number[] = [];
+
+    for (const entry of entries) {
+      const recMatch = entry.match(recordRegex);
+      if (recMatch) {
+        successorRecords.push(Number.parseInt(recMatch[1], 10));
+        continue;
+      }
+      const intakeMatch = entry.match(intakeRegex);
+      if (intakeMatch) {
+        intakeGens.push(Number.parseInt(intakeMatch[1], 10));
+      }
+    }
+
+    for (let k = 1; k <= N; k++) {
+      const file = this.recordPath(session, k);
+      if (!fs.existsSync(file)) {
+        throw new OutcomeStoreError(
+          'corrupt',
+          `Generation ${k} record is missing from store`,
+          { rootSessionId: session },
+        );
+      }
+    }
+
+    const orphanRecordGens = successorRecords
+      .filter((g) => g > N)
+      .sort((a, b) => a - b);
+    if (orphanRecordGens.length > 1) {
+      throw new OutcomeStoreError(
+        'conflict',
+        'Multiple orphan successor records detected',
+        { rootSessionId: session },
+      );
+    }
+
+    if (orphanRecordGens.length === 1) {
+      const orphanGen = orphanRecordGens[0];
+      if (orphanGen !== N + 1) {
+        throw new OutcomeStoreError(
+          'conflict',
+          `Orphan successor record generation ${orphanGen} does not match expected generation ${N + 1}`,
+          { rootSessionId: session },
+        );
+      }
+      const pred = this.#readRecordDirect(session, N);
+      if (pred.phase !== 'accepted' || !pred.finalCertificate) {
+        throw new OutcomeStoreError(
+          'conflict',
+          'Orphan successor record found but predecessor is not accepted',
+          { rootSessionId: session },
+        );
+      }
+
+      let orphan: OutcomeRecord;
+      try {
+        orphan = this.#readRecordDirect(session, orphanGen);
+      } catch (err) {
+        throw new OutcomeStoreError(
+          'corrupt',
+          'Orphan successor record is corrupt',
+          { rootSessionId: session, cause: err },
+        );
+      }
+
+      if (orphan.rootSessionId !== session) {
+        throw new OutcomeStoreError(
+          'conflict',
+          'Orphan successor record root session mismatch',
+          { rootSessionId: session },
+        );
+      }
+      if (orphan.generation !== orphanGen) {
+        throw new OutcomeStoreError(
+          'conflict',
+          'Orphan successor record generation field mismatch',
+          { rootSessionId: session },
+        );
+      }
+
+      for (let k = 1; k <= N; k++) {
+        const ancestor = this.#readRecordDirect(session, k);
+        if (orphan.outcomeId === ancestor.outcomeId) {
+          throw new OutcomeStoreError(
+            'conflict',
+            `Orphan successor outcomeId '${orphan.outcomeId}' collides with ancestor generation ${k}`,
+            { rootSessionId: session },
+          );
+        }
+      }
+
+      if (
+        !orphan.lineage ||
+        !this.#validateLineageAgreement(orphan.lineage, pred)
+      ) {
+        throw new OutcomeStoreError(
+          'conflict',
+          'Orphan successor record lineage mismatch',
+          { rootSessionId: session },
+        );
+      }
+
+      if (
+        manifest.pendingSuccessor &&
+        manifest.pendingSuccessor.boundaryMessageId !==
+          orphan.lineage.boundaryMessageId
+      ) {
+        throw new OutcomeStoreError(
+          'conflict',
+          'Orphan successor boundary message ID mismatch with manifest pending successor',
+          { rootSessionId: session },
+        );
+      }
+
+      const orphanIntakeFile = this.intakePath(session, orphanGen);
+      if (!manifest.pendingSuccessor || !fs.existsSync(orphanIntakeFile)) {
+        throw new OutcomeStoreError(
+          'conflict',
+          'Orphan successor record lacks its authoritative pending intake',
+          { rootSessionId: session },
+        );
+      }
+      let orphanIntake: OutcomePendingIntake;
+      try {
+        const intakeRaw = readRegularFile(
+          orphanIntakeFile,
+          MAX_OUTCOME_INTAKE_BYTES,
+        );
+        orphanIntake = parseOutcomeIntake(JSON.parse(intakeRaw));
+      } catch (err) {
+        if (err instanceof OutcomeStoreError) throw err;
+        throw new OutcomeStoreError(
+          'corrupt',
+          'Intake file for orphan successor is corrupt',
+          { rootSessionId: session, cause: err },
+        );
+      }
+      const expectedPending = this.#pendingSummary(orphanIntake, pred);
+      if (
+        !this.#pendingSummariesMatch(
+          manifest.pendingSuccessor,
+          expectedPending,
+        ) ||
+        orphanIntake.boundaryMessageId !== orphan.lineage.boundaryMessageId ||
+        !this.#intakeReceiptsMatchPromotedRecord(orphanIntake, orphan)
+      ) {
+        throw new OutcomeStoreError(
+          'conflict',
+          'Orphan successor does not exactly match its pending intake',
+          { rootSessionId: session },
+        );
+      }
+
+      const boundaryReceipt = orphan.receipts.userMessages.find(
+        (m) => m.messageId === orphan.lineage?.boundaryMessageId,
+      );
+      if (boundaryReceipt?.provenance !== 'external_user') {
+        throw new OutcomeStoreError(
+          'conflict',
+          'Orphan successor boundary message receipt is missing or not external_user',
+          { rootSessionId: session },
+        );
+      }
+
+      if (
+        !orphan.contract.sourceMessageIds.includes(
+          orphan.lineage.boundaryMessageId,
+        )
+      ) {
+        throw new OutcomeStoreError(
+          'conflict',
+          'Orphan successor contract does not include boundary message ID',
+          { rootSessionId: session },
+        );
+      }
+      for (const srcId of orphan.contract.sourceMessageIds) {
+        const srcReceipt = orphan.receipts.userMessages.find(
+          (m) => m.messageId === srcId,
+        );
+        if (srcReceipt?.provenance !== 'external_user') {
+          throw new OutcomeStoreError(
+            'conflict',
+            `Orphan successor contract sourceMessageId '${srcId}' is not retained external_user`,
+            { rootSessionId: session },
+          );
+        }
+      }
+
+      manifest.currentGeneration = orphanGen;
+      manifest.pendingSuccessor = undefined;
+      manifest.updatedAt = this.#clock();
+      this.#persistManifest(session, manifest);
+
+      try {
+        if (fs.existsSync(orphanIntakeFile)) {
+          fs.unlinkSync(orphanIntakeFile);
+        }
+      } catch {}
+      return;
+    }
+
+    const extraIntakeGens = intakeGens
+      .filter((g) => g > N)
+      .sort((a, b) => a - b);
+    if (extraIntakeGens.length > 1) {
+      throw new OutcomeStoreError(
+        'conflict',
+        'Multiple orphan intake files detected',
+        { rootSessionId: session },
+      );
+    }
+
+    if (extraIntakeGens.length === 1) {
+      const intakeGen = extraIntakeGens[0];
+      if (intakeGen !== N + 1) {
+        throw new OutcomeStoreError(
+          'conflict',
+          `Intake generation ${intakeGen} does not match expected ${N + 1}`,
+          { rootSessionId: session },
+        );
+      }
+      const intakeFile = this.intakePath(session, intakeGen);
+      const intakeRaw = readRegularFile(intakeFile, MAX_OUTCOME_INTAKE_BYTES);
+      let intake: OutcomePendingIntake;
+      try {
+        intake = parseOutcomeIntake(JSON.parse(intakeRaw));
+      } catch (err) {
+        throw new OutcomeStoreError(
+          'corrupt',
+          'Pending successor intake is corrupt',
+          { rootSessionId: session, cause: err },
+        );
+      }
+      const pred = this.#readRecordDirect(session, N);
+      if (pred.phase !== 'accepted' || !pred.finalCertificate) {
+        throw new OutcomeStoreError(
+          'conflict',
+          'Pending successor intake exists but predecessor is not accepted',
+          { rootSessionId: session },
+        );
+      }
+      const expectedPending = this.#pendingSummary(intake, pred);
+
+      const manifestPending = manifest.pendingSuccessor;
+      const needsUpdate = !this.#pendingSummariesMatch(
+        manifestPending,
+        expectedPending,
+      );
+
+      if (needsUpdate) {
+        manifest.pendingSuccessor = expectedPending;
+        manifest.updatedAt = this.#clock();
+        this.#persistManifest(session, manifest);
+      }
+    } else if (manifest.pendingSuccessor) {
+      throw new OutcomeStoreError(
+        'corrupt',
+        'Pending successor intake file missing',
+        { rootSessionId: session },
+      );
+    }
   }
 
   init(
@@ -431,8 +1060,8 @@ export class OutcomeStore {
       );
     }
     return this.#withLock(session, () => {
-      const existing = this.read(session);
-      if (existing.success) {
+      const state = this.#authoritativeSessionStateUnderLock(session);
+      if (state.initialized) {
         return failure(
           new OutcomeStoreError(
             'already_exists',
@@ -441,13 +1070,13 @@ export class OutcomeStore {
           ),
         );
       }
-      if (existing.code !== 'missing') return existing;
       const now = this.#clock();
       const contract = contractResult.data;
       const contractDigest = computeOutcomeContractDigest(contract);
       const record: OutcomeRecord = {
         schema: OUTCOME_RECORD_SCHEMA,
         schemaVersion: OUTCOME_RECORD_VERSION,
+        generation: 1,
         outcomeId:
           input.outcomeId ??
           `out_${sessionHash(session).slice(0, 16)}_${this.#randomId().slice(0, 8)}`,
@@ -482,7 +1111,20 @@ export class OutcomeStore {
         operations: [],
         actionsRequired: [],
       };
-      return this.#persist(session, record, 'created');
+
+      const persistRes = this.#persist(session, record, 'created', 1);
+      if (!persistRes.success) return persistRes;
+
+      const manifest: OutcomeSessionManifest = {
+        schema: OUTCOME_MANIFEST_SCHEMA,
+        schemaVersion: OUTCOME_MANIFEST_VERSION,
+        rootSessionId: session,
+        currentGeneration: 1,
+        updatedAt: now,
+      };
+      this.#persistManifest(session, manifest);
+
+      return persistRes;
     });
   }
 
@@ -491,11 +1133,18 @@ export class OutcomeStore {
     if (session instanceof OutcomeStoreError) return failure(session);
     try {
       this.#assertSafePath();
-      const file = this.recordPath(session);
-      const raw = readRegularFile(file, MAX_OUTCOME_RECORD_BYTES);
-      const parsed = parseOutcomeRecord(JSON.parse(raw));
-      if (parsed.rootSessionId !== session)
-        throw new Error('Session identity mismatch');
+      const state = this.#readSessionManifestOnly(session);
+      if (!state.initialized) {
+        return failure(
+          new OutcomeStoreError('missing', 'Outcome record not found', {
+            rootSessionId: session,
+          }),
+        );
+      }
+      const parsed = this.#readRecordDirect(
+        session,
+        state.manifest.currentGeneration,
+      );
       return {
         success: true,
         data: parsed,
@@ -507,6 +1156,617 @@ export class OutcomeStore {
     }
   }
 
+  readGeneration(
+    rootSessionId: string,
+    generation: number,
+  ): OutcomeStoreResult<OutcomeRecord> {
+    const session = safeSession(rootSessionId);
+    if (session instanceof OutcomeStoreError) return failure(session);
+    try {
+      this.#assertSafePath();
+      const state = this.#readSessionManifestOnly(session);
+      if (!state.initialized) {
+        return failure(
+          new OutcomeStoreError('missing', 'Outcome record not found', {
+            rootSessionId: session,
+          }),
+        );
+      }
+      if (
+        !Number.isInteger(generation) ||
+        generation < 1 ||
+        generation > state.manifest.currentGeneration
+      ) {
+        return failure(
+          new OutcomeStoreError(
+            'missing',
+            `Generation ${generation} not found (current: ${state.manifest.currentGeneration})`,
+            { rootSessionId: session },
+          ),
+        );
+      }
+      const parsed = this.#readRecordDirect(session, generation);
+      return {
+        success: true,
+        data: parsed,
+        revision: parsed.revision,
+        status: 'read',
+      };
+    } catch (error) {
+      return failure(this.#readError(error, session));
+    }
+  }
+
+  readManifest(
+    rootSessionId: string,
+  ): OutcomeStoreResult<OutcomeSessionManifest> {
+    const session = safeSession(rootSessionId);
+    if (session instanceof OutcomeStoreError) return failure(session);
+    try {
+      this.#assertSafePath();
+      const state = this.#readSessionManifestOnly(session);
+      if (!state.initialized) {
+        return failure(
+          new OutcomeStoreError(
+            'missing',
+            'Outcome session manifest not found',
+            { rootSessionId: session },
+          ),
+        );
+      }
+      return {
+        success: true,
+        data: state.manifest,
+        revision: state.manifest.currentGeneration,
+        status: 'read',
+      };
+    } catch (error) {
+      return failure(this.#readError(error, session));
+    }
+  }
+
+  readPendingIntake(
+    rootSessionId: string,
+  ): OutcomeStoreResult<OutcomePendingIntake> {
+    const session = safeSession(rootSessionId);
+    if (session instanceof OutcomeStoreError) return failure(session);
+    try {
+      this.#assertSafePath();
+      const state = this.#readSessionManifestOnly(session);
+      if (!state.initialized || !state.manifest.pendingSuccessor) {
+        return failure(
+          new OutcomeStoreError(
+            'missing',
+            'Pending successor intake not found',
+            { rootSessionId: session },
+          ),
+        );
+      }
+      const file = this.intakePath(
+        session,
+        state.manifest.pendingSuccessor.generation,
+      );
+      const raw = readRegularFile(file, MAX_OUTCOME_INTAKE_BYTES);
+      const parsed = parseOutcomeIntake(JSON.parse(raw));
+      if (parsed.rootSessionId !== session)
+        throw new Error('Session identity mismatch');
+      return {
+        success: true,
+        data: parsed,
+        revision: parsed.userMessages.length,
+        status: 'read',
+      };
+    } catch (error) {
+      return failure(this.#readError(error, session));
+    }
+  }
+
+  findUserMessageReceipt(
+    rootSessionId: string,
+    messageId: string,
+    contentDigest: string,
+  ): OutcomeStoreResult<OutcomeUserMessageLookupResult> {
+    const session = safeSession(rootSessionId);
+    if (session instanceof OutcomeStoreError) return failure(session);
+    try {
+      const state = this.#readSessionManifestOnly(session);
+      if (!state.initialized) {
+        return failure(
+          new OutcomeStoreError('missing', 'Outcome record not found', {
+            rootSessionId: session,
+          }),
+        );
+      }
+      const canonicalMessageId = messageId.trim();
+      for (
+        let generation = 1;
+        generation <= state.manifest.currentGeneration;
+        generation++
+      ) {
+        const record = this.#readRecordDirect(session, generation);
+        const existing = record.receipts.userMessages.find(
+          (entry) => entry.messageId === canonicalMessageId,
+        );
+        if (existing) {
+          if (existing.contentDigest !== contentDigest) {
+            return failure(
+              new OutcomeStoreError(
+                'invalid_transition',
+                `User message '${canonicalMessageId}' was already recorded with different content (generation ${generation})`,
+                { rootSessionId: session },
+              ),
+            );
+          }
+          return {
+            success: true,
+            data: { receipt: existing, stagedInPendingIntake: false },
+            revision: record.revision,
+            status: 'noop',
+          };
+        }
+      }
+      if (state.manifest.pendingSuccessor) {
+        const intakeFile = this.intakePath(
+          session,
+          state.manifest.pendingSuccessor.generation,
+        );
+        const intake = parseOutcomeIntake(
+          JSON.parse(readRegularFile(intakeFile, MAX_OUTCOME_INTAKE_BYTES)),
+        );
+        const existing = intake.userMessages.find(
+          (entry) => entry.messageId === canonicalMessageId,
+        );
+        if (existing) {
+          if (existing.contentDigest !== contentDigest) {
+            return failure(
+              new OutcomeStoreError(
+                'invalid_transition',
+                `User message '${canonicalMessageId}' was already recorded in pending intake with different content`,
+                { rootSessionId: session },
+              ),
+            );
+          }
+          return {
+            success: true,
+            data: { receipt: existing, stagedInPendingIntake: true },
+            revision: intake.userMessages.length,
+            status: 'noop',
+          };
+        }
+      }
+      return {
+        success: true,
+        data: { stagedInPendingIntake: false },
+        revision: 0,
+        status: 'read',
+      };
+    } catch (error) {
+      return failure(this.#readError(error, session));
+    }
+  }
+
+  appendPendingIntakeUserMessage(
+    rootSessionId: string,
+    receipt: OutcomeUserMessageReceipt,
+  ): OutcomeStoreResult<OutcomePendingIntakeAppendResult> {
+    const session = safeSession(rootSessionId);
+    if (session instanceof OutcomeStoreError) return failure(session);
+    return this.#withLock(session, () => {
+      const state = this.#authoritativeSessionStateUnderLock(session);
+      if (!state.initialized) {
+        return failure(
+          new OutcomeStoreError('missing', 'Outcome record not found', {
+            rootSessionId: session,
+          }),
+        );
+      }
+      const currentGen = state.manifest.currentGeneration;
+      const current = this.#readRecordDirect(session, currentGen);
+
+      if (current.phase !== 'accepted' || !current.finalCertificate) {
+        return failure(
+          new OutcomeStoreError(
+            'conflict',
+            'Active outcome changed while staging successor intake',
+            { rootSessionId: session },
+          ),
+        );
+      }
+
+      if (receipt.provenance !== 'external_user') {
+        return failure(
+          new OutcomeStoreError(
+            'invalid_transition',
+            'Only external_user messages can enter pending intake',
+            { rootSessionId: session },
+          ),
+        );
+      }
+
+      const canonicalMessageId = receipt.messageId.trim();
+
+      // Point 1: Check ALL historical generations 1..currentGen
+      for (let k = 1; k <= currentGen; k++) {
+        const hist = this.#readRecordDirect(session, k);
+        const existingHist = hist.receipts.userMessages.find(
+          (m) => m.messageId === canonicalMessageId,
+        );
+        if (existingHist) {
+          if (existingHist.contentDigest === receipt.contentDigest) {
+            // True no-op! Cannot become successor boundary.
+            if (state.manifest.pendingSuccessor) {
+              const intakeRes = this.readPendingIntake(session);
+              if (intakeRes.success) {
+                return {
+                  success: true,
+                  data: {
+                    intake: intakeRes.data,
+                    receipt: existingHist,
+                    stagedInPendingIntake: false,
+                  },
+                  revision: intakeRes.data.userMessages.length,
+                  status: 'noop',
+                };
+              }
+            }
+            return {
+              success: true,
+              data: {
+                receipt: existingHist,
+                stagedInPendingIntake: false,
+              },
+              revision: 0,
+              status: 'noop',
+            };
+          }
+          return failure(
+            new OutcomeStoreError(
+              'invalid_transition',
+              `User message '${canonicalMessageId}' was already recorded with different content (generation ${k})`,
+              { rootSessionId: session },
+            ),
+          );
+        }
+      }
+
+      const certDigest = computeOutcomeFinalCertificateDigest(
+        current.finalCertificate,
+      );
+      const now = this.#clock();
+      const nextGen = currentGen + 1;
+
+      let intake: OutcomePendingIntake;
+      let status: 'created' | 'written' | 'noop';
+
+      if (!state.manifest.pendingSuccessor) {
+        intake = {
+          schema: OUTCOME_INTAKE_SCHEMA,
+          schemaVersion: OUTCOME_INTAKE_VERSION,
+          rootSessionId: session,
+          generation: nextGen,
+          predecessorOutcomeId: current.outcomeId,
+          predecessorGeneration: currentGen,
+          predecessorAcceptedRevision: current.revision,
+          predecessorCertificateDigest: certDigest,
+          boundaryMessageId: receipt.messageId,
+          createdAt: now,
+          updatedAt: now,
+          userMessages: [receipt],
+        };
+        status = 'created';
+      } else {
+        const intakeFile = this.intakePath(session, nextGen);
+        const intakeRaw = readRegularFile(intakeFile, MAX_OUTCOME_INTAKE_BYTES);
+        intake = parseOutcomeIntake(JSON.parse(intakeRaw));
+
+        if (
+          intake.generation !== nextGen ||
+          intake.predecessorOutcomeId !== current.outcomeId ||
+          intake.predecessorGeneration !== currentGen ||
+          intake.predecessorAcceptedRevision !== current.revision ||
+          intake.predecessorCertificateDigest !== certDigest
+        ) {
+          return failure(
+            new OutcomeStoreError(
+              'corrupt',
+              'Pending intake lineage mismatch with predecessor',
+              { rootSessionId: session },
+            ),
+          );
+        }
+
+        const existingMessage = intake.userMessages.find(
+          (m) => m.messageId === canonicalMessageId,
+        );
+        if (existingMessage) {
+          if (existingMessage.contentDigest === receipt.contentDigest) {
+            return {
+              success: true,
+              data: {
+                intake,
+                receipt: existingMessage,
+                stagedInPendingIntake: true,
+              },
+              revision: intake.userMessages.length,
+              status: 'noop',
+            };
+          }
+          return failure(
+            new OutcomeStoreError(
+              'invalid_transition',
+              `User message '${canonicalMessageId}' was already recorded in intake with different content`,
+              { rootSessionId: session },
+            ),
+          );
+        }
+
+        if (intake.userMessages.length >= 32) {
+          return failure(
+            new OutcomeStoreError(
+              'action_capacity_exhausted',
+              'Intake user message capacity exhausted',
+              { rootSessionId: session },
+            ),
+          );
+        }
+
+        intake.userMessages.push(receipt);
+        intake.updatedAt = now;
+        status = 'written';
+      }
+
+      const intakeSerialized = serializeOutcomeIntake(intake);
+      this.#atomicReplace(this.intakePath(session, nextGen), intakeSerialized);
+
+      const manifest = state.manifest;
+      manifest.pendingSuccessor = {
+        generation: nextGen,
+        predecessorOutcomeId: current.outcomeId,
+        predecessorGeneration: currentGen,
+        predecessorAcceptedRevision: current.revision,
+        predecessorCertificateDigest: certDigest,
+        boundaryMessageId: intake.boundaryMessageId,
+        createdAt: intake.createdAt,
+        updatedAt: intake.updatedAt,
+        userMessageCount: intake.userMessages.length,
+      };
+      manifest.updatedAt = now;
+      this.#persistManifest(session, manifest);
+
+      return {
+        success: true,
+        data: {
+          intake,
+          receipt,
+          stagedInPendingIntake: true,
+        },
+        revision: intake.userMessages.length,
+        status,
+      };
+    });
+  }
+
+  promotePendingIntake(
+    rootSessionId: string,
+    input: { outcomeId?: string; contract: OutcomeContract },
+  ): OutcomeStoreResult<OutcomeRecord> {
+    const session = safeSession(rootSessionId);
+    if (session instanceof OutcomeStoreError) return failure(session);
+    const contractResult = OutcomeContractSchema.safeParse(input?.contract);
+    if (!contractResult.success) {
+      return failure(
+        new OutcomeStoreError(
+          'corrupt',
+          'A complete valid outcome contract is required',
+          { rootSessionId: session, cause: contractResult.error },
+        ),
+      );
+    }
+    const contract = contractResult.data;
+    return this.#withLock(session, () => {
+      const state = this.#authoritativeSessionStateUnderLock(session);
+      if (!state.initialized) {
+        return failure(
+          new OutcomeStoreError('missing', 'Outcome record not found', {
+            rootSessionId: session,
+          }),
+        );
+      }
+      const currentGen = state.manifest.currentGeneration;
+      const current = this.#readRecordDirect(session, currentGen);
+
+      if (current.phase !== 'accepted' || !current.finalCertificate) {
+        return failure(
+          new OutcomeStoreError(
+            'invalid_transition',
+            'Cannot promote successor from non-accepted outcome',
+            { rootSessionId: session },
+          ),
+        );
+      }
+
+      if (!state.manifest.pendingSuccessor) {
+        return failure(
+          new OutcomeStoreError(
+            'missing',
+            'No pending successor intake exists to promote',
+            { rootSessionId: session },
+          ),
+        );
+      }
+
+      // Point 8: Reject caller-supplied successor outcomeId colliding with predecessor or ANY historical outcome
+      if (input.outcomeId) {
+        for (let k = 1; k <= currentGen; k++) {
+          const hist = this.#readRecordDirect(session, k);
+          if (hist.outcomeId === input.outcomeId) {
+            return failure(
+              new OutcomeStoreError(
+                'invalid_transition',
+                `Successor outcome ID '${input.outcomeId}' collides with historical generation ${k}`,
+                { rootSessionId: session },
+              ),
+            );
+          }
+        }
+      }
+
+      const intakeFile = this.intakePath(
+        session,
+        state.manifest.pendingSuccessor.generation,
+      );
+      const intakeRaw = readRegularFile(intakeFile, MAX_OUTCOME_INTAKE_BYTES);
+      const intake = parseOutcomeIntake(JSON.parse(intakeRaw));
+
+      const certDigest = computeOutcomeFinalCertificateDigest(
+        current.finalCertificate,
+      );
+
+      if (
+        intake.generation !== currentGen + 1 ||
+        intake.predecessorOutcomeId !== current.outcomeId ||
+        intake.predecessorGeneration !== currentGen ||
+        intake.predecessorAcceptedRevision !== current.revision ||
+        intake.predecessorCertificateDigest !== certDigest
+      ) {
+        return failure(
+          new OutcomeStoreError(
+            'corrupt',
+            'Pending intake lineage does not match accepted predecessor',
+            { rootSessionId: session },
+          ),
+        );
+      }
+
+      const intakeReceiptsByMsgId = new Map(
+        intake.userMessages.map((msg) => [msg.messageId, msg]),
+      );
+
+      const boundaryReceipt = intakeReceiptsByMsgId.get(
+        intake.boundaryMessageId,
+      );
+      if (boundaryReceipt?.provenance !== 'external_user') {
+        return failure(
+          new OutcomeStoreError(
+            'invalid_transition',
+            'Intake boundary message ID does not resolve to an external_user receipt',
+            { rootSessionId: session },
+          ),
+        );
+      }
+
+      for (const srcId of contract.sourceMessageIds) {
+        const receipt = intakeReceiptsByMsgId.get(srcId);
+        if (receipt?.provenance !== 'external_user') {
+          return failure(
+            new OutcomeStoreError(
+              'invalid_transition',
+              `Contract sourceMessageId '${srcId}' does not resolve to a retained external_user receipt in pending intake`,
+              { rootSessionId: session },
+            ),
+          );
+        }
+      }
+
+      if (!contract.sourceMessageIds.includes(intake.boundaryMessageId)) {
+        return failure(
+          new OutcomeStoreError(
+            'invalid_transition',
+            `Contract sourceMessageIds must include the boundary external message ID '${intake.boundaryMessageId}'`,
+            { rootSessionId: session },
+          ),
+        );
+      }
+
+      const now = this.#clock();
+      const nextGen = currentGen + 1;
+      const contractDigest = computeOutcomeContractDigest(contract);
+      const lineageDigest = computeOutcomeSuccessorLineageDigest({
+        predecessorOutcomeId: current.outcomeId,
+        predecessorGeneration: currentGen,
+        predecessorAcceptedRevision: current.revision,
+        predecessorCertificateDigest: certDigest,
+        boundaryMessageId: intake.boundaryMessageId,
+      });
+
+      const successorRecord: OutcomeRecord = {
+        schema: OUTCOME_RECORD_SCHEMA,
+        schemaVersion: OUTCOME_RECORD_VERSION,
+        generation: nextGen,
+        lineage: {
+          predecessorOutcomeId: current.outcomeId,
+          predecessorGeneration: currentGen,
+          predecessorAcceptedRevision: current.revision,
+          predecessorCertificateDigest: certDigest,
+          boundaryMessageId: intake.boundaryMessageId,
+          lineageDigest,
+        },
+        outcomeId:
+          input.outcomeId ??
+          `out_${sessionHash(session).slice(0, 16)}_${this.#randomId().slice(0, 8)}`,
+        rootSessionId: session,
+        serverEpoch: this.#serverEpoch,
+        revision: 1,
+        nextClaimGeneration: 1,
+        contractDigest,
+        createdAt: now,
+        updatedAt: now,
+        phase: 'active',
+        contract,
+        kickoffGate: {
+          policyVersion: 1,
+          state: 'required',
+          contractDigest,
+          attempts: 0,
+          maxAttempts: 2,
+        },
+        resolvedActionArchive: {
+          count: 0,
+          chainDigest: initialActionArchiveChainDigest(),
+        },
+        receipts: {
+          evidence: [],
+          userMessages: intake.userMessages.map((msg) => ({
+            ...msg,
+            createdRevision: 1,
+          })),
+          decisions: [],
+          authorizations: [],
+          handoffSupersessions: [],
+        },
+        reviewSummaries: [],
+        operations: [],
+        actionsRequired: [],
+      };
+
+      const recordPersistRes = this.#persist(
+        session,
+        successorRecord,
+        'created',
+        nextGen,
+      );
+      if (!recordPersistRes.success) return recordPersistRes;
+
+      const manifest: OutcomeSessionManifest = {
+        schema: OUTCOME_MANIFEST_SCHEMA,
+        schemaVersion: OUTCOME_MANIFEST_VERSION,
+        rootSessionId: session,
+        currentGeneration: nextGen,
+        pendingSuccessor: undefined,
+        updatedAt: now,
+      };
+      this.#persistManifest(session, manifest);
+
+      try {
+        if (fs.existsSync(intakeFile)) {
+          fs.unlinkSync(intakeFile);
+        }
+      } catch {}
+
+      return recordPersistRes;
+    });
+  }
+
   mutate(
     rootSessionId: string,
     expectedRevision: number,
@@ -515,9 +1775,16 @@ export class OutcomeStore {
     const session = safeSession(rootSessionId);
     if (session instanceof OutcomeStoreError) return failure(session);
     return this.#withLock(session, () => {
-      const currentResult = this.read(session);
-      if (!currentResult.success) return currentResult;
-      const current = currentResult.data;
+      const state = this.#authoritativeSessionStateUnderLock(session);
+      if (!state.initialized) {
+        return failure(
+          new OutcomeStoreError('missing', 'Outcome record not found', {
+            rootSessionId: session,
+          }),
+        );
+      }
+      const currentGen = state.manifest.currentGeneration;
+      const current = this.#readRecordDirect(session, currentGen);
       if (current.serverEpoch !== this.#serverEpoch) {
         return failure(
           new OutcomeStoreError(
@@ -586,6 +1853,30 @@ export class OutcomeStore {
         }
       } else if (mutation.type === 'append_user_message') {
         const canonicalMessageId = mutation.receipt.messageId.trim();
+        for (let generation = 1; generation < currentGen; generation++) {
+          const historical = this.#readRecordDirect(session, generation);
+          const historicalReceipt = historical.receipts.userMessages.find(
+            (entry) => entry.messageId === canonicalMessageId,
+          );
+          if (!historicalReceipt) continue;
+          if (
+            historicalReceipt.contentDigest === mutation.receipt.contentDigest
+          ) {
+            return {
+              success: true,
+              data: current,
+              revision: current.revision,
+              status: 'noop',
+            };
+          }
+          return failure(
+            new OutcomeStoreError(
+              'invalid_transition',
+              `User message '${canonicalMessageId}' was already recorded with different content (generation ${generation})`,
+              { rootSessionId: session },
+            ),
+          );
+        }
         const existing = current.receipts.userMessages.find(
           (entry) => entry.messageId === canonicalMessageId,
         );
@@ -743,7 +2034,7 @@ export class OutcomeStore {
           this.#serverEpoch,
           this.#randomId,
         );
-        return this.#persist(session, next, 'written');
+        return this.#persist(session, next, 'written', currentGen);
       } catch (error) {
         return failure(
           error instanceof OutcomeStoreError
@@ -904,9 +2195,16 @@ export class OutcomeStore {
     const session = safeSession(rootSessionId);
     if (session instanceof OutcomeStoreError) return failure(session);
     return this.#withLock(session, () => {
-      const currentResult = this.read(session);
-      if (!currentResult.success) return currentResult;
-      const current = currentResult.data;
+      const state = this.#authoritativeSessionStateUnderLock(session);
+      if (!state.initialized) {
+        return failure(
+          new OutcomeStoreError('missing', 'Outcome record not found', {
+            rootSessionId: session,
+          }),
+        );
+      }
+      const currentGen = state.manifest.currentGeneration;
+      const current = this.#readRecordDirect(session, currentGen);
       if (current.serverEpoch !== this.#serverEpoch) {
         return failure(
           new OutcomeStoreError(
@@ -1011,7 +2309,7 @@ export class OutcomeStore {
           this.#serverEpoch,
           this.#randomId,
         );
-        return this.#persist(session, next, 'written');
+        return this.#persist(session, next, 'written', currentGen);
       } catch (error) {
         return failure(
           error instanceof OutcomeStoreError
@@ -1030,10 +2328,17 @@ export class OutcomeStore {
     const session = safeSession(rootSessionId);
     if (session instanceof OutcomeStoreError) return failure(session);
     return this.#withLock(session, () => {
-      const result = this.read(session);
-      if (!result.success) return result;
-      const current = result.data;
-      if (current.serverEpoch === this.#serverEpoch) {
+      const state = this.#authoritativeSessionStateUnderLock(session);
+      if (!state.initialized) {
+        return failure(
+          new OutcomeStoreError('missing', 'Outcome record not found', {
+            rootSessionId: session,
+          }),
+        );
+      }
+      const currentGen = state.manifest.currentGeneration;
+      const current = this.#readRecordDirect(session, currentGen);
+      if (current.phase === 'accepted') {
         return {
           success: true,
           data: current,
@@ -1041,7 +2346,7 @@ export class OutcomeStore {
           status: 'noop',
         };
       }
-      if (current.phase === 'accepted') {
+      if (current.serverEpoch === this.#serverEpoch) {
         return {
           success: true,
           data: current,
@@ -1163,7 +2468,7 @@ export class OutcomeStore {
       )
         ? 'action_required'
         : current.phase;
-      return this.#persist(session, recovered, 'recovered');
+      return this.#persist(session, recovered, 'recovered', currentGen);
     });
   }
 
@@ -1195,11 +2500,13 @@ export class OutcomeStore {
     session: string,
     record: OutcomeRecord,
     status: 'created' | 'written' | 'recovered',
+    generation?: number,
   ): OutcomeStoreResult<OutcomeRecord> {
     try {
       const parsed = parseOutcomeRecord(OutcomeRecordSchema.parse(record));
       const serialized = serializeOutcomeRecord(parsed);
-      this.#atomicReplace(this.recordPath(session), serialized);
+      const targetGen = generation ?? parsed.generation ?? 1;
+      this.#atomicReplace(this.recordPath(session, targetGen), serialized);
       return { success: true, data: parsed, revision: parsed.revision, status };
     } catch (error) {
       return failure(this.#writeError(error, session));
@@ -1210,9 +2517,13 @@ export class OutcomeStore {
     session: string,
     operation: () => OutcomeStoreResult<T>,
   ): OutcomeStoreResult<T> {
+    if (this.#lockedSessions.has(session)) {
+      return operation();
+    }
     let lock: LockCapability;
     try {
       lock = this.#acquireLock(session);
+      this.#lockedSessions.add(session);
     } catch (error) {
       return failure(
         error instanceof OutcomeStoreError
@@ -1223,6 +2534,9 @@ export class OutcomeStore {
     try {
       return operation();
     } catch (error) {
+      if (error instanceof OutcomeStoreError) {
+        return failure(error);
+      }
       return failure(
         new OutcomeStoreError(
           'io_error',
@@ -1231,6 +2545,7 @@ export class OutcomeStore {
         ),
       );
     } finally {
+      this.#lockedSessions.delete(session);
       this.#releaseLock(lock);
     }
   }

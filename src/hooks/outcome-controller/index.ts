@@ -1,5 +1,6 @@
 import type { Plugin } from '@opencode-ai/plugin';
 import type { OutcomeController } from '../../outcome/controller';
+import { canonicalDigest } from '../../outcome/controller-schema';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import { isRecord } from '../../utils/guards';
 import {
@@ -108,12 +109,113 @@ export function isRecognizableDirectOpenCodeRestart(
   );
 }
 
+export const MAX_ATTACHMENT_PARTS = 16;
+export const MAX_ATTACHMENT_PAYLOAD_BYTES = 32 * 1024;
+
+export interface NormalizedAttachmentPart {
+  type: 'file' | 'image';
+  url?: string;
+  path?: string;
+  mime?: string;
+  filename?: string;
+  size?: number;
+}
+
+export function normalizeAuthoritativeAttachmentParts(
+  parts: unknown[],
+): NormalizedAttachmentPart[] {
+  if (!Array.isArray(parts) || parts.length === 0) {
+    throw new Error('Attachment-only message requires a non-empty parts array');
+  }
+  if (parts.length > MAX_ATTACHMENT_PARTS) {
+    throw new Error(
+      `Attachment-only message exceeds maximum of ${MAX_ATTACHMENT_PARTS} parts`,
+    );
+  }
+
+  const seen = new WeakSet<object>();
+  const normalized: NormalizedAttachmentPart[] = [];
+
+  for (const part of parts) {
+    if (!isRecord(part)) {
+      throw new Error('Attachment part must be an object');
+    }
+    if (seen.has(part)) {
+      throw new Error('Circular reference detected in message part');
+    }
+    try {
+      JSON.stringify(part);
+    } catch {
+      throw new Error('Circular reference detected in message part');
+    }
+    seen.add(part);
+
+    const type = typeof part.type === 'string' ? part.type : '';
+    if (type !== 'file' && type !== 'image') {
+      throw new Error(`Unsupported attachment part type '${type}'`);
+    }
+
+    const norm: NormalizedAttachmentPart = { type };
+
+    if ('url' in part && typeof part.url === 'string') {
+      if (part.url.length > 32 * 1024) {
+        throw new Error('Attachment URL exceeds 32 KiB');
+      }
+      norm.url = part.url;
+    }
+    if ('path' in part && typeof part.path === 'string') {
+      if (part.path.length > 1024) {
+        throw new Error('Attachment path exceeds 1024 characters');
+      }
+      norm.path = part.path;
+    }
+    if ('mime' in part && typeof part.mime === 'string') {
+      if (part.mime.length > 256) {
+        throw new Error('Attachment MIME exceeds 256 characters');
+      }
+      norm.mime = part.mime;
+    }
+    if ('filename' in part && typeof part.filename === 'string') {
+      if (part.filename.length > 256) {
+        throw new Error('Attachment filename exceeds 256 characters');
+      }
+      norm.filename = part.filename;
+    }
+    if (
+      'size' in part &&
+      typeof part.size === 'number' &&
+      Number.isFinite(part.size)
+    ) {
+      norm.size = part.size;
+    }
+
+    if (!norm.url && !norm.path) {
+      throw new Error(
+        `Attachment part of type '${type}' must specify url or path`,
+      );
+    }
+
+    normalized.push(norm);
+  }
+
+  const serialized = JSON.stringify(normalized);
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_ATTACHMENT_PAYLOAD_BYTES) {
+    throw new Error(
+      `Normalized attachment payload exceeds ${MAX_ATTACHMENT_PAYLOAD_BYTES} bytes`,
+    );
+  }
+
+  return normalized;
+}
+
 interface PendingToolCall {
   callId: string;
   rootSessionId: string;
   toolName: string;
   argumentDigest: string;
   subagentType?: string;
+  outcomeId?: string;
+  generation?: number;
 }
 
 export interface OutcomeControllerHookOptions {
@@ -325,12 +427,21 @@ export function createOutcomeControllerHook(
         shouldManageSession(sessionID) &&
         controller.isManaged(sessionID)
       ) {
+        const activeRec = controller.readRecord(sessionID);
+        if (!activeRec.success) {
+          return;
+        }
+        const outcomeId = activeRec.data.outcomeId;
+        const generation = activeRec.data.generation ?? 1;
+
         pendingToolCalls.set(callID, {
           callId: callID,
           rootSessionId: sessionID,
           toolName,
           argumentDigest: '',
           subagentType,
+          outcomeId,
+          generation,
         });
 
         const observed = controller.observeToolBefore(
@@ -377,6 +488,7 @@ export function createOutcomeControllerHook(
       const durableRecord = sessionID
         ? controller.readRecord(sessionID)
         : undefined;
+
       const durableManagerCall =
         durableRecord?.success === true &&
         durableRecord.data.checkpoint?.dispatchCallId === callID &&
@@ -388,22 +500,36 @@ export function createOutcomeControllerHook(
           pending.subagentType !== undefined &&
           resolveAgentName(pending.subagentType) === 'outcome-manager');
 
-      if (
-        sessionID &&
-        shouldManageSession(sessionID) &&
-        controller.isManaged(sessionID) &&
-        !isManagerDispatch
-      ) {
-        const observed = controller.observeToolAfter(
-          sessionID,
-          callID,
-          toolName,
-          rawOutput,
-        );
-        if (!observed.success) {
-          throw new Error(
-            `Failed to persist managed tool completion: ${observed.error}`,
+      if (!isManagerDispatch) {
+        if (
+          !pending?.outcomeId ||
+          pending.generation === undefined ||
+          pending.rootSessionId !== sessionID ||
+          !durableRecord ||
+          !durableRecord.success ||
+          durableRecord.data.outcomeId !== pending.outcomeId ||
+          (durableRecord.data.generation ?? 1) !== pending.generation
+        ) {
+          // Identity not established or stale callback across generations: fail closed by skipping persistence!
+          return;
+        }
+
+        if (
+          sessionID &&
+          shouldManageSession(sessionID) &&
+          controller.isManaged(sessionID)
+        ) {
+          const observed = controller.observeToolAfter(
+            sessionID,
+            callID,
+            toolName,
+            rawOutput,
           );
+          if (!observed.success) {
+            throw new Error(
+              `Failed to persist managed tool completion: ${observed.error}`,
+            );
+          }
         }
       }
 
@@ -496,9 +622,13 @@ export function createOutcomeControllerHook(
         }
       }
 
-      if (textParts.length === 0) return;
-
-      const fullText = textParts.join('\n');
+      let fullText: string;
+      if (textParts.length > 0) {
+        fullText = textParts.join('\n');
+      } else {
+        const normalized = normalizeAuthoritativeAttachmentParts(rawParts);
+        fullText = `[attachments:${canonicalDigest('omos/external-part/v1', normalized)}]`;
+      }
 
       idleWokenSessions.delete(sessionID);
       const observed = controller.observeExternalUserTurn(
