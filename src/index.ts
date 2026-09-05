@@ -470,15 +470,58 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     getRevivedContextFiles = taskSessionManagerHook.contextFilesForTask;
     pruneRevivedContext = taskSessionManagerHook.pruneTaskContext;
 
+    outcomeController = new OutcomeController({
+      projectDirectory: ctx.directory,
+      getManagerTaskRecord: (taskId: string) =>
+        backgroundJobCoordinator.get(taskId),
+      readChildSessionResult: async (childSessionId: string) => {
+        try {
+          const res = await extractFinalSessionResult(
+            ctx.client,
+            childSessionId,
+            { directory: ctx.directory },
+          );
+          return {
+            text: res.text,
+            empty: res.empty,
+            terminal: res.terminal ?? false,
+          };
+        } catch {
+          return undefined;
+        }
+      },
+      consumeManagerTask: (
+        rootSessionId: string,
+        taskId: string,
+        generation: number,
+      ) =>
+        consumeCompletedManagerTask(
+          backgroundJobCoordinator,
+          rootSessionId,
+          taskId,
+          generation,
+        ),
+      hasRunningChildren: (rootSessionId: string) =>
+        backgroundJobCoordinator.hasRunning(rootSessionId),
+      hasTerminalUnreconciledChildren: (rootSessionId: string) =>
+        backgroundJobCoordinator.hasTerminalUnreconciled(rootSessionId),
+      resolveAgentName: (agent: string) =>
+        resolveRuntimeAgentName(runtime, agent),
+    });
+
     orchestratorWakeScheduler = createOrchestratorWakeScheduler(ctx, {
       config: runtime.backgroundJobs.orchestratorWake,
       shouldManageSession: (sessionID) =>
         sessionMetadata.getAgent(sessionID) === 'orchestrator',
+      registerSessionAsOrchestrator: (sessionID) => {
+        sessionMetadata.setAgent(sessionID, 'orchestrator');
+      },
       hasInputWait: (sessionID) =>
         taskSessionManagerHook.hasInputWait(sessionID),
       isFallbackInProgress: (sessionID) =>
         foregroundFallback.isFallbackInProgress(sessionID),
       coordinator: sessionLifecycle,
+      outcomeController,
     });
     backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
       if (record.state !== 'stopped' || !record.terminalUnreconciled) return;
@@ -536,45 +579,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     jsonErrorRecovery = createJsonErrorRecoveryHook(ctx);
     toolLoopGuard = createToolLoopGuardHook();
-
-    outcomeController = new OutcomeController({
-      projectDirectory: ctx.directory,
-      getManagerTaskRecord: (taskId: string) =>
-        backgroundJobCoordinator.get(taskId),
-      readChildSessionResult: async (childSessionId: string) => {
-        try {
-          const res = await extractFinalSessionResult(
-            ctx.client,
-            childSessionId,
-            { directory: ctx.directory },
-          );
-          return {
-            text: res.text,
-            empty: res.empty,
-            terminal: res.terminal ?? false,
-          };
-        } catch {
-          return undefined;
-        }
-      },
-      consumeManagerTask: (
-        rootSessionId: string,
-        taskId: string,
-        generation: number,
-      ) =>
-        consumeCompletedManagerTask(
-          backgroundJobCoordinator,
-          rootSessionId,
-          taskId,
-          generation,
-        ),
-      hasRunningChildren: (rootSessionId: string) =>
-        backgroundJobCoordinator.hasRunning(rootSessionId),
-      hasTerminalUnreconciledChildren: (rootSessionId: string) =>
-        backgroundJobCoordinator.hasTerminalUnreconciled(rootSessionId),
-      resolveAgentName: (agent: string) =>
-        resolveRuntimeAgentName(runtime, agent),
-    });
 
     outcomeControllerHook = createOutcomeControllerHook(ctx, {
       controller: outcomeController,

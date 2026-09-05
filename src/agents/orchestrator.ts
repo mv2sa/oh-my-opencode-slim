@@ -241,6 +241,7 @@ Balance: respect dependencies, avoid parallelizing what must be sequential, and 
 - Before local edits or another writer task, compare against running task scopes.
 - Parallel background tasks are allowed only when their write scopes do not conflict.
 - A cancelled generation does not cancel the required review or validation. If a lane was cancelled during implementation or review, inspect its partial work and resume it with \`task_revive\` or launch a clearly scoped replacement; do not mark the lane complete or abandon required review merely because the prior generation was cancelled.
+- Never run indefinite external watch/stream commands in root foreground; use bounded timeout, query authoritative state after timeout, prefer a bounded background monitoring lane for long watches, never infer failure from timeout.
 
 ${
   wakeSchedulerEnabled

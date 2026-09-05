@@ -94,4 +94,18 @@ describe('orchestrator prompt', () => {
       'Do not repeatedly attest evidence or re-dispatch unchanged invalid Manager envelopes',
     );
   });
+
+  test('enforces foreground execution and command discipline policy for external watches', () => {
+    const prompt = buildOrchestratorPrompt();
+
+    expect(prompt).toContain(
+      'Never run indefinite external watch/stream commands in root foreground',
+    );
+    expect(prompt).toContain('use bounded timeout');
+    expect(prompt).toContain('query authoritative state after timeout');
+    expect(prompt).toContain(
+      'prefer a bounded background monitoring lane for long watches',
+    );
+    expect(prompt).toContain('never infer failure from timeout');
+  });
 });

@@ -14,6 +14,12 @@ export type WakeProgressState = {
   observedModel: ContinuationModelSelection | undefined;
 };
 
+export type RestartRecoveryState = {
+  succeeded: boolean;
+  attempts: number;
+  inFlight: boolean;
+};
+
 type InFlightState = { owner: symbol; wakeCommitted: boolean };
 
 type WakeGateStore = {
@@ -22,6 +28,8 @@ type WakeGateStore = {
   releaseWaiters: Map<string, Set<() => void>>;
   /** Insertion-ordered session keys for bounded eviction. */
   order: string[];
+  restartRecovery: Map<string, RestartRecoveryState>;
+  outcomeIdleWoken: Set<string>;
 };
 
 const STORE_KEY = Symbol.for('oh-my-opencode-slim.orchestrator-wake-gate');
@@ -36,7 +44,11 @@ function getStore(): WakeGateStore {
     inFlight: new Map(),
     releaseWaiters: new Map(),
     order: [],
+    restartRecovery: new Map(),
+    outcomeIdleWoken: new Set(),
   };
+  globalWithStore[STORE_KEY].restartRecovery ??= new Map();
+  globalWithStore[STORE_KEY].outcomeIdleWoken ??= new Set();
   return globalWithStore[STORE_KEY];
 }
 
@@ -187,6 +199,7 @@ export function rearmWakeProgress(sessionID: string): void {
   progress.lastFingerprint = undefined;
   progress.stopped = false;
   progress.expectingWakeBusy = false;
+  getStore().outcomeIdleWoken.delete(sessionID);
 }
 
 export function setObservedWakeModel(
@@ -202,12 +215,118 @@ export function getObservedWakeModel(
   return getStore().progress.get(sessionID)?.observedModel;
 }
 
+export function getRestartRecoveryState(
+  sessionID: string,
+): RestartRecoveryState {
+  const store = getStore();
+  let state = store.restartRecovery.get(sessionID);
+  if (!state) {
+    state = { succeeded: false, attempts: 0, inFlight: false };
+    store.restartRecovery.set(sessionID, state);
+  }
+  touchOrder(sessionID);
+  return state;
+}
+
+export function canReserveOutcomeIdleWake(sessionID: string): boolean {
+  const store = getStore();
+  const recovery = store.restartRecovery.get(sessionID);
+  if (
+    recovery?.inFlight ||
+    recovery?.succeeded ||
+    store.outcomeIdleWoken.has(sessionID)
+  ) {
+    return false;
+  }
+  if (store.progress.get(sessionID)?.expectingWakeBusy) return false;
+  return true;
+}
+
+export function commitOutcomeIdleWake(sessionID: string): void {
+  const progress = getWakeProgress(sessionID);
+  progress.expectingWakeBusy = true;
+  touchOrder(sessionID);
+}
+
+export function canAttemptRestartRecovery(sessionID: string): boolean {
+  const store = getStore();
+  const state = store.restartRecovery.get(sessionID);
+  if (state?.succeeded) return false;
+  if (state && state.attempts >= 2) return false;
+  if (state?.inFlight) return false;
+  if (store.inFlight.has(sessionID)) return false;
+  if (store.progress.get(sessionID)?.expectingWakeBusy) return false;
+  return true;
+}
+
+export function tryBeginRestartRecovery(sessionID: string): symbol | null {
+  if (!canAttemptRestartRecovery(sessionID)) return null;
+  const store = getStore();
+  const state = getRestartRecoveryState(sessionID);
+  state.inFlight = true;
+  const owner = Symbol(`restart-recovery-${sessionID}`);
+  store.inFlight.set(sessionID, { owner, wakeCommitted: false });
+  touchOrder(sessionID);
+  return owner;
+}
+
+export function commitRestartRecoverySuccess(
+  sessionID: string,
+  owner: symbol,
+): void {
+  const store = getStore();
+  const state = getRestartRecoveryState(sessionID);
+  state.succeeded = true;
+  state.inFlight = false;
+  const flight = store.inFlight.get(sessionID);
+  if (flight?.owner === owner) {
+    flight.wakeCommitted = true;
+  }
+  const progress = getWakeProgress(sessionID);
+  progress.expectingWakeBusy = true;
+  store.outcomeIdleWoken.add(sessionID);
+  touchOrder(sessionID);
+}
+
+export function recordRestartRecoveryFailure(
+  sessionID: string,
+  owner: symbol,
+): void {
+  const store = getStore();
+  const state = getRestartRecoveryState(sessionID);
+  state.attempts += 1;
+  state.inFlight = false;
+  const flight = store.inFlight.get(sessionID);
+  if (flight?.owner === owner) {
+    store.inFlight.delete(sessionID);
+  }
+  clearExpectingWakeBusy(sessionID);
+  touchOrder(sessionID);
+}
+
+export function releaseRestartRecovery(sessionID: string, owner: symbol): void {
+  const store = getStore();
+  const state = store.restartRecovery.get(sessionID);
+  if (state?.inFlight) {
+    state.inFlight = false;
+  }
+  releaseWakeEvaluation(sessionID, owner);
+}
+
+export function clearOutcomeIdleWake(sessionID: string): void {
+  const store = getStore();
+  store.outcomeIdleWoken.delete(sessionID);
+  clearExpectingWakeBusy(sessionID);
+}
+
 /** Full session cleanup (deletion or disposal). */
 export function clearWakeSession(sessionID: string): void {
   const store = getStore();
   store.progress.delete(sessionID);
   store.inFlight.delete(sessionID);
   store.releaseWaiters.delete(sessionID);
+  store.restartRecovery.delete(sessionID);
+  store.outcomeIdleWoken.delete(sessionID);
   const idx = store.order.indexOf(sessionID);
   if (idx >= 0) store.order.splice(idx, 1);
 }
@@ -218,6 +337,8 @@ export function clearAllWakeSessions(): void {
   store.progress.clear();
   store.inFlight.clear();
   store.releaseWaiters.clear();
+  store.restartRecovery.clear();
+  store.outcomeIdleWoken.clear();
   store.order.length = 0;
 }
 

@@ -72,6 +72,19 @@ busy (external) / errors / user activity → rearm cap
   parameterize wake prompts.
 - **SessionLifecycle**: registers `session.deleted` cleanup via the
   coordinator.
+- **Interrupted Foreground-Turn Restart Recovery** (`index.ts` & `wake-gate.ts`):
+  - One-shot startup bootstrap scanner and first idle/status event fallback for interrupted managed root orchestrator sessions across process restarts.
+  - Startup scan scans bounded current-directory sessions via host `session.list` (roots only, newest first, max 256 roots, concurrency <= 4) after a short non-blocking settle delay.
+  - Exact classification requirements:
+    - Raw prior-epoch Outcome store read (`controller.store.read`) where `serverEpoch !== currentServerEpoch`, not accepted, no durable user/external wait, and exactly one running prior-epoch durable operation.
+    - No process-local user/external wait and no fallback in progress.
+    - Host snapshot 1: root session (`!parentID`), inactive status, valid incomplete TODOs, latest message is exactly one incomplete assistant turn with no error and exactly one running noninteractive tool part.
+    - Exact durable operation binding by callID, tool name, and `canonicalDigest('omos/tool-args/v1', tool input)`.
+    - Normal `controller.readRecord` recovery ensuring the exact operation is interrupted with the standard restart error and matching unresolved action.
+    - Host snapshot 2: must be identical to snapshot 1 and inactive before prompt.
+  - Wakes via single static internal prompt `ORCHESTRATOR_RESTART_RECOVERY_TEXT` directing authoritative inspection without blind re-execution, preserving model from the incomplete assistant turn.
+  - Process-global one-flight and success state shared between startup scan and event fallback: at most 2 SDK-failure attempts per session/process, never a second prompt after success, bounded 256-session eviction, and disposal cancellation.
+  - Shared wake reservation with OutcomeController idle wake so bootstrap and Outcome idle cannot double-prompt.
 - **Dependencies**: `createInternalAgentTextPart` /
   `isInternalInitiatorPart` (`src/utils/internal-initiator.ts`), `log`,
   `isRecord`, `SessionLifecycle`, and the task-session-manager status/selection

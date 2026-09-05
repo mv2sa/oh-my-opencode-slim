@@ -13,6 +13,11 @@ import {
   stripTaggedContent,
 } from '../cache-safe-injection';
 import {
+  canReserveOutcomeIdleWake,
+  clearOutcomeIdleWake,
+  commitOutcomeIdleWake,
+} from '../orchestrator-wake/wake-gate';
+import {
   isMessageWithParts,
   type MessageInfo,
   type MessageWithParts,
@@ -589,7 +594,11 @@ export function createOutcomeControllerHook(
             }
           )?.client;
           if (client?.session?.promptAsync) {
+            if (!canReserveOutcomeIdleWake(eventSessionID)) {
+              return;
+            }
             idleWokenSessions.add(eventSessionID);
+            commitOutcomeIdleWake(eventSessionID);
             try {
               await client.session.promptAsync({
                 path: { id: eventSessionID },
@@ -606,6 +615,7 @@ export function createOutcomeControllerHook(
               });
             } catch {
               idleWokenSessions.delete(eventSessionID);
+              clearOutcomeIdleWake(eventSessionID);
             }
           }
         }
@@ -615,6 +625,7 @@ export function createOutcomeControllerHook(
         (statusType === 'busy' || statusType === 'retry')
       ) {
         idleWokenSessions.delete(eventSessionID);
+        clearOutcomeIdleWake(eventSessionID);
       }
     },
   };
