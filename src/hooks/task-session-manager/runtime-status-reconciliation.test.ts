@@ -13,23 +13,29 @@ function createReconciler(
     clear?: (parentSessionID: string, expectedRevision: number) => void;
     fallback?: (parentSessionID: string) => boolean;
   },
+  sessionMessages: (request?: unknown) => Promise<unknown> = async () => ({
+    data: [],
+  }),
+  resultProbeTimeoutMs?: number,
 ) {
   const board = new BackgroundJobBoard();
   const contextFilesForPrompt = mock(() => []);
   const prune = mock(() => {});
+  const pendingManagedTaskIds = new Set(['child-1']);
   const reconciler = createRuntimeStatusReconciler({
     input: {
       directory: '/test/project',
-      client: { session: { status } },
+      client: { session: { status, messages: sessionMessages } },
     } as never,
     backgroundJobBoard: board,
     statusTimeoutMs,
+    resultProbeTimeoutMs,
     stopConfirmationGraceMs,
     getParentActivity: parentActivity?.get,
     clearParentActivityIfUnchanged: parentActivity?.clear,
     isParentFallbackInProgress: parentActivity?.fallback,
     taskContextTracker: {
-      pendingManagedTaskIds: new Set(['child-1']),
+      pendingManagedTaskIds,
       contextFilesForPrompt,
       prune,
     },
@@ -41,7 +47,13 @@ function createReconciler(
     description: 'fix reconciliation',
     now: 0,
   });
-  return { board, reconciler, contextFilesForPrompt, prune };
+  return {
+    board,
+    reconciler,
+    pendingManagedTaskIds,
+    contextFilesForPrompt,
+    prune,
+  };
 }
 
 function deferred<T>() {
@@ -72,6 +84,25 @@ describe('runtime status reconciliation', () => {
     });
   });
 
+  test('keeps a runtime-retrying job running without probing messages', async () => {
+    const messages = mock(async () => ({ data: [] }));
+    const { board, reconciler } = createReconciler(
+      async () => ({ data: { 'child-1': { type: 'retry' } } }),
+      undefined,
+      undefined,
+      undefined,
+      messages,
+    );
+
+    await reconciler.reconcile();
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      statusUncertain: false,
+    });
+    expect(messages).not.toHaveBeenCalled();
+  });
+
   test('keeps an absent runtime session provisional instead of stopping it', async () => {
     const { board, reconciler, contextFilesForPrompt, prune } =
       createReconciler(async () => ({ data: {} }));
@@ -85,6 +116,381 @@ describe('runtime status reconciliation', () => {
         'Runtime status response did not contain a live session state; task termination is unconfirmed.',
     });
     expect(board.resolveReusable('parent-1', 'fix-1', 'fixer')).toBeUndefined();
+    expect(contextFilesForPrompt).not.toHaveBeenCalled();
+    expect(prune).not.toHaveBeenCalled();
+  });
+
+  test('completes from trimmed visible text and excludes reasoning', async () => {
+    const messages = mock(async () => ({
+      data: [
+        {
+          info: { role: 'assistant', time: { completed: 100 } },
+          parts: [
+            { type: 'reasoning', text: 'private analysis' },
+            { type: 'text', text: '  authoritative final result  ' },
+          ],
+        },
+      ],
+    }));
+    const {
+      board,
+      reconciler,
+      pendingManagedTaskIds,
+      contextFilesForPrompt,
+      prune,
+    } = createReconciler(
+      async () => ({ data: {} }),
+      undefined,
+      undefined,
+      undefined,
+      messages,
+    );
+    const listener = mock(() => {});
+    board.addTerminalStateListener(listener);
+
+    await reconciler.reconcile();
+    await reconciler.reconcile();
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'completed',
+      statusUncertain: false,
+      resultSummary: 'authoritative final result',
+      terminalUnreconciled: true,
+    });
+    expect(messages).toHaveBeenCalledTimes(1);
+    expect(messages).toHaveBeenCalledWith({
+      path: { id: 'child-1' },
+      query: { directory: '/test/project' },
+    });
+    expect(pendingManagedTaskIds.has('child-1')).toBe(false);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(contextFilesForPrompt).toHaveBeenCalledTimes(1);
+    expect(prune).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps an absent session running and uncertain without terminal proof', async () => {
+    const messages = mock(async () => ({
+      data: [
+        {
+          info: { role: 'assistant' },
+          parts: [{ type: 'text', text: 'work in progress' }],
+        },
+      ],
+    }));
+    const { board, reconciler } = createReconciler(
+      async () => ({ data: {} }),
+      undefined,
+      undefined,
+      undefined,
+      messages,
+    );
+
+    await reconciler.reconcile();
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
+      lastStatusError:
+        'Runtime status response did not contain a live session state; task termination is unconfirmed.',
+    });
+    expect(messages).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not complete an absent session from an empty completed assistant turn', async () => {
+    const messages = mock(async () => ({
+      data: [
+        {
+          info: { role: 'assistant', time: { completed: 100 } },
+          parts: [{ type: 'text', text: '' }],
+        },
+      ],
+    }));
+    const { board, reconciler } = createReconciler(
+      async () => ({ data: {} }),
+      undefined,
+      undefined,
+      undefined,
+      messages,
+    );
+
+    await reconciler.reconcile();
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
+    });
+    expect(messages).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    {
+      name: 'reasoning-only',
+      parts: [{ type: 'reasoning', text: 'private analysis' }],
+    },
+    {
+      name: 'whitespace-only',
+      parts: [{ type: 'text', text: ' \n\t ' }],
+    },
+  ])(
+    'does not complete an absent session from a $name completed turn',
+    async ({ parts }) => {
+      const messages = mock(async () => ({
+        data: [
+          {
+            info: { role: 'assistant', time: { completed: 100 } },
+            parts,
+          },
+        ],
+      }));
+      const { board, reconciler } = createReconciler(
+        async () => ({ data: {} }),
+        undefined,
+        undefined,
+        undefined,
+        messages,
+      );
+
+      await reconciler.reconcile();
+
+      expect(board.get('child-1')).toMatchObject({
+        state: 'running',
+        statusUncertain: true,
+      });
+      expect(messages).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test('does not complete an absent session from an error-bearing assistant turn', async () => {
+    const messages = mock(async () => ({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            time: { completed: 100 },
+            error: { name: 'MessageAbortedError', data: {} },
+          },
+          parts: [{ type: 'text', text: 'partial result' }],
+        },
+      ],
+    }));
+    const { board, reconciler } = createReconciler(
+      async () => ({ data: {} }),
+      undefined,
+      undefined,
+      undefined,
+      messages,
+    );
+
+    await reconciler.reconcile();
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
+    });
+    expect(messages).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps an absent session running and uncertain when the result probe fails', async () => {
+    const messages = mock(async () => {
+      throw new Error('messages unavailable');
+    });
+    const { board, reconciler, contextFilesForPrompt, prune } =
+      createReconciler(
+        async () => ({ data: {} }),
+        undefined,
+        undefined,
+        undefined,
+        messages,
+      );
+
+    await expect(reconciler.reconcile()).resolves.toBeUndefined();
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
+      lastStatusError:
+        'Runtime status response did not contain a live session state; task termination is unconfirmed.',
+    });
+    expect(messages).toHaveBeenCalledTimes(1);
+    expect(contextFilesForPrompt).not.toHaveBeenCalled();
+    expect(prune).not.toHaveBeenCalled();
+  });
+
+  test('bounds each missing-session probe so one hung job does not block later jobs', async () => {
+    const secondProbeStarted = deferred<void>();
+    const secondCompleted = deferred<void>();
+    const messages = mock((request?: unknown) => {
+      const taskID = (request as { path?: { id?: string } })?.path?.id;
+      if (taskID === 'child-1') return new Promise<unknown>(() => {});
+      secondProbeStarted.resolve(undefined);
+      return Promise.resolve({
+        data: [
+          {
+            info: { role: 'assistant', time: { completed: 100 } },
+            parts: [{ type: 'text', text: 'second job completed' }],
+          },
+        ],
+      });
+    });
+    const { board, reconciler } = createReconciler(
+      async () => ({ data: {} }),
+      undefined,
+      undefined,
+      undefined,
+      messages,
+      20,
+    );
+    board.registerLaunch({
+      taskID: 'child-2',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'second missing job',
+      now: 0,
+    });
+    board.addTerminalStateListener((taskID) => {
+      if (taskID === 'child-2') secondCompleted.resolve(undefined);
+    });
+
+    let reconciliationFinished = false;
+    const reconciliation = reconciler.reconcile().then(() => {
+      reconciliationFinished = true;
+    });
+    await secondProbeStarted.promise;
+    await secondCompleted.promise;
+
+    expect(messages).toHaveBeenCalledTimes(2);
+    expect(reconciliationFinished).toBe(false);
+    expect(board.get('child-2')).toMatchObject({
+      state: 'completed',
+      resultSummary: 'second job completed',
+    });
+
+    await reconciliation;
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
+    });
+  });
+
+  test('ignores a completed turn older than the relaunched run boundary', async () => {
+    const messages = mock(async () => ({
+      data: [
+        {
+          info: { role: 'assistant', time: { completed: 100 } },
+          parts: [{ type: 'text', text: 'generation one result' }],
+        },
+      ],
+    }));
+    const { board, reconciler } = createReconciler(
+      async () => ({ data: {} }),
+      undefined,
+      undefined,
+      undefined,
+      messages,
+    );
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'generation two',
+      now: 200,
+    });
+
+    await reconciler.reconcile();
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
+      generation: 2,
+      runStartedAt: 200,
+      resultSummary: undefined,
+    });
+    expect(messages).toHaveBeenCalledTimes(1);
+  });
+
+  test('ignores terminal proof older than a same-generation busy observation during the probe', async () => {
+    const response = deferred<unknown>();
+    const probeStarted = deferred<void>();
+    const messages = mock(() => {
+      probeStarted.resolve(undefined);
+      return response.promise;
+    });
+    const { board, reconciler, contextFilesForPrompt, prune } =
+      createReconciler(
+        async () => ({ data: {} }),
+        undefined,
+        undefined,
+        undefined,
+        messages,
+      );
+
+    const reconciliation = reconciler.reconcile();
+    await probeStarted.promise;
+    const generation = board.get('child-1')?.generation;
+    board.markRunningFromLiveSession('child-1', 200, generation);
+    response.resolve({
+      data: [
+        {
+          info: { role: 'assistant', time: { completed: 100 } },
+          parts: [{ type: 'text', text: 'older terminal result' }],
+        },
+      ],
+    });
+    await reconciliation;
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      generation,
+      lastLiveBusyAt: 200,
+      resultSummary: undefined,
+    });
+    expect(contextFilesForPrompt).not.toHaveBeenCalled();
+    expect(prune).not.toHaveBeenCalled();
+  });
+
+  test('ignores a terminal result when the generation changes during the probe', async () => {
+    const response = deferred<unknown>();
+    const probeStarted = deferred<void>();
+    const messages = mock(() => {
+      probeStarted.resolve(undefined);
+      return response.promise;
+    });
+    const { board, reconciler, contextFilesForPrompt, prune } =
+      createReconciler(
+        async () => ({ data: {} }),
+        undefined,
+        undefined,
+        undefined,
+        messages,
+      );
+
+    const reconciliation = reconciler.reconcile();
+    await probeStarted.promise;
+    expect(messages).toHaveBeenCalledTimes(1);
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'relaunched while result probe awaited',
+      now: 1,
+    });
+    response.resolve({
+      data: [
+        {
+          info: { role: 'assistant', time: { completed: 100 } },
+          parts: [{ type: 'text', text: 'stale generation result' }],
+        },
+      ],
+    });
+    await reconciliation;
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      generation: 2,
+      description: 'relaunched while result probe awaited',
+      resultSummary: undefined,
+    });
     expect(contextFilesForPrompt).not.toHaveBeenCalled();
     expect(prune).not.toHaveBeenCalled();
   });

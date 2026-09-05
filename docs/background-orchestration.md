@@ -189,11 +189,12 @@ on the local job board.
 
 After a full OpenCode or plugin restart, persisted running background-task
 history is rehydrated into the local job board and immediately reconciled
-against live host session status. A missing child remains uncertain. An
-explicitly idle child becomes a stop candidate only after the parent can accept
-terminal delivery and the configured confirmation interval elapses. A busy
-child remains running, and status lookup failures remain uncertain rather than
-being treated as completion.
+against live host session status. A missing child remains uncertain unless the
+bounded final-result proof described below establishes completion for the
+current run. An explicitly idle child becomes a stop candidate only after the
+parent can accept terminal delivery and the configured confirmation interval
+elapses. A busy child remains running, and status lookup failures remain
+uncertain rather than being treated as completion.
 
 Specialist outputs are inputs, not final truth. The orchestrator reconciles them
 against each other and the original user goal.
@@ -550,8 +551,17 @@ checks that single map for every board job still marked `running`, while normal
 session events remain the fast path.
 
 `busy` and `retry` confirm that a job is live and reset any pending stop
-confirmation. Absence from an otherwise valid status map is uncertainty only;
-it never starts or advances the stop clock. An explicit child `idle` state is a
+confirmation. Absence from an otherwise valid status map is uncertainty only
+and never starts or advances the stop clock. For each missing running job, one
+bounded child-result probe may run per reconciliation pass; probes are isolated
+so a hung child does not block later jobs. The probe proves completion only when
+the final message is a completed, error-free assistant turn with non-whitespace
+visible text and a completion timestamp at or after the current run/liveness
+boundary. Reasoning text is excluded, and only trimmed visible text is stored.
+The tracked state and generation are revalidated after the probe await, while a
+newer same-generation busy observation defeats older terminal evidence. Probe
+errors, timeouts, and missing, empty, reasoning-only, or nonterminal results
+leave the job running and status-uncertain. An explicit child `idle` state is a
 stop candidate, but positive parent `busy` or `retry` is a terminal-delivery
 barrier: while the parent is active, the child remains running and any pending
 stop clock is cleared. After the parent becomes non-active, a fresh child-idle
@@ -562,7 +572,10 @@ without a native terminal task result. Stopped sessions are never reusable and
 stay visible to the parent for recovery. A later live child `busy` observation
 can revive an unreconciled stopped job. After the parent has been woken and the
 stop acknowledged, stale busy cannot flip the job back to running. Only explicit
-terminal task output proves completion, error, or cancellation.
+terminal task output or the narrowly fenced missing-session proof above proves
+completion; explicit task output remains the only proof of error or cancellation.
+Explicit busy/retry/idle/malformed/error status-map behavior is otherwise
+unchanged.
 
 Malformed status entries and failed status requests are surfaced as `status
 uncertain`; they never prove that a job stopped or completed and do not confirm

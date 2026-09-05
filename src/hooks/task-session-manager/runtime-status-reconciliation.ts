@@ -1,9 +1,15 @@
 import type { PluginInput } from '@opencode-ai/plugin';
-import type { BackgroundJobStore, ContextFile } from '../../utils';
+import type {
+  BackgroundJobRecord,
+  BackgroundJobStore,
+  ContextFile,
+} from '../../utils';
 import {
+  extractFinalSessionResult,
   getRuntimeSessionStatusSnapshot,
   runtimeSessionStatus,
 } from '../../utils';
+import { isRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
 import {
   DEFAULT_STOP_CONFIRMATION_MS,
@@ -11,6 +17,70 @@ import {
 } from './stop-confirmation';
 
 export const RUNTIME_STATUS_RECONCILE_DELAY_MS = 5_000;
+export const RUNTIME_RESULT_PROBE_TIMEOUT_MS = 5_000;
+
+type FinalSessionProof = Awaited<
+  ReturnType<typeof extractFinalSessionResult>
+> & {
+  completedAt?: number;
+};
+
+function finalAssistantCompletedAt(data: unknown): number | undefined {
+  if (!Array.isArray(data)) return undefined;
+  const last = data.at(-1);
+  if (!isRecord(last) || !isRecord(last.info)) return undefined;
+  if (last.info.role !== 'assistant' || !isRecord(last.info.time)) {
+    return undefined;
+  }
+  const completedAt = last.info.time.completed;
+  return typeof completedAt === 'number' && Number.isFinite(completedAt)
+    ? completedAt
+    : undefined;
+}
+
+/** Fetch once, then replay that response through the shared final-result parser. */
+async function extractFinalSessionProof(
+  input: PluginInput,
+  taskID: string,
+): Promise<FinalSessionProof> {
+  const messagesResult = await input.client.session.messages({
+    path: { id: taskID },
+    ...(input.directory ? { query: { directory: input.directory } } : {}),
+  });
+  const replayClient = {
+    session: { messages: async () => messagesResult },
+  } as unknown as Parameters<typeof extractFinalSessionResult>[0];
+  const result = await extractFinalSessionResult(replayClient, taskID, {
+    includeReasoning: false,
+  });
+  return {
+    ...result,
+    completedAt: finalAssistantCompletedAt(messagesResult.data),
+  };
+}
+
+async function withResultProbeTimeout<T>(
+  operation: () => Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('Session result probe timed out');
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error('Session result probe timed out'));
+        }, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export type ParentActivityObservation = {
   active: boolean;
@@ -22,6 +92,7 @@ export function createRuntimeStatusReconciler(options: {
   backgroundJobBoard: BackgroundJobStore;
   delayMs?: number;
   statusTimeoutMs?: number;
+  resultProbeTimeoutMs?: number;
   stopConfirmationGraceMs?: number;
   getParentActivity?: (
     parentSessionID: string,
@@ -38,10 +109,92 @@ export function createRuntimeStatusReconciler(options: {
   };
 }) {
   const delayMs = options.delayMs ?? RUNTIME_STATUS_RECONCILE_DELAY_MS;
+  const resultProbeTimeoutMs =
+    options.resultProbeTimeoutMs ?? RUNTIME_RESULT_PROBE_TIMEOUT_MS;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
   let activeReconcile: Promise<void> | undefined;
   let rerunRequested = false;
+
+  async function probeMissingRunningJob(
+    job: BackgroundJobRecord,
+  ): Promise<void> {
+    const livenessBoundaryAtProbeStart = job.lastLiveBusyAt;
+    let result: FinalSessionProof | undefined;
+    try {
+      result = await withResultProbeTimeout(
+        () => extractFinalSessionProof(options.input, job.taskID),
+        resultProbeTimeoutMs,
+      );
+    } catch (error) {
+      log(
+        '[task-session-manager] missing runtime session result probe was inconclusive',
+        {
+          taskID: job.taskID,
+          generation: job.generation,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+    }
+
+    if (disposed) return;
+    const currentAfterProbe = options.backgroundJobBoard.get(job.taskID);
+    if (
+      currentAfterProbe?.taskID !== job.taskID ||
+      currentAfterProbe.state !== 'running' ||
+      currentAfterProbe.generation !== job.generation
+    ) {
+      return;
+    }
+    if (currentAfterProbe.lastLiveBusyAt !== livenessBoundaryAtProbeStart) {
+      return;
+    }
+
+    const visibleText = result?.text.trim() ?? '';
+    const currentRunAndLivenessBoundary = Math.max(
+      currentAfterProbe.runStartedAt,
+      currentAfterProbe.lastLaunchedAt,
+      currentAfterProbe.lastLiveBusyAt ?? Number.NEGATIVE_INFINITY,
+    );
+    if (
+      result?.terminal !== true ||
+      result.completedAt === undefined ||
+      result.completedAt < currentRunAndLivenessBoundary ||
+      visibleText.length === 0
+    ) {
+      return;
+    }
+
+    const completed = options.backgroundJobBoard.updateStatus({
+      taskID: job.taskID,
+      state: 'completed',
+      resultSummary: visibleText,
+      expectedGeneration: job.generation,
+    });
+    if (
+      completed?.taskID !== job.taskID ||
+      completed.generation !== job.generation ||
+      completed.state !== 'completed' ||
+      !options.backgroundJobBoard.isTerminalUnreconciled(job.taskID)
+    ) {
+      return;
+    }
+    options.taskContextTracker.pendingManagedTaskIds.delete(job.taskID);
+    options.backgroundJobBoard.addContext(
+      job.taskID,
+      options.taskContextTracker.contextFilesForPrompt(job.taskID),
+    );
+    options.taskContextTracker.prune(options.backgroundJobBoard);
+    log(
+      '[task-session-manager] completed missing runtime session from terminal result probe',
+      {
+        taskID: completed.taskID,
+        alias: completed.alias,
+        parentSessionID: completed.parentSessionID,
+        generation: completed.generation,
+      },
+    );
+  }
 
   function schedule(): void {
     if (disposed) return;
@@ -70,6 +223,7 @@ export function createRuntimeStatusReconciler(options: {
     if (running.length === 0) return;
 
     const parentRevisionsAtRequest = new Map<string, number | undefined>();
+    const missingResultProbes: Promise<void>[] = [];
     for (const job of running) {
       if (!parentRevisionsAtRequest.has(job.parentSessionID)) {
         parentRevisionsAtRequest.set(
@@ -138,6 +292,7 @@ export function createRuntimeStatusReconciler(options: {
           'Runtime status response did not contain a live session state; task termination is unconfirmed.',
           job.generation,
         );
+        missingResultProbes.push(probeMissingRunningJob(job));
         continue;
       }
 
@@ -203,6 +358,7 @@ export function createRuntimeStatusReconciler(options: {
         },
       );
     }
+    await Promise.all(missingResultProbes);
   }
 
   async function reconcile(): Promise<void> {
