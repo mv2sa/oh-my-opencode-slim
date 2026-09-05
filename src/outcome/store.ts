@@ -2368,6 +2368,7 @@ export class OutcomeStore {
               ...operation,
               status: 'interrupted' as const,
               updatedAt: now,
+              interruptionOrigin: 'restart' as const,
               error:
                 operation.error ?? 'Operation interrupted by process restart',
             }
@@ -2846,7 +2847,47 @@ function applyMutation(
       delete next.checkpoint;
       break;
     }
-    case 'append_evidence':
+    case 'append_evidence': {
+      if (
+        mutation.entry.kind === 'orchestrator_attestation' &&
+        mutation.entry.linkedObservationId
+      ) {
+        const linkedObsId = mutation.entry.linkedObservationId;
+        const target = next.receipts.evidence.find((e) => e.id === linkedObsId);
+        if (!target) {
+          throw new Error(
+            `Linked observation '${linkedObsId}' not found in durable record`,
+          );
+        }
+        if (target.kind !== 'controller_observed') {
+          throw new Error(
+            `Linked observation '${linkedObsId}' is not controller_observed`,
+          );
+        }
+        if (!target.completionObserved) {
+          throw new Error(`Linked observation '${linkedObsId}' is incomplete`);
+        }
+        const op = next.operations.find((o) => o.callId === target.callId);
+        if (!op) {
+          throw new Error(
+            `Linked operation '${target.callId}' not found for observation '${target.id}'`,
+          );
+        }
+        if (op.status !== 'completed') {
+          throw new Error(
+            `Linked operation '${op.callId}' must be completed (found status '${op.status}')`,
+          );
+        }
+        if (
+          op.toolName !== target.toolName ||
+          op.argumentDigest !== target.argumentDigest ||
+          op.serverEpoch !== target.startedEpoch
+        ) {
+          throw new Error(
+            `Linked observation '${target.id}' is identity-incoherent with its operation`,
+          );
+        }
+      }
       compactUnreferencedToolHistory(
         next,
         mutation.entry.kind === 'orchestrator_attestation' &&
@@ -2864,11 +2905,13 @@ function applyMutation(
       }
       next.receipts.evidence.push(mutation.entry);
       break;
+    }
     case 'start_tool_call':
       compactUnreferencedToolHistory(next);
       if (
         mutation.operation.serverEpoch !== epoch ||
         mutation.operation.status !== 'running' ||
+        mutation.operation.interruptionOrigin !== undefined ||
         mutation.observation.startedEpoch !== epoch ||
         mutation.observation.completionObserved
       ) {
@@ -3419,6 +3462,7 @@ function applyMutation(
         if (op.serverEpoch === epoch && op.status === 'running') {
           op.status = 'interrupted';
           op.updatedAt = now;
+          op.interruptionOrigin = 'idle';
           op.error = 'Session became idle without a durable tool after-hook';
         }
       }
@@ -3721,7 +3765,8 @@ function applyMutation(
       compactUnreferencedToolHistory(next);
       if (
         mutation.operation.serverEpoch !== epoch ||
-        mutation.operation.status !== 'running'
+        mutation.operation.status !== 'running' ||
+        mutation.operation.interruptionOrigin !== undefined
       )
         throw new Error('Operation must start running in current epoch');
       next.operations.push(mutation.operation);
@@ -3736,6 +3781,7 @@ function applyMutation(
         ...next.operations[index],
         status: mutation.status,
         updatedAt: now,
+        interruptionOrigin: undefined,
         ...(mutation.error ? { error: mutation.error } : {}),
       };
       break;
@@ -3752,10 +3798,19 @@ function applyMutation(
           'Only failed or interrupted operations can be acknowledged',
         );
       }
+      const acknowledged = next.operations[index];
+      const inferredInterruptionOrigin =
+        acknowledged.status === 'interrupted'
+          ? (acknowledged.interruptionOrigin ??
+            interruptionOriginFromError(acknowledged.error))
+          : undefined;
       next.operations[index] = {
-        ...next.operations[index],
+        ...acknowledged,
         status: 'acknowledged',
         updatedAt: now,
+        ...(inferredInterruptionOrigin
+          ? { interruptionOrigin: inferredInterruptionOrigin }
+          : { interruptionOrigin: undefined }),
       };
       for (const action of next.actionsRequired) {
         if (
@@ -3871,6 +3926,11 @@ function applyMutation(
       break;
     }
     case 'append_action':
+      if (mutation.action.code === 'interrupted_operation') {
+        throw new Error(
+          'Interrupted-operation actions are reserved for store-owned lifecycle transitions',
+        );
+      }
       if (mutation.action.createdRevision !== revision) {
         throw new Error(
           'Action createdRevision must equal its persisted revision',
@@ -4389,6 +4449,32 @@ function assertFinalizable(record: OutcomeRecord): void {
         'Final evidence attestations must be passed, fresh, and candidate-bound',
       );
     }
+    if (entry.linkedObservationId) {
+      const linkedObs = record.receipts.evidence.find(
+        (candidate) => candidate.id === entry.linkedObservationId,
+      );
+      if (
+        linkedObs?.kind !== 'controller_observed' ||
+        !linkedObs.completionObserved
+      ) {
+        throw new Error(
+          `Final evidence attestation '${entry.id}' linked observation is incomplete or invalid`,
+        );
+      }
+      const operation = record.operations.find(
+        (op) => op.callId === linkedObs.callId,
+      );
+      if (
+        operation?.status !== 'completed' ||
+        operation.toolName !== linkedObs.toolName ||
+        operation.argumentDigest !== linkedObs.argumentDigest ||
+        operation.serverEpoch !== linkedObs.startedEpoch
+      ) {
+        throw new Error(
+          `Final evidence attestation '${entry.id}' linked observation is identity-incoherent with its operation`,
+        );
+      }
+    }
   }
   for (const rule of record.contract.rules) {
     if (
@@ -4456,6 +4542,22 @@ function compactUnreferencedToolHistory(
     }
   }
 
+  for (const entry of record.receipts.evidence) {
+    if (
+      entry.kind === 'controller_observed' &&
+      referencedObsIds.has(entry.id)
+    ) {
+      referencedObsIds.add(entry.callId);
+      referencedOpIds.add(entry.callId);
+    }
+  }
+
+  for (const op of record.operations) {
+    if (referencedOpIds.has(op.callId)) {
+      referencedOpIds.add(op.id);
+    }
+  }
+
   for (const rule of record.contract.rules) {
     for (const id of rule.evidenceAttestationIds) {
       referencedObsIds.add(id);
@@ -4475,8 +4577,13 @@ function compactUnreferencedToolHistory(
   }
 
   for (const actionItem of record.actionsRequired) {
-    referencedOpIds.add(actionItem.referenceId);
-    referencedObsIds.add(actionItem.referenceId);
+    const resolvedInterruptedOperation =
+      actionItem.code === 'interrupted_operation' &&
+      actionItem.resolvedAt !== undefined;
+    if (!resolvedInterruptedOperation) {
+      referencedOpIds.add(actionItem.referenceId);
+      referencedObsIds.add(actionItem.referenceId);
+    }
     if (actionItem.resolutionEvidenceAttestationIds) {
       for (const id of actionItem.resolutionEvidenceAttestationIds) {
         referencedObsIds.add(id);
@@ -4500,33 +4607,29 @@ function compactUnreferencedToolHistory(
     referencedObsIds.add(record.finalCertificate.managerReviewId);
   }
 
-  const completedObsByCallId = new Map<string, OutcomeToolObservation[]>();
+  const compactableObsByCallId = new Map<string, OutcomeToolObservation[]>();
   for (const entry of record.receipts.evidence) {
     if (
       entry.kind === 'controller_observed' &&
-      entry.completionObserved &&
-      entry.outputDigest !== undefined &&
-      entry.completedEpoch !== undefined &&
-      entry.completedAt !== undefined &&
       !referencedObsIds.has(entry.id) &&
       !referencedObsIds.has(entry.callId)
     ) {
-      const list = completedObsByCallId.get(entry.callId) ?? [];
+      const list = compactableObsByCallId.get(entry.callId) ?? [];
       list.push(entry);
-      completedObsByCallId.set(entry.callId, list);
+      compactableObsByCallId.set(entry.callId, list);
     }
   }
 
-  const completedOpsByCallId = new Map<string, OutcomePendingOperation[]>();
+  const compactableOpsByCallId = new Map<string, OutcomePendingOperation[]>();
   for (const op of record.operations) {
     if (
-      op.status === 'completed' &&
+      ['completed', 'acknowledged'].includes(op.status) &&
       !referencedOpIds.has(op.id) &&
       !referencedOpIds.has(op.callId)
     ) {
-      const list = completedOpsByCallId.get(op.callId) ?? [];
+      const list = compactableOpsByCallId.get(op.callId) ?? [];
       list.push(op);
-      completedOpsByCallId.set(op.callId, list);
+      compactableOpsByCallId.set(op.callId, list);
     }
   }
 
@@ -4537,17 +4640,34 @@ function compactUnreferencedToolHistory(
 
   for (const op of record.operations) {
     if (
-      op.status !== 'completed' ||
+      !['completed', 'acknowledged'].includes(op.status) ||
       referencedOpIds.has(op.id) ||
       referencedOpIds.has(op.callId)
     ) {
       continue;
     }
-    const matchingOps = completedOpsByCallId.get(op.callId);
-    const matchingObs = completedObsByCallId.get(op.callId);
+    const matchingOps = compactableOpsByCallId.get(op.callId);
+    const matchingObs = compactableObsByCallId.get(op.callId);
     if (matchingOps?.length === 1 && matchingObs?.length === 1) {
       const obs = matchingObs[0];
+      const completedPair =
+        op.status === 'completed' &&
+        obs.completionObserved &&
+        obs.outputDigest !== undefined &&
+        obs.completedEpoch !== undefined &&
+        obs.completedAt !== undefined;
+      const acknowledgedInterruptedPair =
+        op.status === 'acknowledged' &&
+        !obs.completionObserved &&
+        op.interruptionOrigin !== undefined &&
+        !record.actionsRequired.some(
+          (actionItem) =>
+            actionItem.code === 'interrupted_operation' &&
+            actionItem.referenceId === op.id &&
+            actionItem.resolvedAt === undefined,
+        );
       if (
+        (completedPair || acknowledgedInterruptedPair) &&
         obs.toolName === op.toolName &&
         obs.argumentDigest === op.argumentDigest &&
         obs.startedEpoch === op.serverEpoch
@@ -4640,6 +4760,16 @@ function insertActionRequired(
   }
 
   record.actionsRequired.push(newAction);
+}
+
+function interruptionOriginFromError(
+  error: string | undefined,
+): OutcomePendingOperation['interruptionOrigin'] {
+  if (error === 'Operation interrupted by process restart') return 'restart';
+  if (error === 'Session became idle without a durable tool after-hook') {
+    return 'idle';
+  }
+  return undefined;
 }
 
 function sessionHash(session: string): string {

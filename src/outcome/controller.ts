@@ -1426,15 +1426,57 @@ export class OutcomeController {
     }
     const currentRecord = recRes.data;
 
-    if (params.linkedObservationId) {
-      const observationExistsInStore = currentRecord.receipts.evidence.some(
+    if (params.linkedObservationId !== undefined) {
+      const linkedEntry = currentRecord.receipts.evidence.find(
         (e) => e.id === params.linkedObservationId,
       );
-      if (!observationExistsInStore) {
+      if (!linkedEntry) {
         return {
           success: false,
           error: `Linked observation '${params.linkedObservationId}' not found in durable record`,
           code: 'missing_observation',
+        };
+      }
+      if (linkedEntry.kind !== 'controller_observed') {
+        return {
+          success: false,
+          error: `Linked observation '${params.linkedObservationId}' is not controller_observed`,
+          code: 'not_controller_observed',
+        };
+      }
+      if (!linkedEntry.completionObserved) {
+        return {
+          success: false,
+          error: `Linked observation '${params.linkedObservationId}' is incomplete`,
+          code: 'incomplete_observation',
+        };
+      }
+      const operation = currentRecord.operations.find(
+        (op) => op.callId === linkedEntry.callId,
+      );
+      if (!operation) {
+        return {
+          success: false,
+          error: `Linked observation '${params.linkedObservationId}' lacks matching operation`,
+          code: 'missing_operation',
+        };
+      }
+      if (operation.status !== 'completed') {
+        return {
+          success: false,
+          error: `Linked operation '${operation.callId}' must be completed (found '${operation.status}')`,
+          code: 'operation_not_completed',
+        };
+      }
+      if (
+        operation.toolName !== linkedEntry.toolName ||
+        operation.argumentDigest !== linkedEntry.argumentDigest ||
+        operation.serverEpoch !== linkedEntry.startedEpoch
+      ) {
+        return {
+          success: false,
+          error: `Linked observation '${params.linkedObservationId}' does not match its operation identity`,
+          code: 'operation_identity_mismatch',
         };
       }
     }

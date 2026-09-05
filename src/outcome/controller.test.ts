@@ -790,6 +790,67 @@ describe('OutcomeController service over frozen store', () => {
     }
   });
 
+  test('submitEvidence rejects incomplete and non-observation links without writing', () => {
+    const controller = new OutcomeController({ storeDirectory: tempDir });
+    const root = 'ses_evidence_incomplete';
+    controller.begin(root, testContract());
+    controller.observeToolBefore(root, 'call_incomplete', 'bash', {
+      command: 'bun test',
+    });
+
+    const before = controller.readRecord(root);
+    expect(before.success).toBe(true);
+    if (!before.success) return;
+    const recordPath = controller.store.recordPath(root);
+    const bytesBefore = fs.readFileSync(recordPath, 'utf8');
+
+    const incomplete = controller.submitEvidence(root, {
+      description: 'must not attest an incomplete call',
+      assertedStatus: 'passed',
+      assertedFreshness: 'fresh',
+      candidateFingerprint: hash('candidate_incomplete'),
+      linkedObservationId: 'obs_call_incomplete',
+    });
+    expect(incomplete).toMatchObject({
+      success: false,
+      code: 'incomplete_observation',
+    });
+    expect(fs.readFileSync(recordPath, 'utf8')).toBe(bytesBefore);
+
+    const unlinked = controller.submitEvidence(root, {
+      description: 'unlinked attestation fixture',
+      assertedStatus: 'passed',
+      assertedFreshness: 'fresh',
+      candidateFingerprint: hash('candidate_wrong_kind'),
+    });
+    expect(unlinked.success).toBe(true);
+    if (!unlinked.success) return;
+    const wrongKind = controller.submitEvidence(root, {
+      description: 'must not link to another attestation',
+      assertedStatus: 'passed',
+      assertedFreshness: 'fresh',
+      candidateFingerprint: hash('candidate_wrong_kind'),
+      linkedObservationId: unlinked.data.attestationId,
+    });
+    expect(wrongKind).toMatchObject({
+      success: false,
+      code: 'not_controller_observed',
+    });
+
+    controller.observeToolAfter(root, 'call_incomplete', 'bash', {
+      exitCode: 0,
+      output: 'pass',
+    });
+    const completed = controller.submitEvidence(root, {
+      description: 'completed call may be attested',
+      assertedStatus: 'passed',
+      assertedFreshness: 'fresh',
+      candidateFingerprint: hash('candidate_completed'),
+      linkedObservationId: 'obs_call_incomplete',
+    });
+    expect(completed.success).toBe(true);
+  });
+
   test('process restart turns durable running operation into interrupted', () => {
     const controller1 = new OutcomeController({
       storeDirectory: tempDir,

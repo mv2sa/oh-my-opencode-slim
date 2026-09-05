@@ -551,11 +551,23 @@ export const OutcomePendingOperationSchema = z
     startedAt: Timestamp,
     updatedAt: Timestamp,
     error: Text.optional(),
+    interruptionOrigin: z.enum(['restart', 'idle']).optional(),
   })
   .strict()
-  .refine((operation) => operation.updatedAt >= operation.startedAt, {
-    message: 'Operation update cannot precede start',
-    path: ['updatedAt'],
+  .superRefine((operation, ctx) => {
+    if (operation.updatedAt < operation.startedAt) {
+      issue(ctx, ['updatedAt'], 'Operation update cannot precede start');
+    }
+    if (
+      operation.interruptionOrigin !== undefined &&
+      !['interrupted', 'acknowledged'].includes(operation.status)
+    ) {
+      issue(
+        ctx,
+        ['interruptionOrigin'],
+        'Interruption origin is valid only for interrupted or acknowledged operations',
+      );
+    }
   });
 export type OutcomePendingOperation = z.infer<
   typeof OutcomePendingOperationSchema
@@ -1512,11 +1524,6 @@ function validateRecordRelations(
   addDuplicateIssues(record.operations, 'callId', ['operations'], ctx);
   addDuplicateIssues(record.actionsRequired, 'id', ['actionsRequired'], ctx);
 
-  const observations = new Set(
-    record.receipts.evidence
-      .filter((entry) => entry.kind === 'controller_observed')
-      .map((entry) => entry.id),
-  );
   const operationsByCallId = new Map(
     record.operations.map((operation) => [operation.callId, operation]),
   );
@@ -1550,6 +1557,9 @@ function validateRecordRelations(
       .filter((entry) => entry.kind === 'orchestrator_attestation')
       .map((entry) => [entry.id, entry]),
   );
+  const evidenceById = new Map(
+    record.receipts.evidence.map((entry) => [entry.id, entry]),
+  );
   for (const [index, entry] of record.receipts.evidence.entries()) {
     if (entry.kind !== 'orchestrator_attestation') continue;
     if (
@@ -1568,15 +1578,52 @@ function validateRecordRelations(
         'Attestation revision is in the future',
       );
     }
-    if (
-      entry.linkedObservationId &&
-      !observations.has(entry.linkedObservationId)
-    ) {
-      issue(
-        ctx,
-        ['receipts', 'evidence', index, 'linkedObservationId'],
-        'Attestation references missing observation',
-      );
+    if (entry.linkedObservationId) {
+      const linked = evidenceById.get(entry.linkedObservationId);
+      if (!linked) {
+        issue(
+          ctx,
+          ['receipts', 'evidence', index, 'linkedObservationId'],
+          'Attestation references missing observation',
+        );
+      } else if (linked.kind !== 'controller_observed') {
+        issue(
+          ctx,
+          ['receipts', 'evidence', index, 'linkedObservationId'],
+          'Attestation linked observation is not controller_observed',
+        );
+      } else if (!linked.completionObserved) {
+        issue(
+          ctx,
+          ['receipts', 'evidence', index, 'linkedObservationId'],
+          'Attestation linked observation is incomplete',
+        );
+      } else {
+        const operation = operationsByCallId.get(linked.callId);
+        if (!operation) {
+          issue(
+            ctx,
+            ['receipts', 'evidence', index, 'linkedObservationId'],
+            'Attestation linked observation lacks matching operation',
+          );
+        } else if (operation.status !== 'completed') {
+          issue(
+            ctx,
+            ['receipts', 'evidence', index, 'linkedObservationId'],
+            `Attestation linked operation must be completed (found '${operation.status}')`,
+          );
+        } else if (
+          operation.toolName !== linked.toolName ||
+          operation.argumentDigest !== linked.argumentDigest ||
+          operation.serverEpoch !== linked.startedEpoch
+        ) {
+          issue(
+            ctx,
+            ['receipts', 'evidence', index, 'linkedObservationId'],
+            'Attestation linked observation does not match its operation identity',
+          );
+        }
+      }
     }
   }
 
@@ -2204,13 +2251,27 @@ function validateRecordRelationsV1(
     reviewedClaims.add(identity);
   }
   addDuplicateIssues(record.operations, 'id', ['operations'], ctx);
+  addDuplicateIssues(record.operations, 'callId', ['operations'], ctx);
   addDuplicateIssues(record.actionsRequired, 'id', ['actionsRequired'], ctx);
 
-  const observations = new Set(
-    record.receipts.evidence
-      .filter((entry) => entry.kind === 'controller_observed')
-      .map((entry) => entry.id),
+  const evidenceById = new Map(
+    record.receipts.evidence.map((entry) => [entry.id, entry]),
   );
+  const operationsByCallId = new Map(
+    record.operations.map((operation) => [operation.callId, operation]),
+  );
+  const observationsByCallId = new Map<string, OutcomeToolObservation>();
+  for (const [index, entry] of record.receipts.evidence.entries()) {
+    if (entry.kind !== 'controller_observed') continue;
+    if (observationsByCallId.has(entry.callId)) {
+      issue(
+        ctx,
+        ['receipts', 'evidence', index, 'callId'],
+        'Duplicate controller observation callId',
+      );
+    }
+    observationsByCallId.set(entry.callId, entry);
+  }
   const attestations = new Map(
     record.receipts.evidence
       .filter((entry) => entry.kind === 'orchestrator_attestation')
@@ -2234,15 +2295,52 @@ function validateRecordRelationsV1(
         'Attestation revision is in the future',
       );
     }
-    if (
-      entry.linkedObservationId &&
-      !observations.has(entry.linkedObservationId)
-    ) {
-      issue(
-        ctx,
-        ['receipts', 'evidence', index, 'linkedObservationId'],
-        'Attestation references missing observation',
-      );
+    if (entry.linkedObservationId) {
+      const linked = evidenceById.get(entry.linkedObservationId);
+      if (!linked) {
+        issue(
+          ctx,
+          ['receipts', 'evidence', index, 'linkedObservationId'],
+          'Attestation references missing observation',
+        );
+      } else if (linked.kind !== 'controller_observed') {
+        issue(
+          ctx,
+          ['receipts', 'evidence', index, 'linkedObservationId'],
+          'Attestation linked observation is not controller_observed',
+        );
+      } else if (!linked.completionObserved) {
+        issue(
+          ctx,
+          ['receipts', 'evidence', index, 'linkedObservationId'],
+          'Attestation linked observation is incomplete',
+        );
+      } else {
+        const operation = operationsByCallId.get(linked.callId);
+        if (!operation) {
+          issue(
+            ctx,
+            ['receipts', 'evidence', index, 'linkedObservationId'],
+            'Attestation linked observation lacks matching operation',
+          );
+        } else if (operation.status !== 'completed') {
+          issue(
+            ctx,
+            ['receipts', 'evidence', index, 'linkedObservationId'],
+            `Attestation linked operation must be completed (found '${operation.status}')`,
+          );
+        } else if (
+          operation.toolName !== linked.toolName ||
+          operation.argumentDigest !== linked.argumentDigest ||
+          operation.serverEpoch !== linked.startedEpoch
+        ) {
+          issue(
+            ctx,
+            ['receipts', 'evidence', index, 'linkedObservationId'],
+            'Attestation linked observation does not match its operation identity',
+          );
+        }
+      }
     }
   }
 
@@ -2641,6 +2739,9 @@ function validateAcceptedRecord(
       record.receipts.evidence.find((entry) => entry.id === id),
     ]),
   );
+  const operationsByCallId = new Map(
+    record.operations.map((operation) => [operation.callId, operation]),
+  );
   for (const [id, entry] of includedAttestations) {
     if (
       entry?.kind !== 'orchestrator_attestation' ||
@@ -2653,6 +2754,38 @@ function validateAcceptedRecord(
         ['checkpoint', 'includedEvidenceAttestationIds'],
         `Final attestation '${id}' is not passed, fresh, and candidate-bound`,
       );
+    }
+    if (
+      entry?.kind === 'orchestrator_attestation' &&
+      entry.linkedObservationId
+    ) {
+      const linkedObs = record.receipts.evidence.find(
+        (candidate) => candidate.id === entry.linkedObservationId,
+      );
+      if (
+        linkedObs?.kind !== 'controller_observed' ||
+        !linkedObs.completionObserved
+      ) {
+        issue(
+          ctx,
+          ['checkpoint', 'includedEvidenceAttestationIds'],
+          `Final attestation '${id}' linked observation is incomplete or invalid`,
+        );
+      } else {
+        const operation = operationsByCallId.get(linkedObs.callId);
+        if (
+          operation?.status !== 'completed' ||
+          operation.toolName !== linkedObs.toolName ||
+          operation.argumentDigest !== linkedObs.argumentDigest ||
+          operation.serverEpoch !== linkedObs.startedEpoch
+        ) {
+          issue(
+            ctx,
+            ['checkpoint', 'includedEvidenceAttestationIds'],
+            `Final attestation '${id}' linked observation is identity-incoherent with its operation`,
+          );
+        }
+      }
     }
   }
   for (const [index, rule] of record.contract.rules.entries()) {
@@ -2801,6 +2934,9 @@ function validateAcceptedRecordV1(
       record.receipts.evidence.find((entry) => entry.id === id),
     ]),
   );
+  const operationsByCallId = new Map(
+    record.operations.map((operation) => [operation.callId, operation]),
+  );
   for (const [id, entry] of includedAttestations) {
     if (
       entry?.kind !== 'orchestrator_attestation' ||
@@ -2813,6 +2949,38 @@ function validateAcceptedRecordV1(
         ['checkpoint', 'includedEvidenceAttestationIds'],
         `Final attestation '${id}' is not passed, fresh, and candidate-bound`,
       );
+    }
+    if (
+      entry?.kind === 'orchestrator_attestation' &&
+      entry.linkedObservationId
+    ) {
+      const linkedObs = record.receipts.evidence.find(
+        (candidate) => candidate.id === entry.linkedObservationId,
+      );
+      if (
+        linkedObs?.kind !== 'controller_observed' ||
+        !linkedObs.completionObserved
+      ) {
+        issue(
+          ctx,
+          ['checkpoint', 'includedEvidenceAttestationIds'],
+          `Final attestation '${id}' linked observation is incomplete or invalid`,
+        );
+      } else {
+        const operation = operationsByCallId.get(linkedObs.callId);
+        if (
+          operation?.status !== 'completed' ||
+          operation.toolName !== linkedObs.toolName ||
+          operation.argumentDigest !== linkedObs.argumentDigest ||
+          operation.serverEpoch !== linkedObs.startedEpoch
+        ) {
+          issue(
+            ctx,
+            ['checkpoint', 'includedEvidenceAttestationIds'],
+            `Final attestation '${id}' linked observation is identity-incoherent with its operation`,
+          );
+        }
+      }
     }
   }
   for (const [index, rule] of record.contract.rules.entries()) {

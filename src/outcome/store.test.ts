@@ -802,6 +802,39 @@ describe('OutcomeStore protocol and integrity', () => {
     );
 
     current = store.mutate('root_final', 6, {
+      type: 'start_tool_call',
+      operation: {
+        id: 'op_final_evidence',
+        callId: 'call_final_evidence',
+        toolName: 'bash',
+        argumentDigest: hash('final_args'),
+        serverEpoch: 'epoch_one',
+        status: 'running',
+        startedAt: 1_000,
+        updatedAt: 1_000,
+      },
+      observation: {
+        id: 'obs_final_evidence',
+        kind: 'controller_observed',
+        callId: 'call_final_evidence',
+        toolName: 'bash',
+        argumentDigest: hash('final_args'),
+        startedEpoch: 'epoch_one',
+        startedAt: 1_000,
+        completionObserved: false,
+      },
+    });
+    expectSuccess(current);
+    current = store.mutate('root_final', 7, {
+      type: 'complete_tool_call',
+      operationId: 'op_final_evidence',
+      observationId: 'obs_final_evidence',
+      outputDigest: hash('final_output'),
+      completedEpoch: 'epoch_one',
+      completedAt: 1_000,
+    });
+    expectSuccess(current);
+    current = store.mutate('root_final', 8, {
       type: 'append_evidence',
       entry: {
         id: 'att_final',
@@ -810,25 +843,47 @@ describe('OutcomeStore protocol and integrity', () => {
         assertedStatus: 'passed',
         assertedFreshness: 'fresh',
         candidateFingerprint: candidate,
+        linkedObservationId: 'obs_final_evidence',
         payloadDigest: attestationDigest({
           id: 'att_final',
           description: 'bun test',
           assertedStatus: 'passed',
           assertedFreshness: 'fresh',
           candidateFingerprint: candidate,
+          linkedObservationId: 'obs_final_evidence',
           createdAt: 1_000,
         }),
-        createdRevision: 7,
+        createdRevision: 9,
         createdAt: 1_000,
       },
     });
     expectSuccess(current);
-    openCheckpoint(store, 'root_final', 7, 'final-token', 'final', {
+    openCheckpoint(store, 'root_final', 9, 'final-token', 'final', {
       candidateFingerprint: candidate,
       evidenceAttestationIds: ['att_final'],
     });
-    current = completeReview(store, 'root_final', 8, 'final-token', 'ACCEPT');
-    const accepted = store.mutate('root_final', 12, {
+    current = completeReview(store, 'root_final', 10, 'final-token', 'ACCEPT');
+
+    const file = store.recordPath('root_final');
+    const validBytes = fs.readFileSync(file, 'utf8');
+    const malformed = JSON.parse(validBytes) as {
+      operations: Array<{ id: string; status: string }>;
+    };
+    const linkedOperation = malformed.operations.find(
+      (operation) => operation.id === 'op_final_evidence',
+    );
+    if (!linkedOperation) throw new Error('linked operation missing');
+    linkedOperation.status = 'acknowledged';
+    fs.writeFileSync(file, `${JSON.stringify(malformed, null, 2)}\n`);
+    const blocked = store.mutate('root_final', 14, {
+      type: 'finalize',
+      summary: 'must reject identity-incoherent linked evidence',
+    });
+    expect(blocked.success).toBe(false);
+    expect(blocked.code).toBe('corrupt');
+    fs.writeFileSync(file, validBytes);
+
+    const accepted = store.mutate('root_final', 14, {
       type: 'finalize',
       summary: 'Accepted exact final outcome',
     });
@@ -836,7 +891,7 @@ describe('OutcomeStore protocol and integrity', () => {
     expect(accepted.data.phase).toBe('accepted');
     expect(accepted.data.finalCertificate).toMatchObject({
       outcomeId: accepted.data.outcomeId,
-      acceptedRevision: 13,
+      acceptedRevision: 15,
       candidateFingerprint: candidate,
       evidenceAssurance: 'orchestrator_attestation',
     });
@@ -1487,6 +1542,9 @@ describe('OutcomeStore protocol and integrity', () => {
     );
     expect(linkedObs).toBeDefined();
     expect(linkedObs?.kind).toBe('controller_observed');
+    expect(
+      reloaded.data.operations.some((entry) => entry.id === 'op_call_5'),
+    ).toBe(true);
 
     const linkedAttestation = reloaded.data.receipts.evidence.find(
       (entry) => entry.id === 'att_linked_call_5',
@@ -1678,6 +1736,307 @@ describe('OutcomeStore protocol and integrity', () => {
     // Total operations and evidence must respect bounds
     expect(reloaded.data.operations.length).toBeLessThanOrEqual(16);
     expect(reloaded.data.receipts.evidence.length).toBeLessThanOrEqual(32);
+  });
+
+  test('compaction bounds exact acknowledged incomplete pairs while retaining unresolved and failed operations', () => {
+    const root = 'root_compact_acknowledged_incomplete';
+    let store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_ack_0',
+      clock: () => 1_000,
+    });
+    let current = store.init(root, { contract: contract() });
+    expectSuccess(current);
+
+    for (let i = 1; i <= 40; i++) {
+      const callId = `call_ack_${i}`;
+      current = store.mutate(root, current.revision, {
+        type: 'start_tool_call',
+        operation: {
+          id: `op_${callId}`,
+          callId,
+          toolName: 'bash',
+          argumentDigest: hash(`ack_args_${i}`),
+          serverEpoch: store.serverEpoch,
+          status: 'running',
+          startedAt: 1_000,
+          updatedAt: 1_000,
+        },
+        observation: {
+          id: `obs_${callId}`,
+          kind: 'controller_observed',
+          callId,
+          toolName: 'bash',
+          argumentDigest: hash(`ack_args_${i}`),
+          startedEpoch: store.serverEpoch,
+          startedAt: 1_000,
+          completionObserved: false,
+        },
+      });
+      expectSuccess(current);
+
+      store = new OutcomeStore({
+        storeDirectory: directory,
+        serverEpoch: `epoch_ack_${i}`,
+        clock: () => 1_000 + i,
+      });
+      current = store.recover(root);
+      expectSuccess(current);
+      expect(
+        current.data.operations.find((entry) => entry.id === `op_${callId}`)
+          ?.interruptionOrigin,
+      ).toBe('restart');
+      current = store.mutate(root, current.revision, {
+        type: 'acknowledge_operation',
+        operationId: `op_${callId}`,
+      });
+      expectSuccess(current);
+      expect(
+        current.data.operations.find((entry) => entry.id === `op_${callId}`)
+          ?.interruptionOrigin,
+      ).toBe('restart');
+    }
+
+    current = store.mutate(root, current.revision, {
+      type: 'start_tool_call',
+      operation: {
+        id: 'op_unresolved_tail',
+        callId: 'call_unresolved_tail',
+        toolName: 'bash',
+        argumentDigest: hash('unresolved_tail'),
+        serverEpoch: store.serverEpoch,
+        status: 'running',
+        startedAt: 1_040,
+        updatedAt: 1_040,
+      },
+      observation: {
+        id: 'obs_unresolved_tail',
+        kind: 'controller_observed',
+        callId: 'call_unresolved_tail',
+        toolName: 'bash',
+        argumentDigest: hash('unresolved_tail'),
+        startedEpoch: store.serverEpoch,
+        startedAt: 1_040,
+        completionObserved: false,
+      },
+    });
+    expectSuccess(current);
+    current = store.reconcileIdleOperations(root);
+    expectSuccess(current);
+
+    expect(current.data.operations.length).toBeLessThanOrEqual(16);
+    expect(current.data.receipts.evidence.length).toBeLessThanOrEqual(32);
+    expect(
+      current.data.operations.some(
+        (entry) =>
+          entry.id === 'op_unresolved_tail' && entry.status === 'interrupted',
+      ),
+    ).toBe(true);
+    expect(
+      current.data.receipts.evidence.some(
+        (entry) => entry.id === 'obs_unresolved_tail',
+      ),
+    ).toBe(true);
+    expect(
+      current.data.operations.some((entry) => entry.id === 'op_call_ack_1'),
+    ).toBe(false);
+    expect(
+      current.data.receipts.evidence.some(
+        (entry) => entry.id === 'obs_call_ack_1',
+      ),
+    ).toBe(false);
+
+    const reloaded = store.read(root);
+    expectSuccess(reloaded);
+  });
+
+  test('compaction retains acknowledged failed pairs even when failure text imitates reserved interruption reasons', () => {
+    const store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_forged_failure',
+      clock: () => 1_000,
+    });
+    const root = 'root_forged_interruption_failure';
+    let current = store.init(root, { contract: contract() });
+    expectSuccess(current);
+
+    for (const [suffix, error] of [
+      ['restart', 'Operation interrupted by process restart'],
+      ['idle', 'Session became idle without a durable tool after-hook'],
+    ] as const) {
+      const callId = `call_forged_${suffix}`;
+      current = store.mutate(root, current.revision, {
+        type: 'start_tool_call',
+        operation: {
+          id: `op_${callId}`,
+          callId,
+          toolName: 'bash',
+          argumentDigest: hash(`forged_${suffix}`),
+          serverEpoch: store.serverEpoch,
+          status: 'running',
+          startedAt: 1_000,
+          updatedAt: 1_000,
+        },
+        observation: {
+          id: `obs_${callId}`,
+          kind: 'controller_observed',
+          callId,
+          toolName: 'bash',
+          argumentDigest: hash(`forged_${suffix}`),
+          startedEpoch: store.serverEpoch,
+          startedAt: 1_000,
+          completionObserved: false,
+        },
+      });
+      expectSuccess(current);
+      current = store.mutate(root, current.revision, {
+        type: 'finish_operation',
+        operationId: `op_${callId}`,
+        status: 'failed',
+        error,
+      });
+      expectSuccess(current);
+      current = store.mutate(root, current.revision, {
+        type: 'acknowledge_operation',
+        operationId: `op_${callId}`,
+      });
+      expectSuccess(current);
+      expect(
+        current.data.operations.find((entry) => entry.id === `op_${callId}`)
+          ?.interruptionOrigin,
+      ).toBeUndefined();
+
+      const forgedAction = store.mutate(root, current.revision, {
+        type: 'append_action',
+        action: {
+          id: `action_forged_${suffix}`,
+          code: 'interrupted_operation',
+          referenceId: `op_${callId}`,
+          reason: 'Forged interruption action',
+          createdAt: 1_000,
+          createdRevision: current.revision + 1,
+        },
+      });
+      expect(forgedAction.success).toBe(false);
+      expect(forgedAction.code).toBe('invalid_transition');
+    }
+
+    for (let i = 1; i <= 20; i++) {
+      const callId = `call_pressure_${i}`;
+      current = store.mutate(root, current.revision, {
+        type: 'start_tool_call',
+        operation: {
+          id: `op_${callId}`,
+          callId,
+          toolName: 'bash',
+          argumentDigest: hash(`pressure_${i}`),
+          serverEpoch: store.serverEpoch,
+          status: 'running',
+          startedAt: 1_000,
+          updatedAt: 1_000,
+        },
+        observation: {
+          id: `obs_${callId}`,
+          kind: 'controller_observed',
+          callId,
+          toolName: 'bash',
+          argumentDigest: hash(`pressure_${i}`),
+          startedEpoch: store.serverEpoch,
+          startedAt: 1_000,
+          completionObserved: false,
+        },
+      });
+      expectSuccess(current);
+      current = store.mutate(root, current.revision, {
+        type: 'complete_tool_call',
+        operationId: `op_${callId}`,
+        observationId: `obs_${callId}`,
+        outputDigest: hash(`pressure_output_${i}`),
+        completedEpoch: store.serverEpoch,
+        completedAt: 1_000,
+      });
+      expectSuccess(current);
+    }
+
+    for (const suffix of ['restart', 'idle']) {
+      expect(
+        current.data.operations.some(
+          (entry) => entry.id === `op_call_forged_${suffix}`,
+        ),
+      ).toBe(true);
+      expect(
+        current.data.receipts.evidence.some(
+          (entry) => entry.id === `obs_call_forged_${suffix}`,
+        ),
+      ).toBe(true);
+    }
+  });
+
+  test('direct append and reload reject attestations linked to incomplete observations', () => {
+    const store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_link_guard',
+      clock: () => 1_000,
+    });
+    const root = 'root_link_guard';
+    let current = store.init(root, { contract: contract() });
+    expectSuccess(current);
+    current = store.mutate(root, current.revision, {
+      type: 'start_tool_call',
+      operation: {
+        id: 'op_link_guard',
+        callId: 'call_link_guard',
+        toolName: 'bash',
+        argumentDigest: hash('link_guard_args'),
+        serverEpoch: store.serverEpoch,
+        status: 'running',
+        startedAt: 1_000,
+        updatedAt: 1_000,
+      },
+      observation: {
+        id: 'obs_link_guard',
+        kind: 'controller_observed',
+        callId: 'call_link_guard',
+        toolName: 'bash',
+        argumentDigest: hash('link_guard_args'),
+        startedEpoch: store.serverEpoch,
+        startedAt: 1_000,
+        completionObserved: false,
+      },
+    });
+    expectSuccess(current);
+
+    const entry = {
+      id: 'att_link_guard',
+      kind: 'orchestrator_attestation' as const,
+      description: 'must not link incomplete observation',
+      assertedStatus: 'passed' as const,
+      assertedFreshness: 'fresh' as const,
+      candidateFingerprint: hash('link_guard_candidate'),
+      linkedObservationId: 'obs_link_guard',
+      payloadDigest: '',
+      createdRevision: current.revision + 1,
+      createdAt: 1_000,
+    };
+    entry.payloadDigest = attestationDigest(entry);
+    const file = store.recordPath(root);
+    const bytesBefore = fs.readFileSync(file, 'utf8');
+    const rejected = store.mutate(root, current.revision, {
+      type: 'append_evidence',
+      entry,
+    });
+    expect(rejected.success).toBe(false);
+    expect(rejected.code).toBe('invalid_transition');
+    expect(fs.readFileSync(file, 'utf8')).toBe(bytesBefore);
+
+    const raw = JSON.parse(bytesBefore) as {
+      receipts: { evidence: unknown[] };
+    };
+    raw.receipts.evidence.push(entry);
+    fs.writeFileSync(file, `${JSON.stringify(raw, null, 2)}\n`);
+    const corrupt = store.read(root);
+    expect(corrupt.success).toBe(false);
+    expect(corrupt.code).toBe('corrupt');
   });
 
   test('V1 migration normalizes kickoffGate states, user provenance, and preserves certificates', () => {
