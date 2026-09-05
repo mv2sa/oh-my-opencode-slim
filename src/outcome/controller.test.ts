@@ -5250,6 +5250,7 @@ describe('OutcomeController service over frozen store', () => {
         waitCreatedRevision: setup.wait.createdRevision,
         waitOriginatingServerEpoch: setup.waitOriginatingServerEpoch,
         waitRestartObservedRevision: setup.waitRestartObservedRevision,
+        waitInstructions: setup.wait.instructions,
         expectedPostRestartCheck: setup.postRestartCheck,
         retiredCheckpointId: setup.checkpointId,
         retiredClaimGeneration: setup.retiredClaimGeneration,
@@ -5292,6 +5293,70 @@ describe('OutcomeController service over frozen store', () => {
       expect(freshCpRes.success).toBe(true);
     });
 
+    test('legacy handoff links the retired checkpoint through exact instructions only', async () => {
+      const root = 'ses_super_legacy_instruction_link';
+      const setup = await setupSupersessionFixture(root);
+      const recordBefore = setup.newController.readRecord(root);
+      expect(recordBefore.success).toBe(true);
+      if (!recordBefore.success) return;
+      const wait = recordBefore.data.waitCondition;
+      expect(wait?.kind).toBe('external_handoff');
+      if (wait?.kind !== 'external_handoff') return;
+
+      const legacyInstructions = `Restart, then reconcile checkpoint ${setup.checkpointId} using its preserved Manager identity.`;
+      const legacyExpectedCheck = 'Verify the replacement runtime is healthy.';
+      const raw = JSON.parse(
+        fs.readFileSync(setup.newController.store.recordPath(root), 'utf8'),
+      );
+      raw.waitCondition.instructions = legacyInstructions;
+      raw.waitCondition.expectedPostRestartCheck = legacyExpectedCheck;
+      fs.writeFileSync(
+        setup.newController.store.recordPath(root),
+        `${JSON.stringify(raw, null, 2)}\n`,
+      );
+
+      const controller = new OutcomeController({
+        storeDirectory: tempDir,
+        serverEpoch: setup.newEpoch,
+        getManagerTaskRecord: () => undefined,
+        readChildSessionResult: async () => ({
+          text: setup.childReaderOutput,
+          empty: false,
+          terminal: true,
+        }),
+      });
+      const legacyRecord = controller.readRecord(root);
+      expect(legacyRecord.success).toBe(true);
+      if (!legacyRecord.success) return;
+
+      const result = await controller.supersedeExternalHandoff(root, {
+        reason: 'Supersede exact legacy handoff linked through instructions',
+        waitReferenceId: wait.referenceId,
+        waitCreatedRevision: wait.createdRevision,
+        waitOriginatingServerEpoch: setup.waitOriginatingServerEpoch,
+        waitRestartObservedRevision: setup.waitRestartObservedRevision,
+        waitInstructions: legacyInstructions,
+        expectedPostRestartCheck: legacyExpectedCheck,
+        retiredCheckpointId: setup.checkpointId,
+        retiredClaimGeneration: setup.retiredClaimGeneration,
+        sourceUserMessageReceiptId: setup.sourceUserMessageReceiptId,
+        evidenceAttestationId: setup.evidenceAttestationId,
+        replacementCandidateFingerprint: setup.replacementCandidate,
+      });
+      expect(result.success).toBe(true);
+
+      const after = controller.readRecord(root);
+      expect(after.success).toBe(true);
+      if (!after.success) return;
+      expect(after.data.waitCondition).toBeUndefined();
+      const receipt = after.data.receipts.handoffSupersessions.at(-1);
+      expect(receipt?.waitInstructions).toBe(legacyInstructions);
+      expect(receipt?.expectedPostRestartCheck).toBe(legacyExpectedCheck);
+      expect(receipt?.payloadDigest).toBe(
+        receipt ? computeOutcomeHandoffSupersessionDigest(receipt) : undefined,
+      );
+    });
+
     test('fail-closed rejections for tuple mismatches, epoch, candidate, and child output', async () => {
       const root = 'ses_super_fail_closed';
       const setup = await setupSupersessionFixture(root);
@@ -5317,6 +5382,7 @@ describe('OutcomeController service over frozen store', () => {
         waitCreatedRevision: setup.wait.createdRevision,
         waitOriginatingServerEpoch: setup.waitOriginatingServerEpoch,
         waitRestartObservedRevision: setup.waitRestartObservedRevision,
+        waitInstructions: setup.wait.instructions,
         expectedPostRestartCheck: setup.postRestartCheck,
         retiredCheckpointId: setup.checkpointId,
         retiredClaimGeneration: setup.retiredClaimGeneration,
@@ -5356,6 +5422,16 @@ describe('OutcomeController service over frozen store', () => {
       });
       expect(r4.success).toBe(false);
       expect(r4.code).toBe('expected_check_mismatch');
+
+      const instructionsMismatch = await controller.supersedeExternalHandoff(
+        root,
+        {
+          ...baseParams(),
+          waitInstructions: 'Different exact instructions',
+        },
+      );
+      expect(instructionsMismatch.success).toBe(false);
+      expect(instructionsMismatch.code).toBe('wait_instructions_mismatch');
 
       // 5. Retired checkpoint ID mismatch
       const r5 = await controller.supersedeExternalHandoff(root, {
@@ -5458,6 +5534,7 @@ describe('OutcomeController service over frozen store', () => {
         waitCreatedRevision: setup.wait.createdRevision,
         waitOriginatingServerEpoch: setup.waitOriginatingServerEpoch,
         waitRestartObservedRevision: setup.waitRestartObservedRevision,
+        waitInstructions: setup.wait.instructions,
         expectedPostRestartCheck: setup.postRestartCheck,
         retiredCheckpointId: setup.checkpointId,
         retiredClaimGeneration: setup.retiredClaimGeneration,

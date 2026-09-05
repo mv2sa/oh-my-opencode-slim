@@ -4177,7 +4177,8 @@ describe('OutcomeStore protocol and integrity', () => {
     );
 
     // 3. External handoff set
-    const postRestartCheck = `Confirm ${openedFinal.claim.checkpointId} completed`;
+    const postRestartCheck = 'Confirm replacement runtime health';
+    const waitInstructions = `Restart and reconcile ${openedFinal.claim.checkpointId}`;
     const setWaitRes = oldStore.mutate(root, 9, {
       type: 'set_wait',
       wait: {
@@ -4187,7 +4188,7 @@ describe('OutcomeStore protocol and integrity', () => {
         createdAt: 150,
         createdRevision: 10,
         originatingServerEpoch: 'epoch_handoff_old',
-        instructions: 'Restart opencode',
+        instructions: waitInstructions,
         expectedPostRestartCheck: postRestartCheck,
       },
     });
@@ -4331,6 +4332,7 @@ describe('OutcomeStore protocol and integrity', () => {
       waitCreatedRevision: wait.createdRevision,
       waitOriginatingServerEpoch: wait.originatingServerEpoch,
       waitRestartObservedRevision: wait.restartObservedRevision,
+      waitInstructions,
       expectedPostRestartCheck: wait.expectedPostRestartCheck,
       retiredCheckpointId: openedFinal.claim.checkpointId,
       retiredClaimGeneration: openedFinal.claim.claimGeneration,
@@ -4452,6 +4454,7 @@ describe('OutcomeStore protocol and integrity', () => {
       ['supersededRevision', 999],
       ['serverEpoch', 'epoch_tampered'],
       ['waitRestartObservedRevision', 1],
+      ['waitInstructions', 'tampered instructions without checkpoint id'],
       ['expectedPostRestartCheck', 'tampered check without checkpoint id'],
     ];
     for (const [field, tamperedValue] of tamperFields) {

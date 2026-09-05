@@ -531,6 +531,7 @@ export interface OutcomeSupersedeExternalHandoffParams {
   waitCreatedRevision: number;
   waitOriginatingServerEpoch: string;
   waitRestartObservedRevision: number;
+  waitInstructions: string;
   expectedPostRestartCheck: string;
   retiredCheckpointId: string;
   retiredClaimGeneration: number;
@@ -2168,6 +2169,17 @@ export class OutcomeController {
       };
     }
     if (
+      !params.waitInstructions ||
+      typeof params.waitInstructions !== 'string' ||
+      params.waitInstructions.trim() === ''
+    ) {
+      return {
+        success: false,
+        error: 'waitInstructions must be a non-empty string',
+        code: 'invalid_parameter',
+      };
+    }
+    if (
       !params.expectedPostRestartCheck ||
       typeof params.expectedPostRestartCheck !== 'string' ||
       params.expectedPostRestartCheck.trim() === ''
@@ -2284,6 +2296,7 @@ export class OutcomeController {
             params.waitOriginatingServerEpoch &&
           existing.waitRestartObservedRevision ===
             params.waitRestartObservedRevision &&
+          existing.waitInstructions === params.waitInstructions &&
           existing.expectedPostRestartCheck ===
             params.expectedPostRestartCheck &&
           existing.sourceUserMessageReceiptId ===
@@ -2354,6 +2367,13 @@ export class OutcomeController {
         code: 'restart_revision_mismatch',
       };
     }
+    if (wait.instructions !== params.waitInstructions) {
+      return {
+        success: false,
+        error: `Wait instructions mismatch: expected '${wait.instructions}', got '${params.waitInstructions}'`,
+        code: 'wait_instructions_mismatch',
+      };
+    }
     if (wait.expectedPostRestartCheck !== params.expectedPostRestartCheck) {
       return {
         success: false,
@@ -2369,10 +2389,14 @@ export class OutcomeController {
         code: 'restart_not_observed',
       };
     }
-    if (!params.expectedPostRestartCheck.includes(params.retiredCheckpointId)) {
+    if (
+      !params.expectedPostRestartCheck.includes(params.retiredCheckpointId) &&
+      !params.waitInstructions.includes(params.retiredCheckpointId)
+    ) {
       return {
         success: false,
-        error: 'Expected post restart check must contain retired checkpoint ID',
+        error:
+          'Exact handoff instructions or expected check must contain retired checkpoint ID',
         code: 'checkpoint_not_in_expected_check',
       };
     }
@@ -2529,6 +2553,7 @@ export class OutcomeController {
       waitCreatedRevision: params.waitCreatedRevision,
       waitOriginatingServerEpoch: params.waitOriginatingServerEpoch,
       waitRestartObservedRevision: params.waitRestartObservedRevision,
+      waitInstructions: params.waitInstructions,
       expectedPostRestartCheck: params.expectedPostRestartCheck,
       retiredCheckpointId: params.retiredCheckpointId,
       retiredClaimGeneration: params.retiredClaimGeneration,

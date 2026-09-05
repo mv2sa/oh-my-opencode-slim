@@ -333,6 +333,7 @@ export const OutcomeHandoffSupersessionReceiptSchema = z
     waitCreatedRevision: Revision,
     waitOriginatingServerEpoch: Id,
     waitRestartObservedRevision: Revision,
+    waitInstructions: Text.optional(),
     expectedPostRestartCheck: Text,
     retiredCheckpointId: Id,
     retiredClaimGeneration: z.number().int().positive(),
@@ -934,6 +935,7 @@ export function computeOutcomeHandoffSupersessionDigest(input: {
   waitCreatedRevision: number;
   waitOriginatingServerEpoch: string;
   waitRestartObservedRevision: number;
+  waitInstructions?: string;
   expectedPostRestartCheck: string;
   retiredCheckpointId: string;
   retiredClaimGeneration: number;
@@ -958,6 +960,7 @@ export function computeOutcomeHandoffSupersessionDigest(input: {
     waitCreatedRevision: input.waitCreatedRevision,
     waitOriginatingServerEpoch: input.waitOriginatingServerEpoch,
     waitRestartObservedRevision: input.waitRestartObservedRevision,
+    waitInstructions: input.waitInstructions,
     expectedPostRestartCheck: input.expectedPostRestartCheck,
     retiredCheckpointId: input.retiredCheckpointId,
     retiredClaimGeneration: input.retiredClaimGeneration,
@@ -1855,12 +1858,13 @@ function validateRecordRelations(
     if (
       !supersession.expectedPostRestartCheck.includes(
         supersession.retiredCheckpointId,
-      )
+      ) &&
+      !supersession.waitInstructions?.includes(supersession.retiredCheckpointId)
     ) {
       issue(
         ctx,
-        ['receipts', 'handoffSupersessions', index, 'expectedPostRestartCheck'],
-        'Expected post restart check must contain retired checkpoint ID',
+        ['receipts', 'handoffSupersessions', index, 'retiredCheckpointId'],
+        'Exact handoff instructions or expected check must contain retired checkpoint ID',
       );
     }
     if (

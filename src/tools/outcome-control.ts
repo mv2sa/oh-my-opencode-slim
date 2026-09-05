@@ -511,6 +511,7 @@ Use this tool to establish durable outcome contracts (begin), open checkpoint re
             args.waitCreatedRevision === undefined ||
             !args.waitOriginatingServerEpoch ||
             args.waitRestartObservedRevision === undefined ||
+            !args.instructions ||
             !args.expectedPostRestartCheck ||
             !args.retiredCheckpointId ||
             args.retiredClaimGeneration === undefined ||
@@ -519,7 +520,7 @@ Use this tool to establish durable outcome contracts (begin), open checkpoint re
             !args.replacementCandidateFingerprint
           ) {
             throw new Error(
-              'outcome_control action="supersede_external_handoff" requires reason, waitReferenceId, waitCreatedRevision, waitOriginatingServerEpoch, waitRestartObservedRevision, expectedPostRestartCheck, retiredCheckpointId, retiredClaimGeneration, sourceUserMessageReceiptId, evidenceAttestationId, and replacementCandidateFingerprint',
+              'outcome_control action="supersede_external_handoff" requires reason, waitReferenceId, waitCreatedRevision, waitOriginatingServerEpoch, waitRestartObservedRevision, instructions, expectedPostRestartCheck, retiredCheckpointId, retiredClaimGeneration, sourceUserMessageReceiptId, evidenceAttestationId, and replacementCandidateFingerprint',
             );
           }
           const res = await controller.supersedeExternalHandoff(sessionID, {
@@ -528,6 +529,7 @@ Use this tool to establish durable outcome contracts (begin), open checkpoint re
             waitCreatedRevision: args.waitCreatedRevision,
             waitOriginatingServerEpoch: args.waitOriginatingServerEpoch,
             waitRestartObservedRevision: args.waitRestartObservedRevision,
+            waitInstructions: args.instructions,
             expectedPostRestartCheck: args.expectedPostRestartCheck,
             retiredCheckpointId: args.retiredCheckpointId,
             retiredClaimGeneration: args.retiredClaimGeneration,

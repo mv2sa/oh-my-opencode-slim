@@ -942,6 +942,7 @@ describe('outcome_control tool', () => {
         waitCreatedRevision: wait.createdRevision,
         waitOriginatingServerEpoch: wait.originatingServerEpoch,
         waitRestartObservedRevision: wait.restartObservedRevision,
+        instructions: wait.instructions,
         expectedPostRestartCheck: postRestartCheck,
         retiredCheckpointId: finalCpId,
         retiredClaimGeneration: finalCp.data.claimGeneration,

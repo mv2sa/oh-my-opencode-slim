@@ -274,6 +274,7 @@ export type OutcomeRecordMutation =
       waitCreatedRevision: number;
       waitOriginatingServerEpoch: string;
       waitRestartObservedRevision: number;
+      waitInstructions: string;
       expectedPostRestartCheck: string;
       retiredCheckpointId: string;
       retiredClaimGeneration: number;
@@ -683,6 +684,7 @@ export class OutcomeStore {
                 mutation.waitOriginatingServerEpoch &&
               existing.waitRestartObservedRevision ===
                 mutation.waitRestartObservedRevision &&
+              existing.waitInstructions === mutation.waitInstructions &&
               existing.expectedPostRestartCheck ===
                 mutation.expectedPostRestartCheck &&
               existing.retiredDispatchCallId ===
@@ -2224,6 +2226,9 @@ function applyMutation(
       ) {
         throw new Error('Wait restart observed revision mismatch');
       }
+      if (wait.instructions !== mutation.waitInstructions) {
+        throw new Error('Wait instructions mismatch');
+      }
       if (wait.expectedPostRestartCheck !== mutation.expectedPostRestartCheck) {
         throw new Error('Wait expected post restart check mismatch');
       }
@@ -2241,10 +2246,11 @@ function applyMutation(
       if (
         !mutation.expectedPostRestartCheck.includes(
           mutation.retiredCheckpointId,
-        )
+        ) &&
+        !mutation.waitInstructions.includes(mutation.retiredCheckpointId)
       ) {
         throw new Error(
-          'Expected post restart check must contain retired checkpoint ID',
+          'Exact handoff instructions or expected check must contain retired checkpoint ID',
         );
       }
 
@@ -2369,6 +2375,7 @@ function applyMutation(
         waitCreatedRevision: mutation.waitCreatedRevision,
         waitOriginatingServerEpoch: mutation.waitOriginatingServerEpoch,
         waitRestartObservedRevision: mutation.waitRestartObservedRevision,
+        waitInstructions: mutation.waitInstructions,
         expectedPostRestartCheck: mutation.expectedPostRestartCheck,
         retiredCheckpointId: mutation.retiredCheckpointId,
         retiredClaimGeneration: mutation.retiredClaimGeneration,
