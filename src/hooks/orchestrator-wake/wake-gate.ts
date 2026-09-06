@@ -9,9 +9,15 @@ export type WakeProgressState = {
   unchangedWakeCount: number;
   lastFingerprint: string | undefined;
   stopped: boolean;
-  /** Set when a wake was reserved; next busy preserves the cap. */
+  /** Transport attribution for restart safety only; never reset authority. */
   expectingWakeBusy: boolean;
   observedModel: ContinuationModelSelection | undefined;
+  fingerprints: Map<string, string>;
+  externalMessageIDs: Set<string>;
+  narration?: { cause: string; turns: Set<string> };
+  idlePrompted: boolean;
+  running: boolean;
+  pendingLegacyIdle?: boolean;
 };
 
 export type RestartRecoveryState = {
@@ -25,7 +31,11 @@ type InFlightState = { owner: symbol; wakeCommitted: boolean };
 type WakeGateStore = {
   progress: Map<string, WakeProgressState>;
   inFlight: Map<string, InFlightState>;
-  releaseWaiters: Map<string, Set<() => void>>;
+  releaseWaiters: Map<
+    string,
+    Map<symbol, { retry: () => void; retire: () => void }>
+  >;
+  lifecycleEvents?: WeakSet<object>;
   /** Insertion-ordered session keys for bounded eviction. */
   order: string[];
   restartRecovery: Map<string, RestartRecoveryState>;
@@ -54,14 +64,13 @@ function getStore(): WakeGateStore {
 
 function touchOrder(sessionID: string): void {
   const store = getStore();
+  if (!store.progress.has(sessionID)) return;
   const idx = store.order.indexOf(sessionID);
   if (idx >= 0) store.order.splice(idx, 1);
   store.order.push(sessionID);
-  while (store.order.length > MAX_TRACKED_SESSIONS) {
-    const oldest = store.order.shift();
-    if (!oldest) break;
-    clearWakeSession(oldest);
-  }
+  // Never evict live budgets/owners: eviction would silently refill attempts.
+  // Only the ancillary recency list is bounded; deletion retires session state.
+  if (store.order.length > MAX_TRACKED_SESSIONS) store.order.shift();
 }
 
 function emptyProgress(): WakeProgressState {
@@ -71,6 +80,10 @@ function emptyProgress(): WakeProgressState {
     stopped: false,
     expectingWakeBusy: false,
     observedModel: undefined,
+    fingerprints: new Map(),
+    externalMessageIDs: new Set(),
+    idlePrompted: false,
+    running: false,
   };
 }
 
@@ -80,6 +93,14 @@ export function getWakeProgress(sessionID: string): WakeProgressState {
   if (existing) {
     touchOrder(sessionID);
     return existing;
+  }
+  if (store.progress.size >= MAX_TRACKED_SESSIONS) {
+    return {
+      ...emptyProgress(),
+      stopped: true,
+      unchangedWakeCount: 2,
+      idlePrompted: true,
+    };
   }
   const created = emptyProgress();
   store.progress.set(sessionID, created);
@@ -93,6 +114,7 @@ export function getWakeProgress(sessionID: string): WakeProgressState {
  */
 export function tryBeginWakeEvaluation(sessionID: string): symbol | null {
   const store = getStore();
+  if (!admitWakeSession(sessionID)) return null;
   if (store.inFlight.has(sessionID)) return null;
   const owner = Symbol(sessionID);
   store.inFlight.set(sessionID, { owner, wakeCommitted: false });
@@ -110,10 +132,20 @@ export function releaseWakeEvaluation(sessionID: string, owner: symbol): void {
     store.inFlight.delete(sessionID);
     const waiters = store.releaseWaiters.get(sessionID);
     store.releaseWaiters.delete(sessionID);
-    if (!state.wakeCommitted) {
-      for (const waiter of waiters ?? []) waiter();
-    }
+    for (const waiter of waiters?.values() ?? []) waiter.retire();
+    if (!state.wakeCommitted)
+      for (const waiter of waiters?.values() ?? []) waiter.retry();
   }
+}
+
+/** Disposal may retire a read-only evaluation, but never an active transport. */
+export function releaseUncommittedWakeEvaluation(
+  sessionID: string,
+  owner: symbol,
+): void {
+  const flight = getStore().inFlight.get(sessionID);
+  if (flight?.owner === owner && !flight.wakeCommitted)
+    releaseWakeEvaluation(sessionID, owner);
 }
 
 /**
@@ -124,42 +156,59 @@ export function releaseWakeEvaluation(sessionID: string, owner: symbol): void {
 export function retryAfterWakeEvaluation(
   sessionID: string,
   retry: () => void,
+  source: 'scheduler' | 'controller' = 'scheduler',
+  retire: () => void = () => {},
 ): () => void {
   const store = getStore();
-  if (!store.inFlight.has(sessionID)) {
-    queueMicrotask(retry);
+  if (!store.progress.has(sessionID)) {
+    queueMicrotask(retire);
     return () => {};
   }
-  const waiters = store.releaseWaiters.get(sessionID) ?? new Set<() => void>();
-  waiters.add(retry);
+  if (!store.inFlight.has(sessionID)) {
+    let cancelled = false;
+    queueMicrotask(() => {
+      retire();
+      if (!cancelled) retry();
+    });
+    return () => {
+      cancelled = true;
+      retire();
+    };
+  }
+  const waiters =
+    store.releaseWaiters.get(sessionID) ??
+    new Map<symbol, { retry: () => void; retire: () => void }>();
+  if (waiters.size >= 256) {
+    queueMicrotask(retire);
+    return () => {};
+  }
+  const key = Symbol(source);
+  waiters.set(key, { retry, retire });
   store.releaseWaiters.set(sessionID, waiters);
   return () => {
     const current = store.releaseWaiters.get(sessionID);
-    current?.delete(retry);
+    if (current?.delete(key)) retire();
     if (current?.size === 0) store.releaseWaiters.delete(sessionID);
   };
 }
 
 /**
  * Record a wake reservation before promptAsync. Owner-safe: only the current
- * in-flight owner may commit. Updates fingerprint accounting and marks that
- * the next busy should preserve (not rearm) the no-progress cap.
+ * in-flight owner may commit once. All sources debit the same two-attempt cap.
  */
 export function commitWakeReservation(
   sessionID: string,
   owner: symbol,
-  fingerprint: string,
+  fingerprint?: string,
 ): boolean {
   const store = getStore();
   const flight = store.inFlight.get(sessionID);
-  if (flight?.owner !== owner) return false;
-  flight.wakeCommitted = true;
-
+  if (flight?.owner !== owner || flight.wakeCommitted) return false;
+  if (fingerprint !== undefined) noteHostProgress(sessionID, fingerprint);
   const progress = getWakeProgress(sessionID);
-  if (progress.lastFingerprint !== fingerprint) {
-    progress.unchangedWakeCount = 0;
-    progress.lastFingerprint = fingerprint;
-  }
+  if (progress.unchangedWakeCount >= 2 || progress.idlePrompted) return false;
+  flight.wakeCommitted = true;
+  progress.idlePrompted = true;
   progress.unchangedWakeCount += 1;
   progress.expectingWakeBusy = true;
   if (progress.unchangedWakeCount >= 2) {
@@ -169,12 +218,48 @@ export function commitWakeReservation(
 }
 
 /** Host fingerprint changed: reset the two-wake no-progress cap. */
-export function noteHostProgress(sessionID: string, fingerprint: string): void {
+export function noteHostProgress(
+  sessionID: string,
+  fingerprint: string,
+  component: 'todo-child' | 'controller' = 'todo-child',
+): void {
   const progress = getWakeProgress(sessionID);
-  if (progress.lastFingerprint === fingerprint) return;
+  const previous = progress.fingerprints.get(component);
+  progress.fingerprints.set(component, fingerprint);
   progress.lastFingerprint = fingerprint;
-  progress.unchangedWakeCount = 0;
-  progress.stopped = false;
+  // First observation of another component is a baseline, not progress.
+  if (previous !== undefined && previous !== fingerprint)
+    rearmWakeProgress(sessionID);
+}
+
+export function noteExternalWakeMessage(
+  sessionID: string,
+  messageID: string,
+): boolean {
+  const progress = getWakeProgress(sessionID);
+  if (
+    !admitWakeSession(sessionID) ||
+    progress.externalMessageIDs.has(messageID) ||
+    progress.externalMessageIDs.size >= 256
+  )
+    return false;
+  progress.externalMessageIDs.add(messageID);
+  rearmWakeProgress(sessionID);
+  return true;
+}
+
+/** Called only for completed, authoritative narration-only host turns. */
+export function allowRecoveryNarration(
+  sessionID: string,
+  cause: string,
+  turnID?: string,
+): boolean {
+  const progress = getWakeProgress(sessionID);
+  if (progress.narration?.cause !== cause)
+    progress.narration = { cause, turns: new Set() };
+  const turns = progress.narration.turns;
+  if (turnID && turns.size < 2) turns.add(turnID);
+  return turns.size < 2;
 }
 
 /**
@@ -188,16 +273,67 @@ export function isExpectingWakeBusy(sessionID: string): boolean {
 
 /** Clear the scheduler busy marker once the corresponding idle arrives. */
 export function clearExpectingWakeBusy(sessionID: string): void {
-  const progress = getWakeProgress(sessionID);
-  progress.expectingWakeBusy = false;
+  const progress = getStore().progress.get(sessionID);
+  if (progress) progress.expectingWakeBusy = false;
 }
 
-/** External user activity or genuine lifecycle cleanup rearms the cap. */
+/** No eviction: unknown sessions fail closed at capacity. */
+export function admitWakeSession(sessionID: string): boolean {
+  getWakeProgress(sessionID);
+  return getStore().progress.has(sessionID);
+}
+
+/** Shared transition admission, independent of the no-progress budget. */
+export function observeWakeLifecycle(sessionID: string, status: string): void {
+  const progress = getStore().progress.get(sessionID);
+  if (!progress) return;
+  if (status === 'busy') progress.running = true;
+  if (status === 'idle' && progress.running) {
+    progress.running = false;
+    progress.idlePrompted = false;
+    progress.expectingWakeBusy = false;
+  }
+}
+
+/** Observe once, before either consumer awaits transport. A legacy idle paired
+ * with status-idle belongs to that older transition, even if busy interleaves. */
+export function observeWakeEvent(
+  sessionID: string,
+  event: {
+    type: string;
+    properties?: { status?: { type?: string } };
+  },
+): void {
+  const store = getStore();
+  const progress = store.progress.get(sessionID);
+  if (!progress) return;
+  store.lifecycleEvents ??= new WeakSet();
+  if (store.lifecycleEvents.has(event)) return;
+  store.lifecycleEvents.add(event);
+  if (event.type === 'session.idle') {
+    if (progress.pendingLegacyIdle) {
+      progress.pendingLegacyIdle = false;
+      return;
+    }
+    observeWakeLifecycle(sessionID, 'idle');
+  } else if (event.type === 'session.status') {
+    const status = event.properties?.status?.type;
+    if (status === 'idle') progress.pendingLegacyIdle = true;
+    observeWakeLifecycle(sessionID, status ?? '');
+  }
+}
+
+export function isWakeRunning(sessionID: string): boolean {
+  return getStore().progress.get(sessionID)?.running ?? false;
+}
+
+/** Only distinct external messages or meaningful component changes rearm. */
 export function rearmWakeProgress(sessionID: string): void {
   const progress = getWakeProgress(sessionID);
   progress.unchangedWakeCount = 0;
-  progress.lastFingerprint = undefined;
   progress.stopped = false;
+  progress.narration = undefined;
+  progress.idlePrompted = false;
   progress.expectingWakeBusy = false;
   getStore().outcomeIdleWoken.delete(sessionID);
 }
@@ -219,6 +355,8 @@ export function getRestartRecoveryState(
   sessionID: string,
 ): RestartRecoveryState {
   const store = getStore();
+  if (!admitWakeSession(sessionID))
+    return { succeeded: false, attempts: 2, inFlight: false };
   let state = store.restartRecovery.get(sessionID);
   if (!state) {
     state = { succeeded: false, attempts: 0, inFlight: false };
@@ -231,21 +369,18 @@ export function getRestartRecoveryState(
 export function canReserveOutcomeIdleWake(sessionID: string): boolean {
   const store = getStore();
   const recovery = store.restartRecovery.get(sessionID);
-  if (
-    recovery?.inFlight ||
-    recovery?.succeeded ||
-    store.outcomeIdleWoken.has(sessionID)
-  ) {
+  if (recovery?.inFlight || store.outcomeIdleWoken.has(sessionID)) {
     return false;
   }
-  if (store.progress.get(sessionID)?.expectingWakeBusy) return false;
-  return true;
+  const progress = getWakeProgress(sessionID);
+  return !progress.stopped && !progress.idlePrompted;
 }
 
-export function commitOutcomeIdleWake(sessionID: string): void {
-  const progress = getWakeProgress(sessionID);
-  progress.expectingWakeBusy = true;
-  touchOrder(sessionID);
+export function commitOutcomeIdleWake(
+  sessionID: string,
+  owner: symbol,
+): boolean {
+  return commitWakeReservation(sessionID, owner);
 }
 
 export function canAttemptRestartRecovery(sessionID: string): boolean {
@@ -255,12 +390,19 @@ export function canAttemptRestartRecovery(sessionID: string): boolean {
   if (state && state.attempts >= 2) return false;
   if (state?.inFlight) return false;
   if (store.inFlight.has(sessionID)) return false;
+  if (store.progress.get(sessionID)?.stopped) return false;
+  if (
+    !store.progress.has(sessionID) &&
+    store.progress.size >= MAX_TRACKED_SESSIONS
+  )
+    return false;
   if (store.progress.get(sessionID)?.expectingWakeBusy) return false;
   return true;
 }
 
 export function tryBeginRestartRecovery(sessionID: string): symbol | null {
   if (!canAttemptRestartRecovery(sessionID)) return null;
+  if (!admitWakeSession(sessionID)) return null;
   const store = getStore();
   const state = getRestartRecoveryState(sessionID);
   state.inFlight = true;
@@ -275,13 +417,11 @@ export function commitRestartRecoverySuccess(
   owner: symbol,
 ): void {
   const store = getStore();
+  const flight = store.inFlight.get(sessionID);
+  if (flight?.owner !== owner || !flight.wakeCommitted) return;
   const state = getRestartRecoveryState(sessionID);
   state.succeeded = true;
   state.inFlight = false;
-  const flight = store.inFlight.get(sessionID);
-  if (flight?.owner === owner) {
-    flight.wakeCommitted = true;
-  }
   const progress = getWakeProgress(sessionID);
   progress.expectingWakeBusy = true;
   store.outcomeIdleWoken.add(sessionID);
@@ -293,19 +433,18 @@ export function recordRestartRecoveryFailure(
   owner: symbol,
 ): void {
   const store = getStore();
+  if (store.inFlight.get(sessionID)?.owner !== owner) return;
   const state = getRestartRecoveryState(sessionID);
+  if (!state.inFlight) return;
   state.attempts += 1;
   state.inFlight = false;
-  const flight = store.inFlight.get(sessionID);
-  if (flight?.owner === owner) {
-    store.inFlight.delete(sessionID);
-  }
   clearExpectingWakeBusy(sessionID);
   touchOrder(sessionID);
 }
 
 export function releaseRestartRecovery(sessionID: string, owner: symbol): void {
   const store = getStore();
+  if (store.inFlight.get(sessionID)?.owner !== owner) return;
   const state = store.restartRecovery.get(sessionID);
   if (state?.inFlight) {
     state.inFlight = false;
@@ -322,6 +461,8 @@ export function clearOutcomeIdleWake(sessionID: string): void {
 /** Full session cleanup (deletion or disposal). */
 export function clearWakeSession(sessionID: string): void {
   const store = getStore();
+  for (const waiter of store.releaseWaiters.get(sessionID)?.values() ?? [])
+    waiter.retire();
   store.progress.delete(sessionID);
   store.inFlight.delete(sessionID);
   store.releaseWaiters.delete(sessionID);
@@ -334,6 +475,9 @@ export function clearWakeSession(sessionID: string): void {
 /** Server/instance disposal: drop all process-local wake state. */
 export function clearAllWakeSessions(): void {
   const store = getStore();
+  for (const waiters of store.releaseWaiters.values())
+    for (const waiter of waiters.values()) waiter.retire();
+  store.lifecycleEvents = new WeakSet();
   store.progress.clear();
   store.inFlight.clear();
   store.releaseWaiters.clear();
@@ -345,4 +489,16 @@ export function clearAllWakeSessions(): void {
 /** Test seam. */
 export function resetOrchestratorWakeGateForTests(): void {
   clearAllWakeSessions();
+}
+
+export function wakeGateSizesForTests() {
+  const store = getStore();
+  return {
+    progress: store.progress.size,
+    restart: store.restartRecovery.size,
+    owners: store.inFlight.size,
+    waiters: store.releaseWaiters.size,
+    order: store.order.length,
+    outcomeIdle: store.outcomeIdleWoken.size,
+  };
 }

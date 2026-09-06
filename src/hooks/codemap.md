@@ -34,6 +34,9 @@ from `index.ts`) that returns the hook points OpenCode invokes.
   shared by command-style hooks (deepwork, reflect, loop).
 - **Message types** (`types.ts`): `MessageInfo`, `MessagePart`,
   `MessageWithParts`, plus replay helpers used by foreground-fallback.
+- **External provenance** (`external-message.ts`): whole-message predicate
+  shared by Controller receipts and wake rearming; output parts authoritative,
+  mixed internal/synthetic/compaction/provider metadata rejected.
 
 ### Hook Categories
 

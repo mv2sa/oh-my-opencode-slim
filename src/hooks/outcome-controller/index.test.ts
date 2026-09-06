@@ -17,6 +17,15 @@ import {
 } from '../../utils/internal-initiator';
 import { isTaggedPart } from '../cache-safe-injection';
 import {
+  commitWakeReservation,
+  getWakeProgress,
+  noteHostProgress,
+  observeWakeLifecycle,
+  releaseWakeEvaluation,
+  resetOrchestratorWakeGateForTests,
+  tryBeginWakeEvaluation,
+} from '../orchestrator-wake/wake-gate';
+import {
   createOutcomeControllerHook,
   isRecognizableDirectOpenCodeRestart,
   OUTCOME_CONTROLLER_METADATA_KEY,
@@ -61,6 +70,7 @@ describe('OutcomeControllerHook', () => {
   let board: BackgroundJobBoard;
 
   beforeEach(() => {
+    resetOrchestratorWakeGateForTests();
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-hook-test-'));
     board = new BackgroundJobBoard();
     controller = new OutcomeController({
@@ -107,6 +117,8 @@ describe('OutcomeControllerHook', () => {
     ).toBe(true);
     const injectedText = volatileMsg.parts[0].text || '';
     expect(injectedText).toContain('OMOS_DISPATCH_MARKER');
+    expect(injectedText).toStartWith('[Internal Controller notice');
+    expect(injectedText).toContain(dispatchInstruction(controller, root));
 
     // Passing the injected prompt directly to tool.execute.before with output.args
     const beforeOutput = {
@@ -141,6 +153,317 @@ describe('OutcomeControllerHook', () => {
 
     const status = controller.getStatus(root);
     expect(status.checkpoint?.state).toBe('running');
+  });
+
+  test('recovery notices bound completed Stopped narration, not transforms/tool turns; never mint authority', async () => {
+    const root = 'narration-root';
+    controller.begin(root, sampleContract());
+    controller.validateAndMarkDispatching(
+      root,
+      'failed-call',
+      dispatchInstruction(controller, root),
+    );
+    controller.failManagerDispatch(root, 'failed-call', 'failed transport');
+    let telemetry: unknown = [];
+    const hook = createOutcomeControllerHook(
+      {
+        client: {
+          session: {
+            messages: async () => ({ data: telemetry }),
+          },
+        },
+      },
+      { controller, shouldManageSession: () => true },
+    );
+    const prefix = [
+      {
+        info: { role: 'user', sessionID: root, id: 'human' },
+        parts: [{ type: 'text', text: 'Stop' }],
+      },
+    ];
+    const transform = async () => {
+      const output = { messages: structuredClone(prefix) };
+      await hook['experimental.chat.messages.transform']({}, output);
+      expect(output.messages[0]).toEqual(prefix[0]);
+      return output;
+    };
+    const before = controller.store.read(root);
+    expect((await transform()).messages).toHaveLength(2);
+    expect((await transform()).messages).toHaveLength(2);
+    telemetry = [
+      {
+        info: {
+          role: 'assistant',
+          sessionID: root,
+          id: 'a1',
+          time: { completed: 1 },
+        },
+        parts: [{ type: 'text', text: 'Still stopped' }],
+      },
+    ];
+    expect((await transform()).messages).toHaveLength(2);
+    expect((await transform()).messages).toHaveLength(2);
+    telemetry = [
+      {
+        info: {
+          role: 'assistant',
+          sessionID: root,
+          id: 'tool-turn',
+          time: { completed: 2 },
+        },
+        parts: [{ type: 'tool', tool: 'task_status' }],
+      },
+    ];
+    expect((await transform()).messages).toHaveLength(2);
+    telemetry = [
+      {
+        info: {
+          role: 'assistant',
+          sessionID: root,
+          id: 'a2',
+          time: { completed: 3 },
+        },
+        parts: [{ type: 'text', text: 'Stopped' }],
+      },
+    ];
+    expect((await transform()).messages).toHaveLength(1);
+    expect((await transform()).messages).toHaveLength(1);
+    expect(controller.store.read(root)).toEqual(before);
+    telemetry = undefined; // Missing telemetry cannot reopen exhausted cause.
+    expect((await transform()).messages).toHaveLength(1);
+  });
+
+  test('failed Controller transports across recreated hooks spend the shared cap', async () => {
+    const root = 'failed-root';
+    controller.begin(root, sampleContract());
+    const promptAsync = mock(async () => {
+      throw new Error('transport');
+    });
+    for (let i = 0; i < 6; i++) {
+      const hook = createOutcomeControllerHook(
+        { client: { session: { promptAsync } } },
+        {
+          controller,
+          shouldManageSession: () => true,
+        },
+      );
+      await hook.event({
+        event: { type: 'session.idle', properties: { sessionID: root } },
+      });
+      await hook.event({ event: { type: 'server.instance.disposed' } });
+      observeWakeLifecycle(root, 'busy');
+      observeWakeLifecycle(root, 'idle');
+    }
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+  });
+
+  test('capacity denies recovery narration but preserves exact dispatch capability', async () => {
+    for (let i = 0; i < 256; i++) getWakeProgress(`occupied-${i}`);
+    const root = 'overflow';
+    controller.begin(root, sampleContract());
+    const instruction = dispatchInstruction(controller, root);
+    const hook = createOutcomeControllerHook({} as never, {
+      controller,
+      shouldManageSession: () => true,
+    });
+    const transform = async () => {
+      const output = {
+        messages: [
+          {
+            info: { role: 'user', sessionID: root, id: 'u' },
+            parts: [{ type: 'text', text: 'Stop' }],
+          },
+        ],
+      };
+      await hook['experimental.chat.messages.transform']({}, output);
+      return output.messages;
+    };
+    expect(JSON.stringify(await transform())).toContain(
+      JSON.stringify(instruction).slice(1, -1),
+    );
+    controller.validateAndMarkDispatching(root, 'failed', instruction);
+    controller.failManagerDispatch(root, 'failed', 'failed');
+    for (let i = 0; i < 5; i++) expect(await transform()).toHaveLength(1);
+    expect(getWakeProgress('occupied-0').unchangedWakeCount).toBe(0);
+  });
+
+  test('retired waiter can register again and disposing a second subscriber preserves the first', async () => {
+    const root = 'waiters';
+    controller.begin(root, sampleContract());
+    const promptAsync = mock(async () => ({}));
+    const create = () =>
+      createOutcomeControllerHook(
+        { client: { session: { promptAsync } } },
+        { controller, shouldManageSession: () => true },
+      );
+    const a = create();
+    const b = create();
+    const idle = () => ({
+      event: { type: 'session.idle', properties: { sessionID: root } },
+    });
+    const first = tryBeginWakeEvaluation(root)!;
+    await a.event(idle());
+    expect(commitWakeReservation(root, first)).toBe(true);
+    releaseWakeEvaluation(root, first); // transport failed without a busy event
+    noteHostProgress(root, 'before', 'todo-child');
+    noteHostProgress(root, 'after', 'todo-child');
+    const second = tryBeginWakeEvaluation(root)!;
+    await a.event(idle());
+    await b.event(idle());
+    await b.event({ event: { type: 'server.instance.disposed' } });
+    releaseWakeEvaluation(root, second);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    await a.event({ event: { type: 'server.instance.disposed' } });
+  });
+
+  test('real read/task_status receipts do not refill exhausted idle or narration budgets', async () => {
+    const root = 'observation-churn';
+    controller.begin(root, sampleContract());
+    controller.validateAndMarkDispatching(
+      root,
+      'dispatch',
+      dispatchInstruction(controller, root),
+    );
+    controller.failManagerDispatch(root, 'dispatch', 'transport failed');
+    const promptAsync = mock(async () => ({}));
+    let turn = 'response-1';
+    const hook = createOutcomeControllerHook(
+      {
+        client: {
+          session: {
+            promptAsync,
+            messages: async () => ({
+              data: [
+                {
+                  info: {
+                    role: 'assistant',
+                    sessionID: root,
+                    id: turn,
+                    time: { completed: 1 },
+                  },
+                  parts: [{ type: 'text', text: 'Stopped' }],
+                },
+                {
+                  info: { role: 'user', sessionID: root, id: 'wake' },
+                  parts: [createInternalAgentTextPart('wake')],
+                },
+                {
+                  info: {
+                    role: 'assistant',
+                    sessionID: root,
+                    id: 'current',
+                    time: { created: 2 },
+                  },
+                  parts: [],
+                },
+              ],
+            }),
+          },
+        },
+      },
+      { controller, shouldManageSession: () => true },
+    );
+    const idle = () =>
+      hook.event({
+        event: { type: 'session.idle', properties: { sessionID: root } },
+      });
+    const transform = async () => {
+      const output = {
+        messages: [
+          {
+            info: { role: 'user', sessionID: root, id: 'human' },
+            parts: [{ type: 'text', text: 'Stop' }],
+          },
+        ],
+      };
+      await hook['experimental.chat.messages.transform']({}, output);
+      return output.messages.length;
+    };
+    await idle();
+    expect(await transform()).toBe(2);
+    expect(await transform()).toBe(2);
+    observeWakeLifecycle(root, 'busy');
+    observeWakeLifecycle(root, 'idle');
+    await idle();
+    turn = 'response-2';
+    expect(await transform()).toBe(1);
+    for (const [index, tool] of [
+      'read',
+      'task_status',
+      'READ',
+      'TASK_STATUS',
+    ].entries()) {
+      await hook['tool.execute.before'](
+        { sessionID: root, callID: `read-${index}`, tool },
+        { args: { path: 'same' } },
+      );
+      await hook['tool.execute.after'](
+        { sessionID: root, callID: `read-${index}`, tool },
+        { output: 'unchanged' },
+      );
+      await idle();
+      expect(await transform()).toBe(1);
+      expect(getWakeProgress(root).unchangedWakeCount).toBe(2);
+    }
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    const rec = controller.store.read(root);
+    expect(rec.success && rec.data.receipts.evidence.length).toBeGreaterThan(0);
+    // Actual non-observation operation remains meaningful telemetry.
+    await hook['tool.execute.before'](
+      { sessionID: root, callID: 'write', tool: 'apply_patch' },
+      { args: { patch: 'repair' } },
+    );
+    await hook['tool.execute.after'](
+      { sessionID: root, callID: 'write', tool: 'apply_patch' },
+      { output: 'changed' },
+    );
+    await idle();
+    expect(promptAsync).toHaveBeenCalledTimes(3);
+  });
+
+  test('Controller telemetry ignores revisions but genuine goal progress rearms', async () => {
+    const root = 'telemetry-root';
+    controller.begin(root, sampleContract());
+    const initial = controller.store.read(root);
+    if (!initial.success) throw new Error('missing fixture');
+    const record = structuredClone(initial.data);
+    const promptAsync = mock(async () => ({}));
+    const stub = {
+      readRecord: () => ({ success: true, data: record }),
+      store: {
+        read: () => ({ success: true, data: record }),
+        reconcileIdleOperations: () => ({ success: true, data: record }),
+      },
+      validateManagedWait: () => ({ allowed: false }),
+    } as unknown as OutcomeController;
+    const hook = createOutcomeControllerHook(
+      { client: { session: { promptAsync } } },
+      {
+        controller: stub,
+        shouldManageSession: () => true,
+      },
+    );
+    const idle = () =>
+      hook.event({
+        event: { type: 'session.idle', properties: { sessionID: root } },
+      });
+    await idle();
+    observeWakeLifecycle(root, 'busy');
+    observeWakeLifecycle(root, 'idle');
+    await idle();
+    record.revision += 10;
+    record.updatedAt += 10;
+    await idle();
+    await idle();
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    record.contract.goals[0].status = 'completed';
+    await idle();
+    expect(promptAsync).toHaveBeenCalledTimes(3);
+    record.phase = 'accepted';
+    await idle();
+    expect(promptAsync).toHaveBeenCalledTimes(3);
   });
 
   test('tool.execute.before with real output.args enforces marker correlation and fails closed without callID', async () => {

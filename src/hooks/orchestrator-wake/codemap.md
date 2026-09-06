@@ -5,7 +5,7 @@
 Periodic orchestrator wake scheduler. After continuous parent-idle time,
 capability-gated host session APIs may receive a static internal wake prompt
 when incomplete TODOs remain (or when a background job stopped without a
-terminal result). Active children do not suppress wakes; host responses are
+terminal result). Active children suppress periodic TODO wakes, not stopped-child recovery; host responses are
 authoritative and the local job board is never consulted. Progress/reservation
 state is process-global so independently created hook instances share
 one-flight and the two-wake no-progress cap.
@@ -18,7 +18,8 @@ one-flight and the two-wake no-progress cap.
     idle flag) only; progress lives in the process gate.
   - Gates (`canSchedule`): config enabled, required session APIs present
     (`get`/`todo`/`children`/`status`/`promptAsync`), managed session,
-    no input wait (`hasInputWait`), no fallback in progress, gate not stopped.
+    no input wait (`hasInputWait`), no fallback in progress. Exhaustion allows
+    event-driven telemetry evaluation but no periodic polling or prompt admission.
   - Reads a host snapshot (todos + children + status map + session model) and
     computes a fingerprint; unchanged fingerprints across wake attempts hit
     `ORCHESTRATOR_WAKE_UNCHANGED_CAP` (2) and stop.
@@ -33,13 +34,23 @@ one-flight and the two-wake no-progress cap.
   via `globalThis` + `Symbol.for` (`oh-my-opencode-slim.orchestrator-wake-gate`):
   - `tryBeginWakeEvaluation` / `releaseWakeEvaluation` / `retryAfterWakeEvaluation`:
     single in-flight evaluation per session with waiter re-queueing.
-  - `commitWakeReservation`: marks a committed wake and sets `expectingWakeBusy`
-    so the next busy preserves (not rearms) the no-progress cap.
+  - `commitWakeReservation`: owner-safe, at most once per reservation; debits
+    the shared two-attempt cap before SDK invocation, including failures.
   - `noteHostProgress` / `rearmWakeProgress`: fingerprint-unchanged counting
     and external-activity resets.
   - `getObservedWakeModel` / `setObservedWakeModel`: last-seen model for
     continuation prompts.
-  - Bounded at `MAX_TRACKED_SESSIONS` (256) with insertion-ordered eviction.
+  - First 256 external message IDs retained per session; later unknown IDs fail
+    closed for rearming. At 256 sessions, new admission fails closed; unknown
+    restart candidates allocate nothing before outcome lookup. Budgets remain
+    until deletion/process exit, never evicted under session pressure. Disposal only
+    retires local work; committed transports retain ownership until settlement.
+  - Separate TODO/child and Controller fingerprints: initial/missing components
+    cannot refill spent budget; meaningful changes or distinct external host IDs
+    alone rearm. Revisions/counters/timestamps/prose/status-read churn do not.
+  - Shared idle-cycle admission coalesces paired idle notifications across hooks
+    and SDK acknowledgements. Busy-to-idle opens another cycle without refilling
+    budget. Release waiters are bounded/deduplicated by scheduler/Controller source.
 
 ## Flow
 
@@ -58,7 +69,8 @@ evaluate() (one-flight via gate)
     └─ promptAsync(internal wake reminder)
     ↓
 busy (wake-initiated) → endIdleSpell(rearm=false)   [cap survives]
-busy (external) / errors / user activity → rearm cap
+busy / retry / errors / duplicate lifecycle → never rearm cap
+distinct external user ID / meaningful component change → rearm cap
 ```
 
 ## Integration
@@ -83,7 +95,7 @@ busy (external) / errors / user activity → rearm cap
     - Normal `controller.readRecord` recovery ensuring the exact operation is interrupted with the standard restart error and matching unresolved action.
     - Host snapshot 2: must be identical to snapshot 1 and inactive before prompt.
   - Wakes via single static internal prompt `ORCHESTRATOR_RESTART_RECOVERY_TEXT` directing authoritative inspection without blind re-execution, preserving model from the incomplete assistant turn.
-  - Process-global one-flight and success state shared between startup scan and event fallback: at most 2 SDK-failure attempts per session/process, never a second prompt after success, bounded 256-session eviction, and disposal cancellation.
+  - Process-global one-flight and success state shared between startup scan and event fallback: at most 2 SDK-failure attempts per session/process, never a second restart prompt after success; all attempts also consume the common budget before SDK invocation.
   - Shared wake reservation with OutcomeController idle wake so bootstrap and Outcome idle cannot double-prompt.
 - **Dependencies**: `createInternalAgentTextPart` /
   `isInternalInitiatorPart` (`src/utils/internal-initiator.ts`), `log`,
@@ -105,6 +117,6 @@ busy (external) / errors / user activity → rearm cap
 
 - One unref'd timer per continuously-idle managed session; timers are cleared
   on any busy/error/wait/deletion.
-- All process-global state is bounded and evicted LRU-style.
+- External-ID dedup is bounded; live budgets/owners are not evicted or reset by hook disposal.
 - Host snapshot reads are `Promise.all`-parallel and only happen inside the
   one-flight evaluation.

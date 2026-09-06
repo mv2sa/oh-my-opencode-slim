@@ -98,6 +98,7 @@ The storage foundation provides bounded persistence for cooperative OMOS process
 - `parser.ts` - Envelope extraction (`parseOutcomeReview`, `safeParseOutcomeReview`) and error classes (`OutcomeParseError`).
 - `controller-schema.ts` - Strict Zod schemas, canonical digest helpers, relation validation, and durable Controller types.
 - `controller.ts` - `OutcomeController` service coordinating durable outcome contracts, checkpoint claims, process-local secret tokens, evidence minting, review reconciliation, bounded progress/action transitions, user decisions, external handoff completion, and final certificate creation.
+- `handoff-amendments.ts` - Effective external-handoff obligations, bounded public status projection, stable wait identity, explicit completion-authorization scope, domain-separated amendment/completion audit digests, reload chain/provenance validation, and checkpoint/certificate-bound final-review fences. Final Manager packets include the bound effective obligation. Optional fields preserve legacy fingerprints; unsettled final checkpoints must reconcile before amendment, and retired misbound-final recovery stays on supersession. API and assurance limits: `docs/handoff-amendments.md`.
 - `process-epoch.ts` - Process-stable epoch generation; test reset is not re-exported by the outcome barrel.
 - `store.ts` - Controlled `OutcomeStore` initialization/read/mutation/recovery API with cooperative locking and atomic replacement.
 - `index.ts` - Re-exports all schemas, parsers, epoch utilities, controller, and store classes.

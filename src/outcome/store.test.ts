@@ -2,6 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { buildOutcomeReviewPacket } from './controller';
+import type {
+  OutcomeEvidenceAttestation,
+  OutcomeHandoffAmendmentRequest,
+  OutcomeUserMessageReceipt,
+} from './controller-schema';
 import {
   canonicalDigest,
   computeOutcomeAuthorizationDigest,
@@ -19,6 +25,11 @@ import {
   serializeOutcomeIntake,
   serializeOutcomeRecord,
 } from './controller-schema';
+import {
+  amendmentDigest,
+  effectiveHandoff,
+  obligationDigest,
+} from './handoff-amendments';
 import type { OutcomeReview } from './schema';
 import {
   OutcomeStore,
@@ -249,6 +260,611 @@ describe('OutcomeStore protocol and integrity', () => {
 
   afterEach(() => {
     fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  describe('external handoff amendments', () => {
+    const root = 'root_amendment';
+    function read(store: OutcomeStore) {
+      const result = store.read(root);
+      expectSuccess(result);
+      return result.data;
+    }
+    function setup(final = false) {
+      const old = new OutcomeStore({
+        storeDirectory: directory,
+        serverEpoch: 'old',
+        clock: () => 100,
+      });
+      expectSuccess(
+        old.init(root, {
+          contract: contract({
+            goals: [
+              {
+                id: 'goal_protocol',
+                description: 'Implement the outcome protocol',
+                status: 'satisfied',
+              },
+            ],
+          }),
+        }),
+      );
+      if (final) {
+        openCheckpoint(old, root, read(old).revision, 'kickoff', 'kickoff');
+        completeReview(old, root, read(old).revision, 'kickoff', 'CONTINUE');
+        const oldEvidence = evidence(old);
+        openCheckpoint(old, root, read(old).revision, 'final-old', 'final', {
+          candidateFingerprint: hash('candidate'),
+          evidenceAttestationIds: [oldEvidence],
+        });
+        completeReview(old, root, read(old).revision, 'final-old', 'ACCEPT');
+      }
+      const revision = read(old).revision;
+      expectSuccess(
+        old.mutate(root, revision, {
+          type: 'set_wait',
+          wait: {
+            kind: 'external_handoff',
+            referenceId: 'restart',
+            reason: 'Reload',
+            instructions: 'Original instructions',
+            expectedPostRestartCheck: 'Original check',
+            createdAt: 100,
+            createdRevision: revision + 1,
+            originatingServerEpoch: 'old',
+          },
+        }),
+      );
+      const store = new OutcomeStore({
+        storeDirectory: directory,
+        serverEpoch: 'new',
+        clock: () => 200,
+      });
+      expectSuccess(store.recover(root));
+      return store;
+    }
+    function user(
+      store: OutcomeStore,
+      overrides: Partial<OutcomeUserMessageReceipt> = {},
+    ) {
+      const record = read(store);
+      const id = `user_${record.revision}`;
+      expectSuccess(
+        store.mutate(root, record.revision, {
+          type: 'append_user_message',
+          receipt: {
+            id,
+            messageId: id,
+            contentDigest: hash(id),
+            observedEpoch: record.serverEpoch,
+            observedAt: 200,
+            createdRevision: record.revision + 1,
+            provenance: 'external_user',
+            ...overrides,
+          },
+        }),
+      );
+      return overrides.id ?? id;
+    }
+    function evidence(
+      store: OutcomeStore,
+      overrides: Partial<OutcomeEvidenceAttestation> = {},
+    ) {
+      const record = read(store);
+      const entry: OutcomeEvidenceAttestation = {
+        id: `evidence_${record.revision}`,
+        kind: 'orchestrator_attestation',
+        description: 'New check',
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: hash('candidate'),
+        createdRevision: record.revision + 1,
+        createdAt: 200,
+        payloadDigest: '',
+        ...overrides,
+      };
+      entry.payloadDigest = computeOutcomeEvidenceAttestationDigest(entry);
+      expectSuccess(
+        store.mutate(root, record.revision, { type: 'append_evidence', entry }),
+      );
+      return entry.id;
+    }
+    function request(
+      store: OutcomeStore,
+      source = user(store),
+      attestation = evidence(store),
+    ): OutcomeHandoffAmendmentRequest {
+      const record = read(store);
+      const wait = record.waitCondition!;
+      const effective = effectiveHandoff(record, wait);
+      return {
+        rootSessionId: root,
+        outcomeId: record.outcomeId,
+        generation: record.generation ?? 1,
+        waitReferenceId: wait.referenceId,
+        waitCreatedRevision: wait.createdRevision,
+        waitOriginatingServerEpoch: wait.originatingServerEpoch!,
+        waitRestartObservedRevision: wait.restartObservedRevision!,
+        expectedPreviousAmendmentHead: effective.head,
+        oldEffectiveObligationDigest: obligationDigest(effective.obligation),
+        instructions: 'New instructions',
+        expectedPostRestartCheck: 'New check',
+        candidateFingerprint: hash('candidate'),
+        reason: 'Explicit user-authorized correction',
+        sourceUserMessageReceiptId: source,
+        evidenceAttestationId: attestation,
+      };
+    }
+    function amend(
+      store: OutcomeStore,
+      req: OutcomeHandoffAmendmentRequest,
+      revision = read(store).revision,
+    ) {
+      return store.mutate(root, revision, {
+        type: 'amend_external_handoff',
+        request: req,
+      });
+    }
+    function complete(
+      store: OutcomeStore,
+      source = user(store),
+      attestation = evidence(store),
+      check = 'New check',
+    ) {
+      const record = read(store);
+      const wait = record.waitCondition!;
+      return store.mutate(root, record.revision, {
+        type: 'complete_external_handoff',
+        waitReferenceId: wait.referenceId,
+        waitCreatedRevision: wait.createdRevision,
+        waitOriginatingServerEpoch: wait.originatingServerEpoch!,
+        waitRestartObservedRevision: wait.restartObservedRevision!,
+        expectedPostRestartCheck: check,
+        sourceUserMessageReceiptId: source,
+        evidenceAttestationId: attestation,
+      });
+    }
+    function bytes(store: OutcomeStore) {
+      return fs.readFileSync(store.recordPath(root), 'utf8');
+    }
+
+    test('append preserves original wait, phase, contract, actions and final checkpoint; replay is byte/revision preserving', () => {
+      const store = setup(true);
+      const req = request(store);
+      const before = read(store);
+      const result = amend(store, req);
+      expectSuccess(result);
+      for (const field of [
+        'waitCondition',
+        'phase',
+        'contract',
+        'contractDigest',
+        'checkpoint',
+        'actionsRequired',
+        'reviewSummaries',
+        'kickoffGate',
+      ] as const)
+        expect(result.data[field]).toEqual(before[field]);
+      expect(result.data.receipts.handoffAmendments).toHaveLength(1);
+      const original = bytes(store);
+      const replay = amend(store, req, 1);
+      expectSuccess(replay);
+      expect(replay.status).toBe('noop');
+      expect(bytes(store)).toBe(original);
+      expect(amend(store, { ...req, reason: 'Changed consent' }).success).toBe(
+        false,
+      );
+      expect(bytes(store)).toBe(original);
+    });
+
+    test('every identity and obligation fence rejects direct-store bypass without mutation', () => {
+      const store = setup();
+      const req = request(store);
+      const original = bytes(store);
+      const patches: Partial<OutcomeHandoffAmendmentRequest>[] = [
+        { rootSessionId: 'wrong' },
+        { outcomeId: 'wrong' },
+        { generation: 2 },
+        { waitReferenceId: 'wrong' },
+        { waitCreatedRevision: 1 },
+        { waitOriginatingServerEpoch: 'wrong' },
+        { waitRestartObservedRevision: 1 },
+        { expectedPreviousAmendmentHead: hash('wrong') },
+        { oldEffectiveObligationDigest: hash('wrong') },
+        { sourceUserMessageReceiptId: 'synthetic_notice' },
+        { evidenceAttestationId: 'missing' },
+        { expectedPostRestartCheck: 'Wrong check' },
+        { candidateFingerprint: hash('wrong') },
+        { instructions: 'x'.repeat(513) },
+        { reason: ' padded ' },
+      ];
+      for (const patch of patches) {
+        expect(amend(store, { ...req, ...patch }).success).toBe(false);
+        expect(bytes(store)).toBe(original);
+      }
+      const sameEpoch = new OutcomeStore({
+        storeDirectory: directory,
+        serverEpoch: 'old',
+        clock: () => 200,
+      });
+      expect(amend(sameEpoch, req).success).toBe(false);
+      expect(bytes(store)).toBe(original);
+    });
+
+    test('legacy, pre-restart, wrong-epoch and pre-user/stale/failed evidence cannot authorize', () => {
+      const store = setup();
+      const legacy = user(store, { provenance: 'legacy_unverified' });
+      expect(amend(store, request(store, legacy)).success).toBe(false);
+      const preUser = evidence(store);
+      const freshUser = user(store);
+      expect(amend(store, request(store, freshUser, preUser)).success).toBe(
+        false,
+      );
+      for (const patch of [
+        { assertedStatus: 'failed' },
+        { assertedFreshness: 'stale' },
+        { description: 'Wrong check' },
+        { candidateFingerprint: hash('wrong') },
+      ] as Partial<OutcomeEvidenceAttestation>[]) {
+        expect(
+          amend(store, request(store, freshUser, evidence(store, patch)))
+            .success,
+        ).toBe(false);
+      }
+      const req = request(store);
+      const restarted = new OutcomeStore({
+        storeDirectory: directory,
+        serverEpoch: 'third',
+        clock: () => 300,
+      });
+      expectSuccess(restarted.recover(root));
+      expect(
+        amend(restarted, {
+          ...req,
+          waitRestartObservedRevision:
+            read(restarted).waitCondition!.restartObservedRevision!,
+        }).success,
+      ).toBe(false);
+    });
+
+    test('linear prior head rejects concurrent stale-head forks; second restart keeps effective obligation', () => {
+      const store = setup();
+      const req = request(store);
+      const competing = request(store);
+      const revision = read(store).revision;
+      expectSuccess(amend(store, req, revision));
+      expect(amend(store, competing, revision).success).toBe(false);
+      expect(amend(store, competing).success).toBe(false);
+      // A source minted before the preceding amendment cannot authorize a new head.
+      const staleSource = request(store, competing.sourceUserMessageReceiptId);
+      expect(amend(store, staleSource).success).toBe(false);
+      const oldUser = user(store);
+      const oldEvidence = evidence(store);
+      const second = new OutcomeStore({
+        storeDirectory: directory,
+        serverEpoch: 'third',
+        clock: () => 300,
+      });
+      expectSuccess(second.recover(root));
+      expect(
+        effectiveHandoff(read(second), read(second).waitCondition!).obligation
+          .expectedPostRestartCheck,
+      ).toBe('New check');
+      const original = bytes(second);
+      expect(complete(second, oldUser, oldEvidence).success).toBe(false);
+      expect(bytes(second)).toBe(original);
+      // Stable-wait replay remains exact even when the restart fence advances.
+      expectSuccess(amend(second, req, 1));
+      expect(bytes(second)).toBe(original);
+      const nextRequest = request(second);
+      expectSuccess(amend(second, nextRequest));
+      expect(
+        read(second).receipts.handoffAmendments?.[1].request
+          .expectedPreviousAmendmentHead,
+      ).toBe(read(second).receipts.handoffAmendments?.[0].payloadDigest);
+      const freshUser = user(second);
+      expect(
+        complete(
+          second,
+          freshUser,
+          evidence(second, { description: 'Original check' }),
+          'Original check',
+        ).success,
+      ).toBe(false);
+      expect(
+        complete(
+          second,
+          freshUser,
+          evidence(second, { candidateFingerprint: hash('wrong') }),
+        ).success,
+      ).toBe(false);
+      expectSuccess(complete(second, freshUser, evidence(second)));
+      expect(read(second).waitCondition).toBeUndefined();
+      expect(read(second).receipts.handoffCompletions).toHaveLength(1);
+    });
+
+    test('reload rejects tampered chain, original wait, provenance and evidence even with recomputed audit hash', () => {
+      const store = setup();
+      expectSuccess(amend(store, request(store)));
+      expectSuccess(amend(store, request(store)));
+      const original = bytes(store);
+      const changes: ((record: any) => void)[] = [
+        (r) => {
+          r.receipts.handoffAmendments.reverse();
+        },
+        (r) => {
+          r.receipts.handoffAmendments[1].request.expectedPreviousAmendmentHead =
+            'genesis';
+        },
+        (r) => {
+          r.receipts.handoffAmendments[0].originalWait.instructions = 'tamper';
+        },
+        (r) => {
+          r.receipts.handoffAmendments[0].request.generation = 2;
+        },
+        (r) => {
+          r.receipts.userMessages[0].provenance = 'legacy_unverified';
+        },
+        (r) => {
+          r.receipts.userMessages[0].contentDigest = hash('tamper');
+        },
+        (r) => {
+          r.receipts.evidence[0].createdRevision++;
+        },
+        (r) => {
+          r.waitCondition.instructions = 'tamper';
+        },
+        (r) => {
+          delete r.waitCondition;
+        },
+      ];
+      for (const change of changes) {
+        const tampered = JSON.parse(original);
+        change(tampered);
+        for (const entry of tampered.receipts.handoffAmendments)
+          entry.payloadDigest = amendmentDigest(entry);
+        fs.writeFileSync(store.recordPath(root), JSON.stringify(tampered));
+        expect(store.read(root).success).toBe(false);
+        expect(
+          amend(store, {} as OutcomeHandoffAmendmentRequest, 1).success,
+        ).toBe(false);
+        fs.writeFileSync(store.recordPath(root), original);
+      }
+      expectSuccess(store.read(root));
+    });
+
+    test('bounded amendment capacity fails without byte changes; exact replay works at capacity', () => {
+      const store = setup();
+      let req = request(store);
+      for (let i = 0; i < 16; i++) {
+        req = i === 0 ? req : request(store);
+        expectSuccess(amend(store, req));
+      }
+      const overflow = request(store);
+      const original = bytes(store);
+      expect(amend(store, overflow).success).toBe(false);
+      expect(bytes(store)).toBe(original);
+      expectSuccess(amend(store, req, 1));
+      expect(bytes(store)).toBe(original);
+    });
+
+    test.each([true, false])(
+      'completion reuse requires explicit scope (authorized=%s)',
+      (authorized) => {
+        const store = setup();
+        const req = { ...request(store), completionAuthorized: authorized };
+        expectSuccess(amend(store, req));
+        expect(read(store).waitCondition).toBeDefined();
+        const completion = complete(
+          store,
+          req.sourceUserMessageReceiptId,
+          req.evidenceAttestationId,
+        );
+        expect(completion.success).toBe(authorized);
+        if (authorized) expectSuccess(store.read(root));
+        else expectSuccess(complete(store));
+      },
+    );
+
+    test('completion scope never permits reuse after another restart', () => {
+      const store = setup();
+      const req = { ...request(store), completionAuthorized: true };
+      expectSuccess(amend(store, req));
+      const second = new OutcomeStore({
+        storeDirectory: directory,
+        serverEpoch: 'third',
+        clock: () => 300,
+      });
+      expectSuccess(second.recover(root));
+      const original = bytes(second);
+      expect(
+        complete(
+          second,
+          req.sourceUserMessageReceiptId,
+          req.evidenceAttestationId,
+        ).success,
+      ).toBe(false);
+      expect(bytes(second)).toBe(original);
+      expectSuccess(complete(second));
+    });
+
+    test('total serialized byte capacity fails atomically before history capacity', () => {
+      const store = setup();
+      let capacityReached = false;
+      for (let i = 0; i < 16; i++) {
+        const source = user(store);
+        const check = 'c'.repeat(512);
+        const attestation = evidence(store, { description: check });
+        const req = {
+          ...request(store, source, attestation),
+          instructions: 'i'.repeat(512),
+          expectedPostRestartCheck: check,
+          reason: 'r'.repeat(512),
+        };
+        const original = bytes(store);
+        const result = amend(store, req);
+        if (!result.success) {
+          expect(bytes(store)).toBe(original);
+          expect(result.code).toBe('oversized');
+          capacityReached = true;
+          break;
+        }
+      }
+      expect(capacityReached).toBe(true);
+    });
+
+    test.each([false, true])(
+      'old final ACCEPT cannot certify amendment, new final review can (candidate changed=%s)',
+      (changed) => {
+        const store = setup(true);
+        const req = request(store);
+        if (changed) {
+          req.candidateFingerprint = hash('replacement');
+          req.evidenceAttestationId = evidence(store, {
+            candidateFingerprint: req.candidateFingerprint,
+          });
+        }
+        expectSuccess(amend(store, req));
+        const freshUser = user(store);
+        const finalEvidence = evidence(store, {
+          candidateFingerprint: req.candidateFingerprint,
+        });
+        expectSuccess(complete(store, freshUser, finalEvidence));
+        const before = read(store);
+        const original = bytes(store);
+        expect(
+          store.mutate(root, before.revision, {
+            type: 'finalize',
+            summary: 'Old ACCEPT',
+          }).success,
+        ).toBe(false);
+        expect(bytes(store)).toBe(original);
+        // Even a NEW ACCEPT of the right candidate cannot omit completion evidence.
+        openCheckpoint(
+          store,
+          root,
+          read(store).revision,
+          'final-incomplete',
+          'final',
+          {
+            candidateFingerprint: req.candidateFingerprint,
+            evidenceAttestationIds: [req.evidenceAttestationId],
+          },
+        );
+        completeReview(
+          store,
+          root,
+          read(store).revision,
+          'final-incomplete',
+          'ACCEPT',
+        );
+        expect(
+          store.mutate(root, read(store).revision, {
+            type: 'finalize',
+            summary: 'Missing completion evidence',
+          }).success,
+        ).toBe(false);
+        openCheckpoint(
+          store,
+          root,
+          read(store).revision,
+          'final-new',
+          'final',
+          {
+            candidateFingerprint: req.candidateFingerprint,
+            evidenceAttestationIds: [finalEvidence],
+          },
+        );
+        const snapshot = read(store);
+        const binding = snapshot.checkpoint!.amendedHandoff!;
+        expect(binding.amendmentHead).toBe(
+          snapshot.receipts.handoffAmendments!.at(-1)!.payloadDigest,
+        );
+        expect(binding.completionDigest).toBe(
+          snapshot.receipts.handoffCompletions!.at(-1)!.payloadDigest,
+        );
+        expect(binding.instructions).toBe(req.instructions);
+        const packet = buildOutcomeReviewPacket(snapshot, snapshot.checkpoint!);
+        expect(packet).toContain(JSON.stringify(binding, null, 2));
+        expect(packet).toContain(
+          'Manager must evaluate this effective obligation',
+        );
+        const { amendedHandoff: _, ...legacyClaim } = snapshot.checkpoint!;
+        expect(computeOutcomeCheckpointFingerprint(legacyClaim)).toBe(
+          computeOutcomeCheckpointFingerprint({
+            ...legacyClaim,
+            amendedHandoff: undefined,
+          }),
+        );
+        expect(computeOutcomeCheckpointFingerprint(legacyClaim)).not.toBe(
+          snapshot.checkpoint!.checkpointFingerprint,
+        );
+        completeReview(
+          store,
+          root,
+          read(store).revision,
+          'final-new',
+          'ACCEPT',
+        );
+        expectSuccess(
+          store.mutate(root, read(store).revision, {
+            type: 'finalize',
+            summary: 'New authenticated final review',
+          }),
+        );
+        const accepted = bytes(store);
+        const stripped = JSON.parse(accepted);
+        delete stripped.receipts.handoffAmendments;
+        delete stripped.receipts.handoffCompletions;
+        fs.writeFileSync(store.recordPath(root), JSON.stringify(stripped));
+        expect(store.read(root).success).toBe(false);
+        const missingBinding = JSON.parse(accepted);
+        delete missingBinding.finalCertificate.amendedHandoff;
+        expect(OutcomeRecordSchema.safeParse(missingBinding).success).toBe(
+          false,
+        );
+        fs.writeFileSync(store.recordPath(root), accepted);
+        const tampered = JSON.parse(accepted);
+        tampered.receipts.handoffCompletions[0].evidenceDigest = hash('tamper');
+        fs.writeFileSync(store.recordPath(root), JSON.stringify(tampered));
+        expect(store.read(root).success).toBe(false);
+        fs.writeFileSync(store.recordPath(root), accepted);
+        expectSuccess(store.read(root));
+        // Rebind a structurally consistent certificate to the old ACCEPT: durable
+        // validation must enforce the amendment fence independently of finalize.
+        const staleFinal = JSON.parse(accepted);
+        staleFinal.checkpoint = before.checkpoint;
+        delete staleFinal.finalCertificate.amendedHandoff;
+        const oldClaim = before.checkpoint!;
+        const oldReview = before.reviewSummaries.find(
+          (entry) => entry.checkpointId === oldClaim.checkpointId,
+        )!;
+        Object.assign(staleFinal.finalCertificate, {
+          candidateFingerprint: oldClaim.candidateFingerprint,
+          acceptedCheckpointId: oldClaim.checkpointId,
+          acceptedClaimGeneration: oldClaim.claimGeneration,
+          finalCheckpointFingerprint: oldClaim.checkpointFingerprint,
+          managerTaskId: oldClaim.managerTaskId,
+          managerGeneration: oldClaim.managerGeneration,
+          managerReviewId: oldReview.reviewId,
+          managerReviewDigest: oldReview.reviewDigest,
+          receiptDigests: oldClaim.includedEvidenceAttestationIds.map(
+            (id) =>
+              (
+                before.receipts.evidence.find(
+                  (entry) => entry.id === id,
+                ) as OutcomeEvidenceAttestation
+              ).payloadDigest,
+          ),
+        });
+        const validation = OutcomeRecordSchema.safeParse(staleFinal);
+        expect(validation.success).toBe(false);
+        if (!validation.success)
+          expect(validation.error.message).toContain('new final snapshot');
+        fs.writeFileSync(store.recordPath(root), JSON.stringify(staleFinal));
+        expect(store.read(root).success).toBe(false);
+        fs.writeFileSync(store.recordPath(root), accepted);
+      },
+    );
   });
 
   test('persists canonical JSON-compatible contracts and enforces CAS', () => {
@@ -4614,10 +5230,74 @@ describe('OutcomeStore protocol and integrity', () => {
     }
     expect(wait.restartObservedRevision).toBeDefined();
 
+    // Fresh authority does not make an unsettled recovered final amendable.
+    const preUser = newStore.mutate(root, recovered.revision, {
+      type: 'append_user_message',
+      receipt: {
+        id: 'pre_reconcile_user',
+        messageId: 'pre_reconcile_host',
+        contentDigest: hash('consent'),
+        provenance: 'external_user',
+        observedEpoch: 'epoch_handoff_new',
+        observedAt: 200,
+        createdRevision: recovered.revision + 1,
+      },
+    });
+    expectSuccess(preUser);
+    const preEvidence: OutcomeEvidenceAttestation = {
+      id: 'pre_reconcile_evidence',
+      kind: 'orchestrator_attestation',
+      description: 'Replacement check',
+      assertedStatus: 'passed',
+      assertedFreshness: 'fresh',
+      candidateFingerprint: hash('replacement'),
+      payloadDigest: '',
+      createdRevision: preUser.revision + 1,
+      createdAt: 200,
+    };
+    preEvidence.payloadDigest =
+      computeOutcomeEvidenceAttestationDigest(preEvidence);
+    const preEvidenceResult = newStore.mutate(root, preUser.revision, {
+      type: 'append_evidence',
+      entry: preEvidence,
+    });
+    expectSuccess(preEvidenceResult);
+    const prereconciliationRequest: OutcomeHandoffAmendmentRequest = {
+      rootSessionId: root,
+      outcomeId: recovered.data.outcomeId,
+      generation: recovered.data.generation ?? 1,
+      waitReferenceId: wait.referenceId,
+      waitCreatedRevision: wait.createdRevision,
+      waitOriginatingServerEpoch: wait.originatingServerEpoch,
+      waitRestartObservedRevision: wait.restartObservedRevision,
+      expectedPreviousAmendmentHead: 'genesis',
+      oldEffectiveObligationDigest: obligationDigest(
+        effectiveHandoff(recovered.data, wait).obligation,
+      ),
+      instructions: 'Replacement instructions',
+      expectedPostRestartCheck: preEvidence.description,
+      candidateFingerprint: preEvidence.candidateFingerprint,
+      reason: 'User approved',
+      sourceUserMessageReceiptId: 'pre_reconcile_user',
+      evidenceAttestationId: preEvidence.id,
+    };
+    function rejectPrereconciliation(revision: number) {
+      const original = fs.readFileSync(newStore.recordPath(root), 'utf8');
+      const result = newStore.mutate(root, revision, {
+        type: 'amend_external_handoff',
+        request: prereconciliationRequest,
+      });
+      expect(result.success).toBe(false);
+      if (!result.success)
+        expect(result.error.message).toContain('Unsettled final');
+      expect(fs.readFileSync(newStore.recordPath(root), 'utf8')).toBe(original);
+    }
+    rejectPrereconciliation(preEvidenceResult.revision); // review_uncertain
+
     // Reconcile uncertain final checkpoint to result_available with misbound digest
     const misboundDigest = hash('bound_misbound_digest');
     expectSuccess(
-      newStore.mutate(root, recovered.revision, {
+      newStore.mutate(root, preEvidenceResult.revision, {
         type: 'reconcile_uncertain_checkpoint',
         checkpointId: openedFinal.claim.checkpointId,
         claimGeneration: openedFinal.claim.claimGeneration,
@@ -4630,10 +5310,11 @@ describe('OutcomeStore protocol and integrity', () => {
         },
       }),
     );
+    rejectPrereconciliation(preEvidenceResult.revision + 1); // result_available
 
     // Retire misbound result
     const observedDigest = hash('observed_diff_digest');
-    const retireRes = newStore.mutate(root, recovered.revision + 1, {
+    const retireRes = newStore.mutate(root, preEvidenceResult.revision + 1, {
       type: 'retire_misbound_recovered_result',
       checkpointId: openedFinal.claim.checkpointId,
       claimGeneration: openedFinal.claim.claimGeneration,
@@ -4746,6 +5427,43 @@ describe('OutcomeStore protocol and integrity', () => {
         reason: 'x'.repeat(513),
       }).success,
     ).toBe(false);
+
+    // This retired misbound-final recovery remains exclusively supersession,
+    // even when a caller supplies otherwise valid amendment authority.
+    const beforeAmendAttempt = fs.readFileSync(
+      newStore.recordPath(root),
+      'utf8',
+    );
+    const amendmentAttempt = newStore.mutate(root, evidenceRes.revision, {
+      type: 'amend_external_handoff',
+      request: {
+        rootSessionId: root,
+        outcomeId: evidenceRes.data.outcomeId,
+        generation: evidenceRes.data.generation ?? 1,
+        waitReferenceId: wait.referenceId,
+        waitCreatedRevision: wait.createdRevision,
+        waitOriginatingServerEpoch: wait.originatingServerEpoch,
+        waitRestartObservedRevision: wait.restartObservedRevision,
+        expectedPreviousAmendmentHead: 'genesis',
+        oldEffectiveObligationDigest: obligationDigest(
+          effectiveHandoff(evidenceRes.data, wait).obligation,
+        ),
+        instructions: 'Replacement instructions',
+        expectedPostRestartCheck: attestationPayload.description,
+        candidateFingerprint: replacementCandidate,
+        reason: 'Amendment must not replace misbound supersession',
+        sourceUserMessageReceiptId: 'msg_user_post_restart',
+        evidenceAttestationId: attestationId,
+      },
+    });
+    expect(amendmentAttempt.success).toBe(false);
+    if (!amendmentAttempt.success)
+      expect(amendmentAttempt.error.message).toContain(
+        'require supersede_external_handoff',
+      );
+    expect(fs.readFileSync(newStore.recordPath(root), 'utf8')).toBe(
+      beforeAmendAttempt,
+    );
 
     // Successful supersede_external_handoff mutation
     const supersedeRes = newStore.mutate(root, evidenceRes.revision, {

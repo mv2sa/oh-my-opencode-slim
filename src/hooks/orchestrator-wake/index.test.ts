@@ -20,7 +20,9 @@ import {
 } from './index';
 import {
   getWakeProgress,
+  observeWakeLifecycle,
   resetOrchestratorWakeGateForTests,
+  wakeGateSizesForTests,
 } from './wake-gate';
 
 type SessionClient = {
@@ -192,7 +194,7 @@ afterEach(() => {
 });
 
 describe('buildOrchestratorWakeFingerprint', () => {
-  test('includes todo statuses and child status/update evidence', () => {
+  test('includes todo and child activity but excludes timestamp churn', () => {
     const fp = buildOrchestratorWakeFingerprint(
       [
         { id: 'b', status: 'pending' },
@@ -203,11 +205,296 @@ describe('buildOrchestratorWakeFingerprint', () => {
     );
     expect(fp).toContain('a:in_progress');
     expect(fp).toContain('b:pending');
-    expect(fp).toContain('child-1:busy:42');
+    expect(fp).toContain('child-1:active');
+    expect(fp).not.toContain('42');
   });
 });
 
 describe('orchestrator wake scheduler', () => {
+  test('interleaved busy cannot let original idle or its legacy pair close the new run', async () => {
+    const base = {
+      outcomeId: 'o',
+      contractDigest: 'd',
+      phase: 'action_required',
+      contract: { goals: [] },
+      actionsRequired: [],
+      operations: [],
+      receipts: { evidence: [] },
+    };
+    const controller = {
+      readRecord: () => ({ success: true, data: base }),
+      store: {
+        read: () => ({ success: true, data: base }),
+        reconcileIdleOperations: () => ({ success: true, data: base }),
+      },
+      validateManagedWait: () => ({ allowed: false }),
+    } as unknown as OutcomeController;
+    let dispatch: (type: string) => Promise<void>;
+    const promptAsync = mock(async () => {
+      await dispatch('busy');
+      return {};
+    });
+    const session = makeClient({ promptAsync, todos: [] });
+    const hook = createOutcomeControllerHook(
+      { client: { session } },
+      { controller, shouldManageSession: () => true },
+    );
+    const { scheduler } = createScheduler({ sessionClient: session });
+    dispatch = async (type) => {
+      const input = {
+        event: {
+          type: 'session.status',
+          properties: { sessionID: 'root', status: { type } },
+        },
+      };
+      await hook.event(input);
+      await scheduler.event(input);
+    };
+    await dispatch('idle');
+    const legacy = {
+      event: { type: 'session.idle', properties: { sessionID: 'root' } },
+    };
+    await hook.event(legacy);
+    await scheduler.event(legacy);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(getWakeProgress('root').running).toBe(true);
+    await dispatch('idle'); // actual run completion
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    await hook.event({ event: { type: 'server.instance.disposed' } });
+    await scheduler.event({ event: { type: 'server.instance.disposed' } });
+  });
+  test('real Controller-before-scheduler order: alternating wakes and synthetic lifecycle share two attempts', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-integration-'));
+    const root = 'integration-root';
+    const controller = new OutcomeController({ storeDirectory: dir });
+    controller.begin(
+      root,
+      OutcomeContractSchema.parse({
+        classification: 'non_trivial',
+        objective: 'Repair source only',
+        deliverables: ['repair'],
+        goals: [{ id: 'g', description: 'repair', status: 'in_progress' }],
+        inScope: ['src'],
+        outOfScope: [],
+        constraints: [],
+        safetyBoundaries: [],
+        handoffRequirements: ['report checks'],
+        sourceMessageIds: ['initial'],
+        rules: [],
+        exceptions: [],
+      }),
+    );
+    const todos = [{ id: 't1', status: 'pending' }];
+    const promptAsync = mock(async () => ({}));
+    const session = makeClient({ todos, promptAsync });
+    const hook = createOutcomeControllerHook(
+      { directory: dir, client: { session } },
+      {
+        controller,
+        shouldManageSession: () => true,
+      },
+    );
+    const { scheduler } = createScheduler({
+      sessionClient: session,
+      outcomeController: controller,
+    });
+    const event = async (type: string) => {
+      const input = {
+        event: {
+          type: 'session.status',
+          properties: { sessionID: root, status: { type } },
+        },
+      };
+      await hook.event(input);
+      await scheduler.event(input);
+    };
+    try {
+      await event('idle'); // Controller spends first attempt.
+      await hook.event({
+        event: { type: 'session.idle', properties: { sessionID: root } },
+      });
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: root } },
+      });
+      await clock.advance(60_000);
+      expect(promptAsync).toHaveBeenCalledTimes(1); // Paired idle after SDK ack is the same cycle.
+      await event('busy');
+      observeWakeLifecycle(root, 'idle');
+      scheduler.triggerStoppedJobRecovery(root); // scheduler spends second.
+      await clock.advance(0);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      const before = controller.store.read(root);
+      for (let i = 0; i < 5; i++) {
+        await event('busy');
+        await event('retry');
+        await event('idle');
+        const synthetic = {
+          sessionID: root,
+          messageID: `synthetic-${i}`,
+          parts: [
+            { type: 'text', text: 'Stop' },
+            createInternalAgentTextPart('Still stopped'),
+          ],
+        };
+        await hook['chat.message'](synthetic);
+        scheduler.observeChatMessage(synthetic, undefined);
+        scheduler.triggerStoppedJobRecovery(root);
+        await scheduler.event({
+          event: { type: 'session.error', properties: { sessionID: root } },
+        });
+        await clock.advance(60_000);
+      }
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      expect(controller.store.read(root)).toEqual(before);
+      // Manual input refills liveness only, not governance or certification.
+      const manual = {
+        sessionID: root,
+        messageID: 'human-1',
+        parts: [
+          {
+            type: 'text',
+            text: 'Source-only UNCERTIFIED; no outcome_control. Stop.',
+          },
+        ],
+      };
+      await hook['chat.message'](manual);
+      scheduler.observeChatMessage(manual, undefined);
+      await event('idle');
+      await event('busy');
+      await event('idle');
+      await clock.advance(60_000);
+      expect(promptAsync).toHaveBeenCalledTimes(4);
+      await hook['chat.message'](manual);
+      scheduler.observeChatMessage(manual, undefined);
+      await event('busy');
+      await event('idle');
+      await clock.advance(60_000);
+      expect(promptAsync).toHaveBeenCalledTimes(4);
+      const record = controller.store.read(root);
+      expect(record.success && record.data.receipts.userMessages.length).toBe(
+        1,
+      );
+      expect(record.success && record.data.receipts.decisions.length).toBe(0);
+      expect(record.success && record.data.finalCertificate).toBeUndefined();
+      todos[0].status = 'in_progress';
+      await event('idle');
+      await clock.advance(0);
+      expect(promptAsync).toHaveBeenCalledTimes(5);
+      await clock.advance(60_000);
+      await event('busy');
+      await event('idle');
+      expect(promptAsync).toHaveBeenCalledTimes(6);
+      for (let i = 0; i < 300; i++) {
+        const message = {
+          sessionID: root,
+          messageID: `external-${i}`,
+          parts: [{ type: 'text', text: 'manual' }],
+        };
+        // Receipt capacity is independently fail-closed at 32. Exercise wake
+        // admission through both hooks without changing that durable policy.
+        if (i < 31) await hook['chat.message'](message);
+        else
+          await expect(hook['chat.message'](message)).rejects.toThrow(
+            'userMessages',
+          );
+        scheduler.observeChatMessage(message, undefined);
+      }
+      await event('idle');
+      await event('busy');
+      await event('idle');
+      const exhausted = promptAsync.mock.calls.length;
+      const replay = {
+        sessionID: root,
+        messageID: 'external-0',
+        parts: [{ type: 'text', text: 'manual' }],
+      };
+      await hook['chat.message'](replay);
+      scheduler.observeChatMessage(replay, undefined);
+      await event('idle');
+      await clock.advance(60_000);
+      expect(promptAsync).toHaveBeenCalledTimes(exhausted);
+      expect(getWakeProgress(root).unchangedWakeCount).toBe(2);
+    } finally {
+      await scheduler.event({ event: { type: 'server.instance.disposed' } });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('Controller retries once when periodic read owner releases a no-TODO evaluation', async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const base = {
+      outcomeId: 'o',
+      contractDigest: 'd',
+      phase: 'action_required',
+      contract: { goals: [] },
+      actionsRequired: [],
+      operations: [],
+      receipts: { evidence: [] },
+    };
+    const controller = {
+      readRecord: () => ({ success: true, data: base }),
+      store: {
+        read: () => ({ success: true, data: base }),
+        reconcileIdleOperations: () => ({ success: true, data: base }),
+      },
+      validateManagedWait: () => ({ allowed: false }),
+    } as unknown as OutcomeController;
+    const promptAsync = mock(async () => ({}));
+    const session = makeClient({
+      promptAsync,
+      todo: mock(async () => {
+        await blocked;
+        return { data: [] };
+      }),
+    });
+    const { scheduler } = createScheduler({ sessionClient: session });
+    const hook = createOutcomeControllerHook(
+      { client: { session } },
+      { controller, shouldManageSession: () => true },
+    );
+    const idle = {
+      event: { type: 'session.idle', properties: { sessionID: 'root' } },
+    };
+    await scheduler.event(idle);
+    await clock.advance(60_000);
+    await hook.event(idle);
+    await hook.event(idle);
+    expect(promptAsync).not.toHaveBeenCalled();
+    release();
+    await clock.advance(0);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    await hook.event({ event: { type: 'server.instance.disposed' } });
+    await scheduler.event({ event: { type: 'server.instance.disposed' } });
+  });
+
+  test('unknown restart candidates do not allocate process-global state', async () => {
+    const controller = {
+      store: { read: () => ({ success: false, code: 'missing' }) },
+    } as unknown as OutcomeController;
+    const { scheduler } = createScheduler({
+      outcomeController: controller,
+      shouldManageSession: () => false,
+    });
+    for (let i = 0; i < 2000; i++) {
+      await scheduler._test.classifyAndRecoverInterruptedSession(
+        `unknown-${i}`,
+        'event',
+      );
+    }
+    expect(wakeGateSizesForTests()).toEqual({
+      progress: 0,
+      restart: 0,
+      owners: 0,
+      waiters: 0,
+      order: 0,
+      outcomeIdle: 0,
+    });
+    await scheduler.event({ event: { type: 'server.instance.disposed' } });
+  });
+
   test('immediately wakes an idle parent after a stopped child with an active sibling', async () => {
     const promptAsync = mock(async () => ({}));
     const { scheduler } = createScheduler({
@@ -740,7 +1027,7 @@ describe('orchestrator wake scheduler', () => {
     expect(promptAsync).toHaveBeenCalledTimes(ORCHESTRATOR_WAKE_UNCHANGED_CAP);
   });
 
-  test('external busy (not wake-initiated) rearms the no-progress cap', async () => {
+  test('distinct external user rearms the cap after two actual idle cycles', async () => {
     const promptAsync = mock(async () => ({}));
     const { scheduler } = createScheduler({
       intervalMs: 60_000,
@@ -751,6 +1038,15 @@ describe('orchestrator wake scheduler', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'busy' } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
     await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(2);
     expect(getWakeProgress('p1').stopped).toBe(true);
@@ -823,6 +1119,17 @@ describe('orchestrator wake scheduler', () => {
     await clock.advance(1_000);
     expect(calls).toBe(1);
     await clock.advance(59_000);
+    expect(calls).toBe(1);
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'busy' } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
     expect(calls).toBe(2);
   });
 
@@ -1747,6 +2054,8 @@ describe('orchestrator wake scheduler', () => {
       expect(promptAsync).toHaveBeenCalledTimes(1);
 
       // Attempt 2: SDK failure
+      observeWakeLifecycle(root, 'busy');
+      observeWakeLifecycle(root, 'idle');
       res = await scheduler._test.classifyAndRecoverInterruptedSession(
         root,
         'bootstrap',
@@ -1993,8 +2302,16 @@ describe('orchestrator wake scheduler', () => {
         },
       });
       expect(failingOutcomePrompt).toHaveBeenCalledTimes(1);
+      observeWakeLifecycle(root, 'busy');
+      observeWakeLifecycle(root, 'idle');
 
-      const bootstrapPrompt = mock(async () => ({}));
+      let preAwaitEvents: (() => Promise<void>) | undefined;
+      const bootstrapPrompt = mock(async () => {
+        expect(getWakeProgress(root).unchangedWakeCount).toBe(2);
+        expect(getWakeProgress(root).expectingWakeBusy).toBe(true);
+        await preAwaitEvents?.();
+        return {};
+      });
       const { scheduler } = createScheduler({
         sessionClient: makeClient({
           get: mock(async () => ({
@@ -2030,6 +2347,18 @@ describe('orchestrator wake scheduler', () => {
         outcomeController: newCtrl,
         shouldManageSession: () => false,
       });
+      preAwaitEvents = async () => {
+        for (const type of ['busy', 'retry', 'idle', 'idle']) {
+          const event = {
+            event: {
+              type: 'session.status',
+              properties: { sessionID: root, status: { type } },
+            },
+          };
+          await outcomeHook.event(event);
+          await scheduler.event(event);
+        }
+      };
       expect(
         await scheduler._test.classifyAndRecoverInterruptedSession(
           root,
@@ -2037,6 +2366,7 @@ describe('orchestrator wake scheduler', () => {
         ),
       ).toBe(true);
       expect(bootstrapPrompt).toHaveBeenCalledTimes(1);
+      expect(failingOutcomePrompt).toHaveBeenCalledTimes(1);
     });
 
     test('disposal during the second snapshot prevents stale prompt and replacement instance can recover', async () => {

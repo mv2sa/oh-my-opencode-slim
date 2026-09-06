@@ -785,6 +785,189 @@ describe('outcome_control tool', () => {
     });
   });
 
+  test('amend_external_handoff routes exact identity through controller, preserves governance, and completion uses effective check', async () => {
+    const root = 'ses_root';
+    const old = new OutcomeController({
+      storeDirectory: tempDir,
+      serverEpoch: 'old',
+    });
+    expect(old.begin(root, sampleContract()).success).toBe(true);
+    expect(
+      old.externalHandoff(root, {
+        kind: 'restart_current_opencode',
+        instructions: 'Original instructions',
+        expectedPostRestartCheck: 'Original check',
+      }).success,
+    ).toBe(true);
+    let current = new OutcomeController({
+      storeDirectory: tempDir,
+      serverEpoch: 'new',
+    });
+    const turn = current.observeExternalUserTurn(
+      root,
+      'user-amend',
+      'I authorize the new check and candidate',
+    );
+    if (!turn.success) throw new Error(turn.error);
+    const attestation = current.submitEvidence(root, {
+      description: 'New check',
+      assertedStatus: 'passed',
+      assertedFreshness: 'fresh',
+      candidateFingerprint: hash('new-candidate'),
+    });
+    if (!attestation.success) throw new Error(attestation.error);
+    let tool = createOutcomeControlTool({
+      controller: current,
+      shouldManageSession: (id) => id === root,
+    }).outcome_control;
+    const context = { sessionID: root, agent: 'orchestrator' } as never;
+    const status = JSON.parse(
+      String(await tool.execute({ action: 'status' }, context)),
+    );
+    const wait = status.handoff.original;
+    const amendment = {
+      rootSessionId: status.handoff.rootSessionId,
+      outcomeId: status.outcomeId,
+      generation: status.generation,
+      waitReferenceId: wait.referenceId,
+      waitCreatedRevision: wait.createdRevision,
+      waitOriginatingServerEpoch: wait.originatingServerEpoch,
+      waitRestartObservedRevision:
+        status.handoff.currentRestartObservedRevision,
+      expectedPreviousAmendmentHead: status.handoff.amendmentHead,
+      oldEffectiveObligationDigest: status.handoff.obligationDigest,
+      instructions: 'New instructions',
+      expectedPostRestartCheck: 'New check',
+      candidateFingerprint: hash('new-candidate'),
+      reason: 'Explicit semantic consent checked by orchestrator',
+      sourceUserMessageReceiptId: status.handoff.userReceipts.at(-1).id,
+      evidenceAttestationId: status.handoff.evidenceReceipts.at(-1).id,
+    };
+    await expect(
+      tool.execute({ action: 'amend_external_handoff' }, context),
+    ).rejects.toThrow('requires amendment');
+    await expect(
+      tool.execute({ action: 'amend_external_handoff', amendment }, {
+        sessionID: root,
+        agent: 'fixer',
+      } as never),
+    ).rejects.toThrow('only be used by orchestrator');
+    const output = JSON.parse(
+      String(
+        await tool.execute(
+          { action: 'amend_external_handoff', amendment },
+          context,
+        ),
+      ),
+    );
+    expect(output.noop).toBe(false);
+    expect(output.handoff.original).toEqual(wait);
+    expect(output.phase).toBe(status.phase);
+    expect(output.record).toBeUndefined();
+    expect(JSON.stringify(output)).not.toContain('claimToken');
+    expect(
+      JSON.parse(
+        String(
+          await tool.execute(
+            { action: 'amend_external_handoff', amendment },
+            context,
+          ),
+        ),
+      ).noop,
+    ).toBe(true);
+    await expect(
+      tool.execute(
+        {
+          action: 'amend_external_handoff',
+          amendment: { ...amendment, candidateFingerprint: hash('wrong') },
+        },
+        context,
+      ),
+    ).rejects.toThrow('replay changed');
+    current = new OutcomeController({
+      storeDirectory: tempDir,
+      serverEpoch: 'third',
+    });
+    expect(
+      current.observeExternalUserTurn(
+        root,
+        'user-second-amend',
+        'Authorize another amendment and explicit completion',
+      ).success,
+    ).toBe(true);
+    tool = createOutcomeControlTool({
+      controller: current,
+      shouldManageSession: (id) => id === root,
+    }).outcome_control;
+    await tool.execute(
+      {
+        action: 'submit_evidence',
+        description: 'Second check',
+        assertedStatus: 'passed',
+        assertedFreshness: 'fresh',
+        candidateFingerprint: hash('second-candidate'),
+      },
+      context,
+    );
+    const second = JSON.parse(
+      String(await tool.execute({ action: 'status' }, context)),
+    );
+    expect(second.handoff.effective.instructions).toBe('New instructions');
+    expect(second.handoff.currentRestartObservedRevision).toBeGreaterThan(
+      status.handoff.currentRestartObservedRevision,
+    );
+    expect(second.handoff.userReceipts.at(-1).provenance).toBe('external_user');
+    const secondAmendment = {
+      ...amendment,
+      rootSessionId: second.handoff.rootSessionId,
+      outcomeId: second.outcomeId,
+      generation: second.generation,
+      waitReferenceId: second.handoff.original.referenceId,
+      waitCreatedRevision: second.handoff.original.createdRevision,
+      waitOriginatingServerEpoch:
+        second.handoff.original.originatingServerEpoch,
+      waitRestartObservedRevision:
+        second.handoff.currentRestartObservedRevision,
+      expectedPreviousAmendmentHead: second.handoff.amendmentHead,
+      oldEffectiveObligationDigest: second.handoff.obligationDigest,
+      instructions: 'Second instructions',
+      expectedPostRestartCheck: 'Second check',
+      candidateFingerprint: hash('second-candidate'),
+      sourceUserMessageReceiptId: second.handoff.userReceipts.at(-1).id,
+      evidenceAttestationId: second.handoff.evidenceReceipts.at(-1).id,
+    };
+    const amendedAgain = JSON.parse(
+      String(
+        await tool.execute(
+          { action: 'amend_external_handoff', amendment: secondAmendment },
+          context,
+        ),
+      ),
+    );
+    expect(amendedAgain.handoff.effective.instructions).toBe(
+      'Second instructions',
+    );
+    const completionTurn = current.observeExternalUserTurn(
+      root,
+      'user-complete',
+      'Complete the amended handoff',
+    );
+    if (!completionTurn.success) throw new Error(completionTurn.error);
+    const verification = current.submitEvidence(root, {
+      description: 'Second check',
+      assertedStatus: 'passed',
+      assertedFreshness: 'fresh',
+      candidateFingerprint: hash('second-candidate'),
+    });
+    if (!verification.success) throw new Error(verification.error);
+    expect(
+      current.completeExternalHandoff(root, {
+        sourceUserMessageReceiptId: completionTurn.data.receipt.id,
+        evidenceAttestationId: verification.data.attestationId,
+      }).success,
+    ).toBe(true);
+  });
+
   describe('supersede_external_handoff tool action', () => {
     test('strictly validates inputs and awaits controller.supersedeExternalHandoff', async () => {
       const root = 'ses_root';

@@ -3,51 +3,45 @@ import type { OutcomeController } from '../../outcome/controller';
 import { canonicalDigest } from '../../outcome/controller-schema';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import { isRecord } from '../../utils/guards';
-import {
-  createInternalAgentTextPart,
-  INTERNAL_INITIATOR_METADATA_KEY,
-  isInternalInitiatorPart,
-} from '../../utils/internal-initiator';
+import { createInternalAgentTextPart } from '../../utils/internal-initiator';
 import { parseTaskIdFromTaskOutput } from '../../utils/task';
 import {
   appendTrailingVolatileMessage,
   stripTaggedContent,
 } from '../cache-safe-injection';
+import { externalMessage } from '../external-message';
 import {
+  admitWakeSession,
+  allowRecoveryNarration,
   canReserveOutcomeIdleWake,
-  clearOutcomeIdleWake,
+  clearExpectingWakeBusy,
   commitOutcomeIdleWake,
+  isWakeRunning,
+  noteExternalWakeMessage,
+  noteHostProgress,
+  observeWakeEvent,
+  releaseWakeEvaluation,
+  retryAfterWakeEvaluation,
+  tryBeginWakeEvaluation,
 } from '../orchestrator-wake/wake-gate';
+
+export { isInternalOrSyntheticPart } from '../external-message';
+
 import {
   isMessageWithParts,
   type MessageInfo,
   type MessageWithParts,
 } from '../types';
+import {
+  completedNarrationTurn,
+  controllerProgressFingerprint,
+  INTERNAL_CONTROLLER_NOTICE_LABEL,
+} from './notice-state';
 
 export const OUTCOME_CONTROLLER_METADATA_KEY =
   'oh-my-opencode-slim:outcome-controller';
 
-export const OUTCOME_CONTROLLER_WAKE_TEXT =
-  'Action required on outcome protocol. Check outcome_control status or pending checkpoint instructions.';
-
-function hasInternalMetadata(metadata: unknown): boolean {
-  if (!isRecord(metadata)) return false;
-  return (
-    metadata[INTERNAL_INITIATOR_METADATA_KEY] === true ||
-    metadata.compaction_continue === true ||
-    metadata[OUTCOME_CONTROLLER_METADATA_KEY] === true ||
-    metadata['oh-my-opencode-slim.backgroundJobBoard'] === true
-  );
-}
-
-export function isInternalOrSyntheticPart(part: unknown): boolean {
-  if (!isRecord(part)) return false;
-  if (part.synthetic === true) return true;
-  if (isInternalInitiatorPart(part)) return true;
-  if (hasInternalMetadata(part.metadata)) return true;
-  if (hasInternalMetadata(part.providerMetadata)) return true;
-  return false;
-}
+export const OUTCOME_CONTROLLER_WAKE_TEXT = `${INTERNAL_CONTROLLER_NOTICE_LABEL}\nAction required on outcome protocol. Check outcome_control status or pending checkpoint instructions only if permitted by the user.`;
 
 const EXTERNAL_HANDOFF_ERROR =
   "Managed orchestrators cannot directly restart the current OpenCode process. Call outcome_control(action='external_handoff', handoffKind='restart_current_opencode', ...) and give the user restart instructions instead.";
@@ -239,7 +233,17 @@ export function createOutcomeControllerHook(
     options.resolveAgentName ?? ((agent: string) => agent);
 
   const pendingToolCalls = new Map<string, PendingToolCall>();
-  const idleWokenSessions = new Set<string>();
+  let disposed = false;
+  const sessionClient = (
+    ctx as {
+      client?: {
+        session?: {
+          promptAsync?: (req: unknown) => Promise<unknown>;
+          messages?: (req: unknown) => Promise<{ data?: unknown }>;
+        };
+      };
+    }
+  )?.client?.session;
 
   const failReservedManagerDispatch = (
     reservation: OutcomeManagerDispatchReservation,
@@ -262,7 +266,8 @@ export function createOutcomeControllerHook(
     }
   };
 
-  return {
+  const pendingIdleRetries = new Map<string, () => void>();
+  const hook = {
     reserveManagerDispatch: (
       input: {
         tool: string;
@@ -323,6 +328,8 @@ export function createOutcomeControllerHook(
         return;
       }
 
+      if (disposed) return;
+
       const nudge = controller.getPendingNudge(sessionID);
       if (!nudge) {
         return;
@@ -350,8 +357,38 @@ export function createOutcomeControllerHook(
       const text =
         nudge.kind === 'dispatch' ? nudge.instruction : nudge.message;
 
+      if (nudge.kind === 'recovery') {
+        if (!admitWakeSession(sessionID)) return;
+        const record = controller.store.read(sessionID);
+        if (record.success) {
+          const cause = controllerProgressFingerprint(record.data);
+          noteHostProgress(sessionID, cause, 'controller');
+          let turnID: string | undefined;
+          try {
+            const snapshot = await sessionClient?.messages?.({
+              path: { id: sessionID },
+              query: {
+                directory: (ctx as { directory?: string }).directory ?? '',
+              },
+              throwOnError: true,
+            });
+            turnID = completedNarrationTurn(snapshot?.data, sessionID);
+          } catch {
+            /* Missing host telemetry is not proof of delivery. */
+          }
+          const current = controller.store.read(sessionID);
+          if (
+            !current.success ||
+            controllerProgressFingerprint(current.data) !== cause
+          )
+            return;
+          if (!allowRecoveryNarration(sessionID, cause, turnID)) return;
+        }
+      }
+      if (disposed) return;
+
       appendTrailingVolatileMessage(messages, info, {
-        text,
+        text: `${INTERNAL_CONTROLLER_NOTICE_LABEL}\n${text}`,
         metadataKey: OUTCOME_CONTROLLER_METADATA_KEY,
       });
     },
@@ -585,30 +622,9 @@ export function createOutcomeControllerHook(
       const sessionID = input.sessionID;
       if (!sessionID || !shouldManageSession(sessionID)) return;
 
-      const messageID = input.messageID?.trim()
-        ? input.messageID.trim()
-        : output?.message?.id?.trim()
-          ? output.message.id.trim()
-          : undefined;
-      if (!messageID) return;
-
-      // An explicitly supplied output.parts array is authoritative even when
-      // empty. Never fall back to dirtier input parts after a host transform
-      // removed content.
-      const rawParts = Array.isArray(output?.parts)
-        ? output.parts
-        : Array.isArray(input.parts)
-          ? input.parts
-          : [];
-
-      if (rawParts.length === 0) return;
-
-      // Reject entire message if any authoritative part is synthetic, internal initiator, or compaction continuation
-      for (const part of rawParts) {
-        if (isInternalOrSyntheticPart(part)) {
-          return;
-        }
-      }
+      const external = externalMessage(input, output);
+      if (!external) return;
+      const { messageID, parts: rawParts } = external;
 
       const textParts: string[] = [];
       for (const part of rawParts) {
@@ -630,7 +646,7 @@ export function createOutcomeControllerHook(
         fullText = `[attachments:${canonicalDigest('omos/external-part/v1', normalized)}]`;
       }
 
-      idleWokenSessions.delete(sessionID);
+      noteExternalWakeMessage(sessionID, messageID);
       const observed = controller.observeExternalUserTurn(
         sessionID,
         messageID,
@@ -659,14 +675,28 @@ export function createOutcomeControllerHook(
     }): Promise<void> => {
       const event = input.event;
       if (event.type === 'server.instance.disposed') {
+        disposed = true;
         pendingToolCalls.clear();
-        idleWokenSessions.clear();
+        for (const cancel of pendingIdleRetries.values()) cancel();
+        pendingIdleRetries.clear();
         return;
       }
+      if (disposed) return;
 
       const eventSessionID =
         event.properties?.info?.id || event.properties?.sessionID;
       const statusType = event.properties?.status?.type;
+      if (eventSessionID) {
+        observeWakeEvent(eventSessionID, event);
+        if (
+          event.type === 'session.deleted' ||
+          statusType === 'busy' ||
+          statusType === 'retry'
+        ) {
+          pendingIdleRetries.get(eventSessionID)?.();
+          pendingIdleRetries.delete(eventSessionID);
+        }
+      }
 
       if (
         eventSessionID &&
@@ -674,6 +704,7 @@ export function createOutcomeControllerHook(
           (event.type === 'session.status' && statusType === 'idle'))
       ) {
         if (!shouldManageSession(eventSessionID)) return;
+        if (isWakeRunning(eventSessionID)) return;
 
         const readResult = controller.readRecord(eventSessionID);
         if (!readResult.success) {
@@ -684,6 +715,8 @@ export function createOutcomeControllerHook(
         }
         const record = readResult.data;
         if (record.phase === 'accepted') return;
+        if (!admitWakeSession(eventSessionID)) return;
+        observeWakeEvent(eventSessionID, event);
 
         // Valid waits suppress idle continuation
         if (controller.validateManagedWait(eventSessionID).allowed) {
@@ -703,6 +736,11 @@ export function createOutcomeControllerHook(
           );
         }
         const updatedRecord = reconcileRes.data;
+        noteHostProgress(
+          eventSessionID,
+          controllerProgressFingerprint(updatedRecord),
+          'controller',
+        );
 
         const hasTerminalUnreconciledChildren =
           backgroundJobBoard?.hasTerminalUnreconciled?.(eventSessionID) ??
@@ -710,11 +748,10 @@ export function createOutcomeControllerHook(
 
         // Send one-flight promptAsync if actionable
         if (
-          (updatedRecord.phase === 'action_required' ||
-            updatedRecord.checkpoint?.state === 'claimed' ||
-            updatedRecord.checkpoint?.state === 'review_uncertain' ||
-            hasTerminalUnreconciledChildren) &&
-          !idleWokenSessions.has(eventSessionID)
+          updatedRecord.phase === 'action_required' ||
+          updatedRecord.checkpoint?.state === 'claimed' ||
+          updatedRecord.checkpoint?.state === 'review_uncertain' ||
+          hasTerminalUnreconciledChildren
         ) {
           const client = (
             ctx as {
@@ -727,9 +764,41 @@ export function createOutcomeControllerHook(
             if (!canReserveOutcomeIdleWake(eventSessionID)) {
               return;
             }
-            idleWokenSessions.add(eventSessionID);
-            commitOutcomeIdleWake(eventSessionID);
+            const owner = tryBeginWakeEvaluation(eventSessionID);
+            if (!owner) {
+              if (!pendingIdleRetries.has(eventSessionID)) {
+                const cancel = retryAfterWakeEvaluation(
+                  eventSessionID,
+                  () => {
+                    pendingIdleRetries.delete(eventSessionID);
+                    if (
+                      !disposed &&
+                      shouldManageSession(eventSessionID) &&
+                      canReserveOutcomeIdleWake(eventSessionID)
+                    ) {
+                      void hook.event(input).catch(() => {
+                        /* Event retry is best effort. */
+                      });
+                    }
+                  },
+                  'controller',
+                  () => pendingIdleRetries.delete(eventSessionID),
+                );
+                pendingIdleRetries.set(eventSessionID, cancel);
+              }
+              return;
+            }
             try {
+              const finalRecord = controller.store.read(eventSessionID);
+              if (
+                !finalRecord.success ||
+                finalRecord.data.phase === 'accepted' ||
+                controller.validateManagedWait(eventSessionID).allowed ||
+                backgroundJobBoard?.hasRunning?.(eventSessionID) ||
+                disposed
+              )
+                return;
+              if (!commitOutcomeIdleWake(eventSessionID, owner)) return;
               await client.session.promptAsync({
                 path: { id: eventSessionID },
                 query: {
@@ -744,19 +813,15 @@ export function createOutcomeControllerHook(
                 throwOnError: true,
               });
             } catch {
-              idleWokenSessions.delete(eventSessionID);
-              clearOutcomeIdleWake(eventSessionID);
+              // A transport failure is still a spent attempt.
+              clearExpectingWakeBusy(eventSessionID);
+            } finally {
+              releaseWakeEvaluation(eventSessionID, owner);
             }
           }
         }
-      } else if (
-        eventSessionID &&
-        event.type === 'session.status' &&
-        (statusType === 'busy' || statusType === 'retry')
-      ) {
-        idleWokenSessions.delete(eventSessionID);
-        clearOutcomeIdleWake(eventSessionID);
       }
     },
   };
+  return hook;
 }

@@ -30,6 +30,10 @@ import {
   type OutcomeDecisionReceipt,
   type OutcomeEvidenceEntry,
   type OutcomeFinalCertificate,
+  type OutcomeHandoffAmendment,
+  type OutcomeHandoffAmendmentRequest,
+  OutcomeHandoffAmendmentRequestSchema,
+  type OutcomeHandoffCompletion,
   type OutcomeHandoffSupersessionReceipt,
   type OutcomeKickoffGate,
   type OutcomeManagerReviewSummary,
@@ -50,6 +54,18 @@ import {
   serializeOutcomeRecord,
   validateVerdictForCheckpointKind,
 } from './controller-schema';
+import {
+  amendedHandoffBinding,
+  amendmentAuthorizesCompletion,
+  amendmentDigest,
+  assertAmendedFinalReview,
+  completionDigest,
+  effectiveHandoff,
+  handoffEvidenceDigest,
+  handoffSourceDigest,
+  obligationDigest,
+  stableHandoffWait,
+} from './handoff-amendments';
 import { getProcessEpoch } from './process-epoch';
 import {
   type OutcomeReview,
@@ -127,6 +143,7 @@ interface OutcomeStoreOptions {
 }
 
 export type OutcomeRecordMutation =
+  | { type: 'amend_external_handoff'; request: OutcomeHandoffAmendmentRequest }
   | {
       type: 'revise_contract';
       contract: OutcomeContract;
@@ -1897,6 +1914,37 @@ export class OutcomeStore {
             ),
           );
         }
+      } else if (mutation.type === 'amend_external_handoff') {
+        const request = mutation.request;
+        const existing = current.receipts.handoffAmendments?.find(
+          (entry) =>
+            entry.request.sourceUserMessageReceiptId ===
+              request.sourceUserMessageReceiptId &&
+            entry.request.waitReferenceId === request.waitReferenceId &&
+            entry.request.waitCreatedRevision === request.waitCreatedRevision &&
+            entry.request.waitOriginatingServerEpoch ===
+              request.waitOriginatingServerEpoch,
+        );
+        if (existing) {
+          if (
+            handoffSourceDigest(existing.request) ===
+            handoffSourceDigest(request)
+          ) {
+            return {
+              success: true,
+              data: current,
+              revision: current.revision,
+              status: 'noop',
+            };
+          }
+          return failure(
+            new OutcomeStoreError(
+              'invalid_transition',
+              'Amendment source/wait replay changed',
+              { rootSessionId: session },
+            ),
+          );
+        }
       } else if (mutation.type === 'retire_misbound_recovered_result') {
         const claim = current.checkpoint;
         if (
@@ -3202,6 +3250,10 @@ function applyMutation(
         includedDecisionIds: mutation.decisionIds ?? [],
         includedExceptionRuleIds: mutation.exceptionRuleIds ?? [],
         includedEvidenceAttestationIds: mutation.evidenceAttestationIds ?? [],
+        ...(mutation.kind === 'final' &&
+        current.receipts.handoffAmendments?.length
+          ? { amendedHandoff: amendedHandoffBinding(current) }
+          : {}),
       };
       next.checkpoint = {
         ...base,
@@ -3490,6 +3542,87 @@ function applyMutation(
       delete next.waitCondition;
       next.phase = 'active';
       break;
+    case 'amend_external_handoff': {
+      const request = OutcomeHandoffAmendmentRequestSchema.parse(
+        mutation.request,
+      );
+      // Reject normalized-but-not-exact inputs, including direct-store callers.
+      if (
+        handoffSourceDigest(request) !== handoffSourceDigest(mutation.request)
+      )
+        throw new Error('Amendment request must use canonical exact fields');
+      const wait = current.waitCondition;
+      if (
+        request.rootSessionId !== current.rootSessionId ||
+        request.outcomeId !== current.outcomeId ||
+        request.generation !== (current.generation ?? 1)
+      )
+        throw new Error('Amendment outcome identity mismatch');
+      if (
+        !wait ||
+        wait.kind !== 'external_handoff' ||
+        wait.referenceId !== request.waitReferenceId ||
+        wait.createdRevision !== request.waitCreatedRevision ||
+        wait.originatingServerEpoch !== request.waitOriginatingServerEpoch ||
+        wait.restartObservedRevision !== request.waitRestartObservedRevision ||
+        current.serverEpoch !== epoch ||
+        wait.originatingServerEpoch === epoch
+      )
+        throw new Error('Amendment wait/restart identity mismatch');
+      const claim = current.checkpoint;
+      if (claim?.kind === 'final' && !isReviewed(claim.state))
+        throw new Error(
+          'Unsettled final checkpoint must be reconciled before amendment',
+        );
+      if (
+        claim?.kind === 'final' &&
+        claim.state === 'retired' &&
+        claim.recoveryNote &&
+        parseMisboundRetirementNote(claim.recoveryNote)
+      )
+        throw new Error(
+          'Retired misbound final handoffs require supersede_external_handoff',
+        );
+      const effective = effectiveHandoff(current, wait);
+      if (
+        effective.head !== request.expectedPreviousAmendmentHead ||
+        obligationDigest(effective.obligation) !==
+          request.oldEffectiveObligationDigest
+      )
+        throw new Error('Amendment previous head/obligation mismatch');
+      const user = current.receipts.userMessages.find(
+        (entry) => entry.id === request.sourceUserMessageReceiptId,
+      );
+      const evidence = current.receipts.evidence.find(
+        (entry) => entry.id === request.evidenceAttestationId,
+      );
+      if (!user || evidence?.kind !== 'orchestrator_attestation')
+        throw new Error('Amendment provenance missing');
+      const entry: OutcomeHandoffAmendment = {
+        request,
+        originalWait: stableHandoffWait(wait),
+        oldObligation: effective.obligation,
+        newObligation: {
+          instructions: request.instructions,
+          expectedPostRestartCheck: request.expectedPostRestartCheck,
+          candidateFingerprint: request.candidateFingerprint,
+        },
+        sourceReceiptDigest: handoffSourceDigest(user),
+        evidenceDigest: handoffEvidenceDigest(evidence),
+        amendedRevision: revision,
+        amendedAt: now,
+        serverEpoch: epoch,
+        payloadDigest: '',
+      };
+      entry.payloadDigest = amendmentDigest(entry);
+      next.receipts.handoffAmendments = [
+        ...(next.receipts.handoffAmendments ?? []),
+        entry,
+      ];
+      // Full provenance/chain/capacity validation is also run by persistence.
+      // Deliberately preserve governance phase, checkpoint, contract and wait.
+      return { ...next, revision, updatedAt: now, serverEpoch: epoch };
+    }
     case 'complete_external_handoff': {
       if (!next.waitCondition) {
         throw new Error('No wait condition to complete');
@@ -3498,6 +3631,7 @@ function applyMutation(
         throw new Error('Wait condition is not an external handoff');
       }
       const wait = next.waitCondition;
+      const effective = effectiveHandoff(next, wait);
       if (wait.referenceId !== mutation.waitReferenceId) {
         throw new Error('Wait reference ID mismatch');
       }
@@ -3512,7 +3646,10 @@ function applyMutation(
       ) {
         throw new Error('Wait restart observed revision mismatch');
       }
-      if (wait.expectedPostRestartCheck !== mutation.expectedPostRestartCheck) {
+      if (
+        (effective.obligation.expectedPostRestartCheck ?? undefined) !==
+        mutation.expectedPostRestartCheck
+      ) {
         throw new Error('Wait expected post restart check mismatch');
       }
       if (wait.originatingServerEpoch === epoch) {
@@ -3551,14 +3688,45 @@ function applyMutation(
         evidence.createdRevision > revision ||
         evidence.assertedStatus !== 'passed' ||
         evidence.assertedFreshness !== 'fresh' ||
-        (wait.expectedPostRestartCheck &&
-          evidence.description !== wait.expectedPostRestartCheck)
+        (effective.obligation.expectedPostRestartCheck &&
+          evidence.description !==
+            effective.obligation.expectedPostRestartCheck) ||
+        (effective.latest &&
+          (evidence.candidateFingerprint !==
+            effective.obligation.candidateFingerprint ||
+            (userReceipt.createdRevision <= effective.latest.amendedRevision &&
+              !amendmentAuthorizesCompletion(
+                effective.latest,
+                epoch,
+                wait.restartObservedRevision,
+                userReceipt.id,
+                evidence.id,
+              ))))
       ) {
         throw new Error(
           'External handoff completion requires matching fresh passed post-restart evidence',
         );
       }
 
+      if (effective.latest) {
+        const completion: OutcomeHandoffCompletion = {
+          amendmentHead: effective.latest.payloadDigest,
+          sourceUserMessageReceiptId: userReceipt.id,
+          sourceReceiptDigest: handoffSourceDigest(userReceipt),
+          evidenceAttestationId: evidence.id,
+          evidenceDigest: handoffEvidenceDigest(evidence),
+          restartObservedRevision: wait.restartObservedRevision,
+          completedRevision: revision,
+          completedAt: now,
+          serverEpoch: epoch,
+          payloadDigest: '',
+        };
+        completion.payloadDigest = completionDigest(completion);
+        next.receipts.handoffCompletions = [
+          ...(next.receipts.handoffCompletions ?? []),
+          completion,
+        ];
+      }
       delete next.waitCondition;
       next.phase = 'active';
       break;
@@ -4038,6 +4206,9 @@ function applyMutation(
           acceptedCheckpointId: claim.checkpointId,
           acceptedClaimGeneration: claim.claimGeneration,
           finalCheckpointFingerprint: claim.checkpointFingerprint,
+          ...(claim.amendedHandoff
+            ? { amendedHandoff: claim.amendedHandoff }
+            : {}),
           managerTaskId: claim.managerTaskId as string,
           managerGeneration: claim.managerGeneration as number,
           managerReviewId: review.reviewId,
@@ -4385,6 +4556,7 @@ function derivePhase(record: OutcomeRecord): OutcomeRecord['phase'] {
 }
 
 function assertFinalizable(record: OutcomeRecord): void {
+  assertAmendedFinalReview(record);
   const claim = record.checkpoint;
   if (
     claim?.kind !== 'final' ||

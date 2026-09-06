@@ -13,6 +13,7 @@ import {
   OutcomeContractSchema,
   type OutcomeEvidenceAttestation,
   type OutcomeFinalCertificate,
+  type OutcomeHandoffAmendmentRequest,
   type OutcomeKickoffGateState,
   type OutcomeManagerReviewSummary,
   type OutcomePendingIntake,
@@ -23,6 +24,7 @@ import {
   type OutcomeToolObservation,
   type OutcomeUserMessageReceipt,
 } from './controller-schema';
+import { effectiveHandoff, projectHandoff } from './handoff-amendments';
 import { safeParseOutcomeReview } from './parser';
 import { getProcessEpoch } from './process-epoch';
 import type {
@@ -325,6 +327,17 @@ export function buildOutcomeReviewPacket(
     }
   }
 
+  if (checkpoint.amendedHandoff) {
+    lines.push(
+      '',
+      '## Bound Amended Handoff (Manager must evaluate this effective obligation)',
+      'This final snapshot binds the following instructions, check, candidate, amendment head and completion digest. ACCEPT must evaluate this obligation, not the original wait. Do not add these fields to the review envelope.',
+      '```json',
+      JSON.stringify(checkpoint.amendedHandoff, null, 2),
+      '```',
+    );
+  }
+
   lines.push(
     '',
     '## Exact Controller-Authenticated Review Values (Manager MUST copy exactly)',
@@ -385,6 +398,7 @@ export interface OutcomeStatusProjection {
     candidateFingerprint?: string;
   };
   waitCondition?: OutcomeRecord['waitCondition'];
+  handoff?: ReturnType<typeof projectHandoff>;
   actionsRequired: OutcomeActionRequired[];
   activeOperations: {
     id: string;
@@ -795,6 +809,7 @@ export class OutcomeController {
           }
         : undefined,
       waitCondition: record.waitCondition,
+      handoff: projectHandoff(record),
       actionsRequired: record.actionsRequired.filter(
         (a) => a.resolvedAt === undefined,
       ),
@@ -2198,6 +2213,40 @@ export class OutcomeController {
       : { success: false, error: result.error.message, code: result.code };
   }
 
+  amendExternalHandoff(
+    rootSessionId: string,
+    request: OutcomeHandoffAmendmentRequest,
+  ): OutcomeControllerResult<{
+    revision: number;
+    phase: OutcomePhase;
+    handoff: ReturnType<typeof projectHandoff>;
+    noop: boolean;
+  }> {
+    const current = this.readRecord(rootSessionId);
+    if (!current.success) {
+      return {
+        success: false,
+        error: current.error.message,
+        code: current.code,
+      };
+    }
+    const result = this.#store.mutate(rootSessionId, current.revision, {
+      type: 'amend_external_handoff',
+      request,
+    });
+    return result.success
+      ? {
+          success: true,
+          data: {
+            revision: result.data.revision,
+            phase: result.data.phase,
+            handoff: projectHandoff(result.data),
+            noop: result.status === 'noop',
+          },
+        }
+      : { success: false, error: result.error.message, code: result.code };
+  }
+
   completeExternalHandoff(
     rootSessionId: string,
     params: {
@@ -2230,6 +2279,7 @@ export class OutcomeController {
       (entry) => entry.id === params.sourceUserMessageReceiptId,
     );
     const restartRevision = wait.restartObservedRevision;
+    const effective = effectiveHandoff(record, wait);
     if (
       !userReceipt ||
       userReceipt.createdRevision <= restartRevision ||
@@ -2248,8 +2298,8 @@ export class OutcomeController {
       evidence.createdRevision <= restartRevision ||
       evidence.assertedStatus !== 'passed' ||
       evidence.assertedFreshness !== 'fresh' ||
-      (wait.expectedPostRestartCheck &&
-        evidence.description !== wait.expectedPostRestartCheck)
+      (effective.obligation.expectedPostRestartCheck &&
+        evidence.description !== effective.obligation.expectedPostRestartCheck)
     ) {
       return {
         success: false,
@@ -2263,7 +2313,8 @@ export class OutcomeController {
       waitCreatedRevision: wait.createdRevision,
       waitOriginatingServerEpoch: wait.originatingServerEpoch,
       waitRestartObservedRevision: wait.restartObservedRevision,
-      expectedPostRestartCheck: wait.expectedPostRestartCheck,
+      expectedPostRestartCheck:
+        effective.obligation.expectedPostRestartCheck ?? undefined,
       sourceUserMessageReceiptId: params.sourceUserMessageReceiptId,
       evidenceAttestationId: params.evidenceAttestationId,
     });

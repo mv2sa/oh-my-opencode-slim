@@ -12,12 +12,10 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { OutcomeController } from '../../outcome/controller';
 import { canonicalDigest } from '../../outcome/controller-schema';
-import {
-  createInternalAgentTextPart,
-  isInternalInitiatorPart,
-} from '../../utils';
+import { createInternalAgentTextPart } from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
+import { externalMessage } from '../external-message';
 import type { SessionLifecycle } from '../session-lifecycle';
 import {
   type ContinuationModelSelection,
@@ -26,19 +24,21 @@ import {
 import { isActiveStatus } from '../task-session-manager/status-utils';
 import { isMessageWithParts } from '../types';
 import {
+  admitWakeSession,
   canAttemptRestartRecovery,
   clearExpectingWakeBusy,
   clearWakeSession,
   commitRestartRecoverySuccess,
   commitWakeReservation,
   getObservedWakeModel,
-  getRestartRecoveryState,
   getWakeProgress,
-  isExpectingWakeBusy,
+  isWakeRunning,
+  noteExternalWakeMessage,
   noteHostProgress,
-  rearmWakeProgress,
+  observeWakeEvent,
   recordRestartRecoveryFailure,
   releaseRestartRecovery,
+  releaseUncommittedWakeEvaluation,
   releaseWakeEvaluation,
   retryAfterWakeEvaluation,
   setObservedWakeModel,
@@ -55,7 +55,7 @@ export const ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT =
 export const ORCHESTRATOR_RESTART_RECOVERY_TEXT =
   '<system-reminder>\nThe previous OpenCode process was restarted while a foreground tool was running. That operation was interrupted and must not be blindly re-executed. Inspect authoritative local and background state (via outcome_control, task_status, or git/filesystem checks) to determine whether the operation completed or needs targeted recovery before proceeding. Do not respond to this reminder.\n</system-reminder>';
 
-/** After this many successful wakes with an unchanged fingerprint, stop. */
+/** All automatic prompt attempts, including transport errors, share this cap. */
 export const ORCHESTRATOR_WAKE_UNCHANGED_CAP = 2;
 
 const SUPPORTED_TODO_STATUSES = new Set([
@@ -169,32 +169,14 @@ function todoFingerprint(todos: Array<Record<string, unknown>>): string {
     .join('\n');
 }
 
-function childUpdateEvidence(child: Record<string, unknown>): string {
-  const time = isObjectRecord(child.time) ? child.time : undefined;
-  const candidates = [
-    time?.updated,
-    time?.completed,
-    child.updatedAt,
-    child.updated,
-    time?.created,
-    child.createdAt,
-  ];
-  for (const value of candidates) {
-    if (typeof value === 'number' || typeof value === 'string') {
-      return String(value);
-    }
-  }
-  return '';
-}
-
 function childStatusEvidence(
   childID: string,
   status: Record<string, unknown>,
 ): string {
-  if (!Object.hasOwn(status, childID)) return 'absent';
+  if (!Object.hasOwn(status, childID)) return 'idle';
   const entry = status[childID];
   if (!isObjectRecord(entry)) return 'malformed';
-  return typeof entry.type === 'string' ? entry.type : 'active';
+  return entry.type === 'idle' ? 'idle' : 'active';
 }
 
 function childrenFingerprint(
@@ -204,7 +186,7 @@ function childrenFingerprint(
   return children
     .map((child) => {
       const id = String(child.id);
-      return `${id}:${childStatusEvidence(id, status)}:${childUpdateEvidence(child)}`;
+      return `${id}:${childStatusEvidence(id, status)}`;
     })
     .sort()
     .join('\n');
@@ -292,13 +274,12 @@ export function createOrchestratorWakeScheduler(
 
     const controller = options.outcomeController;
 
-    getRestartRecoveryState(sessionID);
-
     // 1. Raw prior-epoch Outcome store read (or an exact already-recovered
     // interrupted operation when a previous classification lost a host race).
     const rawRes = controller.store.read(sessionID);
     if (!rawRes.success) return false; // corrupt or missing records rejected
     const rawRecord = rawRes.data;
+    if (!admitWakeSession(sessionID)) return false;
 
     // Reject accepted outcomes
     if (rawRecord.phase === 'accepted') return false;
@@ -714,7 +695,11 @@ export function createOrchestratorWakeScheduler(
       if (disposed) return false;
 
       const finalDurable = controller.store.read(sessionID);
-      if (!finalDurable.success || finalDurable.data.waitCondition)
+      if (
+        !finalDurable.success ||
+        finalDurable.data.waitCondition ||
+        finalDurable.data.phase === 'accepted'
+      )
         return false;
       const finalOperation = finalDurable.data.operations.find(
         (operation) => operation.id === priorRunningOp.id,
@@ -738,6 +723,14 @@ export function createOrchestratorWakeScheduler(
         parseContinuationModelSelection(sessionData.model) ??
         getObservedWakeModel(sessionID);
 
+      if (
+        !commitWakeReservation(
+          sessionID,
+          owner,
+          buildOrchestratorWakeFingerprint(todos2, children2, finalStatus.data),
+        )
+      )
+        return false;
       try {
         await sessionSdk.promptAsync({
           path: { id: sessionID },
@@ -903,32 +896,27 @@ export function createOrchestratorWakeScheduler(
     clearTimer(state);
     bumpGeneration(state);
     state.continuousIdle = false;
-    releaseLocalWakeOwner(sessionID);
   }
 
   /**
-   * End a continuous idle spell. When `rearmProgress` is true, reset the
-   * process-global no-progress cap (external busy / lifecycle). Wake-initiated
-   * busy must pass false so the two-wake cap survives busy→idle.
+   * Lifecycle activity invalidates local work, never progress or live ownership.
    */
-  function endIdleSpell(sessionID: string, rearmProgress: boolean): void {
+  function endIdleSpell(sessionID: string, _rearmProgress: boolean): void {
     const state = localSessions.get(sessionID);
     if (state) {
       clearTimer(state);
       bumpGeneration(state);
       state.continuousIdle = false;
     }
-    releaseLocalWakeOwner(sessionID);
-    if (rearmProgress) rearmWakeProgress(sessionID);
   }
 
   function canSchedule(sessionID: string): boolean {
     if (!enabled) return false;
     if (!hasRequiredSessionApis(sessionSdk)) return false;
     if (!options.shouldManageSession(sessionID)) return false;
+    if (!admitWakeSession(sessionID)) return false;
     if (options.hasInputWait(sessionID)) return false;
     if (options.isFallbackInProgress?.(sessionID)) return false;
-    if (getWakeProgress(sessionID).stopped) return false;
     return true;
   }
 
@@ -936,7 +924,11 @@ export function createOrchestratorWakeScheduler(
     if (!canSchedule(sessionID)) return;
     const state = touchLocal(sessionID);
     if (!state.continuousIdle || state.timer !== undefined) return;
-    if (getWakeProgress(sessionID).stopped) return;
+    if (
+      getWakeProgress(sessionID).stopped ||
+      getWakeProgress(sessionID).idlePrompted
+    )
+      return;
 
     const generation = state.generation;
     const timer = setTimeout(() => {
@@ -953,7 +945,6 @@ export function createOrchestratorWakeScheduler(
     const state = touchLocal(sessionID);
     if (state.continuousIdle && state.timer !== undefined) return;
     state.continuousIdle = true;
-    if (getWakeProgress(sessionID).stopped) return;
     if (state.timer === undefined) schedule(sessionID);
   }
 
@@ -1005,7 +996,15 @@ export function createOrchestratorWakeScheduler(
       !todosHaveValidStatuses(todos as Array<Record<string, unknown>>) ||
       !children.every(
         (child) => isObjectRecord(child) && typeof child.id === 'string',
-      )
+      ) ||
+      !children.every((child) => {
+        if (!Object.hasOwn(status, child.id)) return true;
+        const entry = status[child.id];
+        return (
+          isObjectRecord(entry) &&
+          ['idle', 'busy', 'retry'].includes(String(entry.type))
+        );
+      })
     ) {
       return undefined;
     }
@@ -1074,8 +1073,16 @@ export function createOrchestratorWakeScheduler(
         return;
       }
 
+      const outcome = options.outcomeController?.store.read(sessionID);
+      if (
+        outcome?.success &&
+        (outcome.data.phase === 'accepted' ||
+          options.outcomeController?.validateManagedWait(sessionID).allowed)
+      )
+        return;
+
       if (isActiveStatus(snapshot.status, sessionID)) {
-        endIdleSpell(sessionID, true);
+        endIdleSpell(sessionID, false);
         return;
       }
       if (!recoveryWake && hasActiveChild(snapshot.children, snapshot.status)) {
@@ -1115,7 +1122,7 @@ export function createOrchestratorWakeScheduler(
         return;
       }
       if (isActiveStatus(latest.status, sessionID)) {
-        endIdleSpell(sessionID, true);
+        endIdleSpell(sessionID, false);
         return;
       }
       if (!recoveryWake && hasActiveChild(latest.children, latest.status)) {
@@ -1147,6 +1154,14 @@ export function createOrchestratorWakeScheduler(
       const modelSelection =
         latest.model ?? snapshot.model ?? getObservedWakeModel(sessionID);
 
+      const finalOutcome = options.outcomeController?.store.read(sessionID);
+      if (
+        finalOutcome?.success &&
+        (finalOutcome.data.phase === 'accepted' ||
+          options.outcomeController?.validateManagedWait(sessionID).allowed)
+      )
+        return;
+
       // Reserve before promptAsync so a failed call cannot storm retries and
       // concurrent hook instances cannot double-wake.
       if (!commitWakeReservation(sessionID, owner, latestFingerprint)) {
@@ -1173,8 +1188,8 @@ export function createOrchestratorWakeScheduler(
       });
       if (recoveryWake) pendingStoppedRecoveries.delete(sessionID);
     } catch (error) {
-      // Failed promptAsync already reserved; clear expecting-busy so a later
-      // unrelated busy can rearm normally.
+      // Failed promptAsync already reserved; clearing transport attribution
+      // never refills the shared budget.
       clearExpectingWakeBusy(sessionID);
       log('[orchestrator-wake] wake suppressed after SDK error', {
         sessionID,
@@ -1201,39 +1216,28 @@ export function createOrchestratorWakeScheduler(
   }
 
   function observeChatMessage(input: unknown, output: unknown): void {
+    const external = externalMessage(input, output);
+    if (!external || !options.shouldManageSession(external.sessionID)) return;
+    if (
+      !external.parts.some(
+        (part) =>
+          (part.type === 'text' &&
+            typeof part.text === 'string' &&
+            part.text.trim()) ||
+          part.type === 'file' ||
+          part.type === 'image',
+      )
+    )
+      return;
+    const { sessionID, messageID } = external;
+    if (!admitWakeSession(sessionID)) return;
+    // Both hooks see the same host message; only the first observation refills.
+    noteExternalWakeMessage(sessionID, messageID);
     const inputMessage = isObjectRecord(input) ? input : undefined;
     const outputRecord = isObjectRecord(output) ? output : undefined;
     const outputMessage = isObjectRecord(outputRecord?.message)
       ? outputRecord.message
       : undefined;
-    const sessionID =
-      typeof outputMessage?.sessionID === 'string'
-        ? outputMessage.sessionID
-        : typeof inputMessage?.sessionID === 'string'
-          ? inputMessage.sessionID
-          : undefined;
-    const parts = Array.isArray(outputRecord?.parts)
-      ? outputRecord.parts
-      : inputMessage?.parts;
-    if (
-      !sessionID ||
-      (typeof outputMessage?.role === 'string' &&
-        outputMessage.role !== 'user') ||
-      !options.shouldManageSession(sessionID) ||
-      !Array.isArray(parts) ||
-      parts.some(isInternalInitiatorPart) ||
-      !parts.some(
-        (part) =>
-          isObjectRecord(part) &&
-          part.synthetic !== true &&
-          !isInternalInitiatorPart(part) &&
-          ((part.type === 'text' && typeof part.text === 'string') ||
-            part.type === 'file' ||
-            part.type === 'image'),
-      )
-    ) {
-      return;
-    }
 
     const outputModel = isObjectRecord(outputMessage?.model)
       ? outputMessage.model
@@ -1252,8 +1256,6 @@ export function createOrchestratorWakeScheduler(
     clearTimer(state);
     bumpGeneration(state);
     state.continuousIdle = false;
-    // External user activity rearms the process-global no-progress cap.
-    rearmWakeProgress(sessionID);
   }
 
   /**
@@ -1270,14 +1272,13 @@ export function createOrchestratorWakeScheduler(
     ) {
       return;
     }
+    if (!admitWakeSession(sessionID)) return;
     pendingStoppedRecoveries.add(sessionID);
-    rearmWakeProgress(sessionID);
     if (!canSchedule(sessionID)) return;
     const state = touchLocal(sessionID);
     clearTimer(state);
     bumpGeneration(state);
     state.continuousIdle = true;
-    rearmWakeProgress(sessionID);
     void evaluate(sessionID, state.generation, true);
   }
 
@@ -1300,8 +1301,9 @@ export function createOrchestratorWakeScheduler(
         startupTimer = undefined;
       }
       pendingStoppedRecoveries.clear();
-      for (const sessionID of [...localWakeOwners.keys()]) {
-        releaseLocalWakeOwner(sessionID);
+      // Pending transports retain their owner until their finally block runs.
+      for (const [sessionID, owner] of localWakeOwners) {
+        releaseUncommittedWakeEvaluation(sessionID, owner);
       }
       for (const sessionID of [...localSessions.keys()]) {
         clearLocalSession(sessionID);
@@ -1311,6 +1313,8 @@ export function createOrchestratorWakeScheduler(
 
     const sessionID = extractSessionID(input.event);
     if (!sessionID) return;
+    if (options.shouldManageSession(sessionID)) admitWakeSession(sessionID);
+    observeWakeEvent(sessionID, input.event);
 
     if (type === 'session.deleted') {
       clearSession(sessionID);
@@ -1325,13 +1329,23 @@ export function createOrchestratorWakeScheduler(
     }
 
     if (isIdleEvent(type, properties)) {
+      if (isWakeRunning(sessionID)) return;
       if (options.shouldManageSession(sessionID)) {
-        clearExpectingWakeBusy(sessionID);
+        if (!admitWakeSession(sessionID)) return;
         if (pendingStoppedRecoveries.has(sessionID)) {
           triggerStoppedJobRecovery(sessionID);
           return;
         }
         beginContinuousIdle(sessionID);
+        // Exhaustion stops periodic polling. An idle event permits one bounded
+        // telemetry evaluation, without refilling or sending at the cap.
+        if (
+          getWakeProgress(sessionID).stopped ||
+          getWakeProgress(sessionID).idlePrompted
+        ) {
+          const state = touchLocal(sessionID);
+          void evaluate(sessionID, state.generation);
+        }
       } else {
         // First idle/status event fallback for unknown sessions
         await classifyAndRecoverInterruptedSession(sessionID, 'event');
@@ -1341,9 +1355,7 @@ export function createOrchestratorWakeScheduler(
 
     if (isBusyEvent(type, properties)) {
       if (options.shouldManageSession(sessionID)) {
-        // Wake-initiated busy preserves the no-progress cap; external busy rearms.
-        const wakeBusy = isExpectingWakeBusy(sessionID);
-        endIdleSpell(sessionID, !wakeBusy);
+        endIdleSpell(sessionID, false);
       } else {
         clearExpectingWakeBusy(sessionID);
       }
@@ -1358,9 +1370,9 @@ export function createOrchestratorWakeScheduler(
           properties?.status?.type !== 'busy')
       ) {
         if (options.shouldManageSession(sessionID)) {
-          // Errors / retry are external lifecycle — rearm.
+          // Lifecycle delivery is not evidence of external activity/progress.
           clearExpectingWakeBusy(sessionID);
-          endIdleSpell(sessionID, true);
+          endIdleSpell(sessionID, false);
         }
       }
     }

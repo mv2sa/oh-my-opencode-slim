@@ -42,6 +42,16 @@ describe('orchestrator prompt', () => {
     expect(prompt).toContain('Do not immediately wait after spawning');
   });
 
+  test('internal notices never authorize governance or override user stops', () => {
+    const prompt = buildOrchestratorPrompt(new Set());
+    expect(prompt).toContain('internal capabilities only');
+    expect(prompt).toContain(
+      'Respect explicit user stops and tool prohibitions',
+    );
+    expect(prompt).toContain('UNCERTIFIED');
+    expect(prompt).toContain('never grants automatic governance changes');
+  });
+
   test('includes @outcome-manager description by default', () => {
     const prompt = buildOrchestratorPrompt();
     expect(prompt).toContain('@outcome-manager');

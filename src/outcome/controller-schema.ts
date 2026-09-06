@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import {
+  assertAmendedFinalReview,
+  validateHandoffAmendments,
+} from './handoff-amendments';
+import {
   EvidenceFreshnessSchema,
   EvidenceStatusSchema,
   GoalStatusSchema,
@@ -375,6 +379,14 @@ export const OutcomeReceiptsSchema = z
       .array(OutcomeHandoffSupersessionReceiptSchema)
       .max(16)
       .default([]),
+    handoffAmendments: z
+      .array(z.lazy(() => OutcomeHandoffAmendmentSchema))
+      .max(16)
+      .optional(),
+    handoffCompletions: z
+      .array(z.lazy(() => OutcomeHandoffCompletionSchema))
+      .max(16)
+      .optional(),
   })
   .strict();
 export type OutcomeReceipts = z.infer<typeof OutcomeReceiptsSchema>;
@@ -401,6 +413,16 @@ export type OutcomeManagerReviewSummary = z.infer<
   typeof OutcomeManagerReviewSummarySchema
 >;
 
+export const OutcomeAmendedHandoffBindingSchema = z
+  .object({
+    amendmentHead: Digest,
+    completionDigest: Digest,
+    instructions: Text,
+    expectedPostRestartCheck: Text,
+    candidateFingerprint: Digest,
+  })
+  .strict();
+
 export const OutcomeCheckpointClaimSchema = z
   .object({
     outcomeId: Id,
@@ -420,6 +442,7 @@ export const OutcomeCheckpointClaimSchema = z
     includedDecisionIds: z.array(Id).max(32),
     includedExceptionRuleIds: z.array(Id).max(32),
     includedEvidenceAttestationIds: z.array(Id).max(64),
+    amendedHandoff: OutcomeAmendedHandoffBindingSchema.optional(),
     state: OutcomeClaimStateSchema,
     dispatchCallId: Id.optional(),
     managerTaskId: Id.optional(),
@@ -625,6 +648,71 @@ export const OutcomeWaitConditionSchema = z
   });
 export type OutcomeWaitCondition = z.infer<typeof OutcomeWaitConditionSchema>;
 
+export const OutcomeHandoffObligationSchema = z
+  .object({
+    instructions: Text.nullable(),
+    expectedPostRestartCheck: Text.nullable(),
+    candidateFingerprint: Digest.nullable(),
+  })
+  .strict();
+export const OutcomeHandoffAmendmentRequestSchema = z
+  .object({
+    rootSessionId: OutcomeSessionIdSchema,
+    outcomeId: Id,
+    generation: z.number().int().positive(),
+    waitReferenceId: Id,
+    waitCreatedRevision: Revision,
+    waitOriginatingServerEpoch: Id,
+    waitRestartObservedRevision: Revision,
+    expectedPreviousAmendmentHead: z.union([z.literal('genesis'), Digest]),
+    oldEffectiveObligationDigest: Digest,
+    instructions: Text,
+    expectedPostRestartCheck: Text,
+    candidateFingerprint: Digest,
+    reason: Text,
+    sourceUserMessageReceiptId: Id,
+    evidenceAttestationId: Id,
+    completionAuthorized: z.boolean().optional(),
+  })
+  .strict();
+export type OutcomeHandoffAmendmentRequest = z.infer<
+  typeof OutcomeHandoffAmendmentRequestSchema
+>;
+export const OutcomeHandoffAmendmentSchema = z
+  .object({
+    request: OutcomeHandoffAmendmentRequestSchema,
+    originalWait: OutcomeWaitConditionSchema,
+    oldObligation: OutcomeHandoffObligationSchema,
+    newObligation: OutcomeHandoffObligationSchema,
+    sourceReceiptDigest: Digest,
+    evidenceDigest: Digest,
+    amendedRevision: Revision,
+    amendedAt: Timestamp,
+    serverEpoch: Id,
+    payloadDigest: Digest,
+  })
+  .strict();
+export type OutcomeHandoffAmendment = z.infer<
+  typeof OutcomeHandoffAmendmentSchema
+>;
+export const OutcomeHandoffCompletionSchema = z
+  .object({
+    amendmentHead: Digest,
+    sourceUserMessageReceiptId: Id,
+    sourceReceiptDigest: Digest,
+    evidenceAttestationId: Id,
+    evidenceDigest: Digest,
+    restartObservedRevision: Revision,
+    completedRevision: Revision,
+    completedAt: Timestamp,
+    serverEpoch: Id,
+    payloadDigest: Digest,
+  })
+  .strict();
+export type OutcomeHandoffCompletion = z.infer<
+  typeof OutcomeHandoffCompletionSchema
+>;
+
 export const OutcomeActionRequiredSchema = z
   .object({
     id: Id,
@@ -729,6 +817,7 @@ export const OutcomeFinalCertificateSchema = z
     acceptedCheckpointId: Id,
     acceptedClaimGeneration: z.number().int().positive(),
     finalCheckpointFingerprint: Digest,
+    amendedHandoff: OutcomeAmendedHandoffBindingSchema.optional(),
     managerTaskId: Id,
     managerGeneration: z.number().int().positive(),
     managerReviewId: Id,
@@ -1121,6 +1210,7 @@ export function computeOutcomeCheckpointFingerprint(
     | 'includedDecisionIds'
     | 'includedExceptionRuleIds'
     | 'includedEvidenceAttestationIds'
+    | 'amendedHandoff'
   >,
 ): string {
   return canonicalDigest('omos/outcome-checkpoint/v1', {
@@ -1142,6 +1232,7 @@ export function computeOutcomeCheckpointFingerprint(
     includedDecisionIds: claim.includedDecisionIds,
     includedExceptionRuleIds: claim.includedExceptionRuleIds,
     includedEvidenceAttestationIds: claim.includedEvidenceAttestationIds,
+    ...(claim.amendedHandoff ? { amendedHandoff: claim.amendedHandoff } : {}),
   });
 }
 
@@ -2190,6 +2281,12 @@ function validateRecordRelations(
       ['phase'],
       'Accepted phase and final certificate must appear together',
     );
+  }
+  try {
+    validateHandoffAmendments(record);
+    if (accepted) assertAmendedFinalReview(record);
+  } catch (error) {
+    issue(ctx, ['receipts', 'handoffAmendments'], String(error));
   }
   if (accepted) validateAcceptedRecord(record, ctx);
 }

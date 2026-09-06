@@ -1,5 +1,6 @@
 import { type ToolDefinition, tool } from '@opencode-ai/plugin';
 import type { OutcomeController } from '../outcome/controller';
+import { OutcomeHandoffAmendmentRequestSchema } from '../outcome/controller-schema';
 
 const z = tool.schema;
 
@@ -66,12 +67,16 @@ Use this tool to establish durable outcome contracts (begin, or begin after acce
           'reconcile_uncertain',
           'acknowledge_operation',
           'supersede_external_handoff',
+          'amend_external_handoff',
         ])
         .describe('Outcome control action to execute'),
       contract: z
         .any()
         .optional()
         .describe('Complete OutcomeContract object for begin action'),
+      amendment: OutcomeHandoffAmendmentRequestSchema.optional().describe(
+        'Exact amendment identity, genesis/prior head, obligation digest, new instructions/check/candidate, reason and external user/evidence references; obtain identity/digests/receipt IDs from status.handoff. Orchestrator must explicitly check semantic consent. Set completionAuthorized=true only if consent also covers separate explicit completion using this exact evidence pair before another restart.',
+      ),
       generation: z
         .number()
         .int()
@@ -256,6 +261,17 @@ Use this tool to establish durable outcome contracts (begin, or begin after acce
       }
 
       switch (args.action) {
+        case 'amend_external_handoff': {
+          if (!args.amendment)
+            throw new Error('amend_external_handoff requires amendment');
+          const res = controller.amendExternalHandoff(
+            sessionID,
+            args.amendment,
+          );
+          if (!res.success)
+            throw new Error(`amend_external_handoff failed: ${res.error}`);
+          return JSON.stringify(res.data, null, 2);
+        }
         case 'status': {
           const generation =
             typeof args.generation === 'number' &&

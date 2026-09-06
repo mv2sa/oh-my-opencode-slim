@@ -713,9 +713,7 @@ describe('Outcome Controller plugin integration', () => {
             body: { parts: Array<{ text: string }> };
           }
         ).body.parts[0].text,
-      ).toStartWith(
-        'Action required on outcome protocol. Check outcome_control status or pending checkpoint instructions.',
-      );
+      ).toStartWith('[Internal Controller notice — non-authorizing.');
     } finally {
       await hooks.dispose?.();
     }
