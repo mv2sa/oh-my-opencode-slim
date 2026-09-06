@@ -127,6 +127,11 @@ describe('RuntimeConfig', () => {
     expect(runtime.backgroundJobs.maxSessionsPerAgent).toBe(2);
     expect(runtime.backgroundJobs.strategy).toBe('latest');
     expect(runtime.backgroundJobs.stopConfirmationMs).toBe(30_000);
+    expect(runtime.backgroundJobs.concurrency).toEqual({
+      defaultConcurrency: 0,
+      providerConcurrency: {},
+      modelConcurrency: {},
+    });
     expect(runtime.fallback).toEqual({ enabled: true, maxRetries: 3 });
     expect(runtime.webfetch.enabled).toBe(true);
     expect(runtime.acpAgents).toEqual({});

@@ -1,5 +1,15 @@
 import type { Plugin, ToolDefinition } from '@opencode-ai/plugin';
-import { createAgents, getAgentConfigs, isSubagent } from './agents';
+import {
+  type AdmissionRuntimeLease,
+  acquireAdmissionRuntime,
+} from './admission-runtime';
+import {
+  applyModelInheritanceToConfig,
+  createAgents,
+  getAgentConfigs,
+  isSubagent,
+  resolvePrimaryModelValue,
+} from './agents';
 import { buildOrchestratorPrompt } from './agents/orchestrator';
 import { CompanionManager } from './companion/manager';
 import { ensureCompanionVersion } from './companion/updater';
@@ -27,6 +37,7 @@ import {
   createPhaseReminderHook,
   createPostFileToolNudgeHook,
   createReflectCommandHook,
+  createSearchPathGuardHook,
   createTaskSessionManagerHook,
   createToolLoopGuardHook,
   ForegroundFallbackManager,
@@ -66,11 +77,17 @@ import {
   resolveEventSessionID,
   TaskActivityTracker,
 } from './tools/task-activity';
-import { recordTuiAgentModel, recordTuiAgentModels } from './tui-state';
+import {
+  clearTuiAgentActivities,
+  recordTuiAgentActivity,
+  recordTuiAgentModel,
+  recordTuiAgentModels,
+} from './tui-state';
 import {
   BackgroundJobBoard,
   BackgroundJobCoordinator,
   BackgroundJobSupervisor,
+  type BackgroundTaskConcurrency,
   createDisplayNameMentionRewriter,
   resolveRuntimeAgentName,
 } from './utils';
@@ -181,6 +198,46 @@ export function consumeCompletedManagerTask(
 // re-runs, it checks this variable and applies the runtime preset instead
 // of the config file's preset. State lives in RuntimeConfig.
 
+/**
+ * Decide whether multiplexer pane management initializes for a plugin
+ * input. v1 hosts (hostFlavor absent) keep the exact env-based
+ * conditions — configured type, resolvable multiplexer, inside-session
+ * env marker; v2 hosts, marked `hostFlavor: 'v2'` by the v2 client shim,
+ * are gated off before any multiplexer initialization runs.
+ */
+export function shouldEnableMultiplexer(input: {
+  hostFlavor?: string;
+  multiplexerConfig: MultiplexerConfig;
+}): boolean {
+  if ((input as { hostFlavor?: string }).hostFlavor === 'v2') {
+    log('[v2] multiplexer disabled on v2 host');
+    return false;
+  }
+  // Get multiplexer instance for capability checks (v1 path, unchanged)
+  const multiplexer = getMultiplexer(input.multiplexerConfig);
+  return (
+    input.multiplexerConfig.type !== 'none' &&
+    multiplexer !== null &&
+    multiplexer.isInsideSession()
+  );
+}
+
+/**
+ * Config handed to MultiplexerSessionManager. The manager is created
+ * unconditionally (its lifecycle hooks are wired into the job coordinator),
+ * but it self-gates only on env (inside tmux/zellij) — which would
+ * incorrectly self-enable on a v2 host running inside tmux. v2 hosts are
+ * therefore forced to type 'none', which disables every manager path (all
+ * its public methods no-op when `enabled` is false). v1 hosts receive the
+ * real config object unchanged.
+ */
+export function sessionManagerMultiplexerConfig(
+  hostFlavor: string | undefined,
+  config: MultiplexerConfig,
+): MultiplexerConfig {
+  return hostFlavor === 'v2' ? { ...config, type: 'none' } : config;
+}
+
 export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   const sessionId = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
   initLogger(sessionId);
@@ -214,6 +271,29 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       });
     },
   });
+  const ownedTuiActivitySessions = new Map<string, string>();
+  const tuiActivityDirectory = (sessionID: string): string => {
+    return sessionMetadata.getDirectory(sessionID) ?? ctx.directory;
+  };
+  const markTuiAgentActive = (sessionID: string, agentName: string): void => {
+    const directory = tuiActivityDirectory(sessionID);
+    recordTuiAgentActivity({ sessionID, agentName, active: true }, directory);
+    ownedTuiActivitySessions.set(sessionID, directory);
+  };
+  const markTuiAgentInactive = (sessionID: string): void => {
+    const directory =
+      ownedTuiActivitySessions.get(sessionID) ??
+      tuiActivityDirectory(sessionID);
+    recordTuiAgentActivity({ sessionID, active: false }, directory);
+    ownedTuiActivitySessions.delete(sessionID);
+  };
+  const clearTuiActivities = (): void => {
+    for (const [sessionID, directory] of ownedTuiActivitySessions) {
+      recordTuiAgentActivity({ sessionID, active: false }, directory);
+    }
+    ownedTuiActivitySessions.clear();
+  };
+  clearTuiAgentActivities(ctx.directory);
   let sessionLifecycle: SessionLifecycle;
 
   let chatHeadersHook: ReturnType<typeof createChatHeadersHook>;
@@ -229,6 +309,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let filterAvailableSkills: ReturnType<typeof createFilterAvailableSkillsHook>;
   let postFileToolNudge: ReturnType<typeof createPostFileToolNudgeHook>;
   let applyPatch: ReturnType<typeof createApplyPatchHook>;
+  let searchPathGuard: ReturnType<typeof createSearchPathGuardHook>;
   let jsonErrorRecovery: ReturnType<typeof createJsonErrorRecoveryHook>;
   let toolLoopGuard: ToolLoopGuardHook;
   let postFileToolNudgeAfter: (i: unknown, o: unknown) => Promise<void>;
@@ -239,6 +320,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let outcomeControlTools: ReturnType<typeof createOutcomeControlTool>;
   let backgroundJobBoard: BackgroundJobBoard;
   let backgroundJobSupervisor: BackgroundJobSupervisor;
+  let backgroundTaskConcurrency: BackgroundTaskConcurrency;
+  let admissionRuntimeLease: AdmissionRuntimeLease | undefined;
+  let finalHostAgentConfig: Record<string, unknown> | undefined;
   let interviewManager: ReturnType<typeof createInterviewManager>;
   let companionManager: CompanionManager;
   let taskCancelTools: ReturnType<typeof createCancelTaskTool>;
@@ -262,6 +346,21 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
   // Counters for post-init health check (set inside try, checked outside)
   let toolCount = 0;
+
+  const resolvePrimaryModelFromFinalHostConfig = (
+    agentType: string,
+  ): string | undefined => {
+    const readModel = (entry: unknown): string | undefined => {
+      if (entry === null || typeof entry !== 'object') return undefined;
+      return resolvePrimaryModelValue((entry as Record<string, unknown>).model);
+    };
+
+    const directModel = readModel(finalHostAgentConfig?.[agentType]);
+    if (directModel) return directModel;
+
+    const resolvedName = resolveRuntimeAgentName(runtime, agentType);
+    return readModel(finalHostAgentConfig?.[resolvedName]);
+  };
 
   try {
     config = loadPluginConfig(ctx.directory);
@@ -296,12 +395,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     // Parse multiplexer config with defaults
     multiplexerConfig = runtime.multiplexer;
 
-    // Get multiplexer instance for capability checks
-    const multiplexer = getMultiplexer(multiplexerConfig);
-    multiplexerEnabled =
-      multiplexerConfig.type !== 'none' &&
-      multiplexer !== null &&
-      multiplexer.isInsideSession();
+    const hostFlavor = (ctx as Parameters<Plugin>[0] & { hostFlavor?: string })
+      .hostFlavor;
+
+    multiplexerEnabled = shouldEnableMultiplexer({
+      hostFlavor,
+      multiplexerConfig,
+    });
 
     log('[plugin] initialized with multiplexer config', {
       multiplexerConfig,
@@ -352,6 +452,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       readContextMinLines: runtime.backgroundJobs.readContextMinLines,
       readContextMaxFiles: runtime.backgroundJobs.readContextMaxFiles,
     });
+    admissionRuntimeLease = acquireAdmissionRuntime(
+      ctx.directory,
+      runtime.backgroundJobs.concurrency,
+    );
+    backgroundTaskConcurrency = admissionRuntimeLease.backgroundTaskConcurrency;
 
     // Initialize coordinator as the sole writer to the board
     const backgroundJobCoordinator = new BackgroundJobCoordinator(
@@ -368,6 +473,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     });
     backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
       backgroundJobSupervisor.onTerminal(record);
+      backgroundTaskConcurrency.releaseTask(record.taskID);
     });
     sessionLifecycle = new SessionLifecycle(log);
 
@@ -380,6 +486,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       ctx,
       runtime.fallback.maxRetries,
       sessionLifecycle,
+      // Preserve upstream admission accounting when a managed background
+      // session changes models during foreground fallback.
+      (sessionID: string, model: string) =>
+        backgroundTaskConcurrency.migrateTask(sessionID, model),
       getCooldownRegistry(),
       Object.fromEntries(
         Object.entries(runtime.modelArrays).map(([agentName, models]) => [
@@ -395,7 +505,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           ),
         ]),
       ),
-      (sessionID) => backgroundJobBoard.get(sessionID) !== undefined,
+      (sessionID: string) => backgroundJobBoard.get(sessionID) !== undefined,
     );
 
     const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator();
@@ -415,10 +525,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     });
 
     // Initialize MultiplexerSessionManager to handle OpenCode's built-in
-    // Task tool sessions
+    // Task tool sessions. On v2 hosts the multiplexer is host-gated off
+    // (shouldEnableMultiplexer), so the manager's config is forced to
+    // 'none' — otherwise its env-based self-gate could re-enable pane
+    // management inside tmux/zellij on a v2 host.
     multiplexerSessionManager = new MultiplexerSessionManager(
       ctx,
-      multiplexerConfig,
+      sessionManagerMultiplexerConfig(hostFlavor, multiplexerConfig),
       backgroundJobCoordinator,
     );
     backgroundJobCoordinator.addTerminalStateListener((taskID) => {
@@ -451,6 +564,18 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       stopConfirmationMs: runtime.backgroundJobs.stopConfirmationMs,
       backgroundJobBoard: backgroundJobCoordinator,
       backgroundJobSupervisor,
+      backgroundTaskConcurrency,
+      pendingCallTracker: admissionRuntimeLease.pendingCallTracker,
+      getModelForAgent: (agentType: string, parentSessionID?: string) =>
+        // Admission must use the config after the host has merged all of its
+        // agent layers. The direct lookup preserves display-name keys; the
+        // resolved lookup handles canonical names and legacy aliases. A
+        // parent model is only an inheritance fallback when neither final
+        // agent entry carries one.
+        resolvePrimaryModelFromFinalHostConfig(agentType) ??
+        (parentSessionID
+          ? sessionMetadata.getModel(parentSessionID)
+          : undefined),
       shouldManageSession: (sessionID) =>
         sessionMetadata.getAgent(sessionID) === 'orchestrator',
       registerSessionAsOrchestrator: (sessionID) => {
@@ -577,6 +702,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     applyPatch = createApplyPatchHook(ctx);
 
+    searchPathGuard = createSearchPathGuardHook(ctx);
+
     jsonErrorRecovery = createJsonErrorRecoveryHook(ctx);
     toolLoopGuard = createToolLoopGuardHook();
 
@@ -680,6 +807,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     toolCount = Object.keys(tools).length;
   } catch (err) {
+    admissionRuntimeLease?.release();
     // Plugin init failed: log visibly before re-throwing so the user
     // sees something actionable instead of a silent "loaded but empty".
     log('[plugin] FATAL: init failed', String(err));
@@ -854,6 +982,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         }
       }
       const configAgent = opencodeConfig.agent as Record<string, unknown>;
+      applyModelInheritanceToConfig(configAgent, runtime);
 
       // Model resolution for foreground agents: use _modelArray entries
       // to pick the first model for startup-time selection. Cooled models
@@ -1059,6 +1188,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         configPreset: runtime.preset,
         runtimePreset: runtimePresetName,
       });
+      // This is the source of truth for admission. It is intentionally
+      // captured only after every host/plugin merge and the final model
+      // inheritance, array-primary, preset, and orchestrator-model passes.
+      finalHostAgentConfig = configAgent;
 
       // Merge MCP configs
       const configMcp = opencodeConfig.mcp as
@@ -1153,6 +1286,17 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // by session so child activity refreshes the correct stuck timer.
       const eventSessionID = resolveEventSessionID(event);
       const statusType = event.properties?.status?.type;
+      if (
+        eventSessionID &&
+        sessionMetadata.getAgent(eventSessionID) === 'orchestrator' &&
+        (event.type === 'session.idle' ||
+          (event.type === 'session.status' && statusType === 'idle'))
+      ) {
+        toolLoopGuard.resetTurn(eventSessionID);
+      }
+      if (eventSessionID && event.type === 'session.deleted') {
+        toolLoopGuard.resetSession(eventSessionID);
+      }
       if (eventSessionID) {
         applyActivityEvent(taskActivityTracker, event);
         if (
@@ -1160,12 +1304,17 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           (statusType === 'busy' || statusType === 'retry')
         ) {
           sessionMetadata.markOrchestratorActive(eventSessionID);
+          const agentName = sessionMetadata.getAgent(eventSessionID);
+          if (agentName) {
+            markTuiAgentActive(eventSessionID, agentName);
+          }
         } else if (
           event.type === 'session.idle' ||
           (event.type === 'session.status' && statusType === 'idle') ||
           event.type === 'session.deleted'
         ) {
           sessionMetadata.markOrchestratorIdle(eventSessionID);
+          markTuiAgentInactive(eventSessionID);
         }
       }
 
@@ -1183,6 +1332,18 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             : typeof info?.model?.modelID === 'string'
               ? info.model.modelID
               : undefined;
+        // Track each session's current model so background task admission
+        // can resolve the model a model-less subagent will inherit.
+        if (typeof info?.sessionID === 'string' && providerID && modelID) {
+          const model = `${providerID}/${modelID}`;
+          sessionMetadata.setModel(info.sessionID, model);
+          // Managed background-task sessions are identified by their session
+          // ID. If the model serving one changed (fallback re-prompt, runtime
+          // switch), migrate the admission accounting so provider/model caps
+          // keep tracking the model actually in use. No-op for other
+          // sessions and idempotent when the model is unchanged.
+          backgroundTaskConcurrency.migrateTask(info.sessionID, model);
+        }
         if (typeof info?.agent === 'string' && providerID && modelID) {
           const agentName = resolveRuntimeAgentName(runtime, info.agent);
           const model = `${providerID}/${modelID}`;
@@ -1230,6 +1391,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           await multiplexerSessionManager.cleanupOnInstanceDisposed();
         },
       );
+      if (event.type === 'server.instance.disposed') {
+        clearTuiActivities();
+      }
 
       // Outcome liveness must observe the board after task-session lifecycle
       // reconciliation and before unrelated wake/fallback/update hooks.
@@ -1315,10 +1479,16 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       });
       await interviewManager.dispose();
       await multiplexerSessionManager.cleanupOnInstanceDisposed();
+      clearTuiActivities();
+      // Release only this generation's ownership. The admission runtime
+      // defers final scheduler/tracker teardown by one macrotask so an
+      // immediate config-update re-init can retain active and queued calls.
+      admissionRuntimeLease?.release();
     },
 
     'tool.execute.before': async (input, output) => {
-      await toolLoopGuard['tool.execute.before'](
+      await applyPatch['tool.execute.before'](input as never, output as never);
+      await searchPathGuard['tool.execute.before'](
         input as never,
         output as never,
       );
@@ -1327,15 +1497,18 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         output as never,
       );
       try {
-        await applyPatch['tool.execute.before'](
-          input as never,
-          output as never,
-        );
         await taskSessionManagerHook['tool.execute.before'](
           input as never,
           output as never,
         );
         await outcomeControllerHook['tool.execute.before'](
+          input as never,
+          output as never,
+        );
+        // Record a call only after every rejecting before-hook has accepted
+        // it. This prevents search-path or Outcome rejections from leaving a
+        // loop-guard entry that can never receive tool.execute.after.
+        await toolLoopGuard['tool.execute.before'](
           input as never,
           output as never,
         );
@@ -1467,6 +1640,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       if (agent) {
         foregroundFallback.registerSessionAgent(input.sessionID, agent);
         sessionMetadata.setAgent(input.sessionID, agent);
+        markTuiAgentActive(input.sessionID, agent);
         // A chat message means this session is actively working. This also
         // covers the race where session.status busy fires before the
         // session's agent is known.
@@ -1476,9 +1650,31 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           status: 'busy',
         });
       }
+      // chat.message carries the model selected for this message, and it
+      // fires before the message.updated event that the event hook relies
+      // on. Recording it here closes the early window where a session-
+      // inheriting background task could be admitted before its parent's
+      // model is known — admission then resolves the correct provider/model
+      // cap immediately.
+      // output.message.model is authoritative after request-time cooldown
+      // selection above; input.model still describes the pre-transform model.
+      const messageModel = output?.message?.model ?? input.model;
+      if (
+        messageModel &&
+        typeof messageModel.providerID === 'string' &&
+        typeof messageModel.modelID === 'string'
+      ) {
+        const model = `${messageModel.providerID}/${messageModel.modelID}`;
+        sessionMetadata.setModel(input.sessionID, model);
+        backgroundTaskConcurrency.migrateTask(input.sessionID, model);
+      }
       await outcomeControllerHook['chat.message'](input, output);
       taskSessionManagerHook.observeChatMessage(input, output);
       orchestratorWakeScheduler.observeChatMessage(input, output);
+      const messageID = input.messageID ?? output?.message?.id;
+      if (messageID) {
+        toolLoopGuard.observeNewUserMessage(input.sessionID, messageID);
+      }
     },
 
     // Inject orchestrator system prompt for serve-mode sessions. In serve
@@ -1628,6 +1824,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
 export default {
   id: 'oh-my-opencode-slim',
+  // NOTE: do not add a `tui` key here. OpenCode v1.18.23+ (and v2's
+  // byte-identical readV1Plugin) validate the default export of a server
+  // plugin module: `tui`, when present, must be a function and must not
+  // coexist with `server` — a boolean marker makes the whole plugin fail
+  // to load with "invalid tui export". The TUI entry is discovered
+  // separately by hosts through the package.json `./tui` export
+  // (dist/tui2.js), never through this module.
   server: OhMyOpenCodeLite,
   setup: createV2Setup(),
 };

@@ -8,11 +8,13 @@
 import type {
   BackgroundJobStore,
   BackgroundJobSupervisor,
+  BackgroundTaskConcurrency,
   ContextFile,
 } from '../../utils';
 import {
   deriveFullObjective,
   deriveTaskSessionLabel,
+  guardCompletedStatusText,
   parseTaskIdFromTaskOutput,
   parseTaskLaunchOutput,
   parseTaskStatusOutput,
@@ -80,10 +82,17 @@ export async function handleToolExecuteBefore(
     backgroundJobBoard: BackgroundJobStore;
     pendingCallTracker: {
       add(call: PendingTaskCall): void;
+      take(callID?: string, sessionID?: string): PendingTaskCall | undefined;
+      release?(call: PendingTaskCall): void;
       pendingCallId(sessionID?: string, callID?: string): string;
     };
     taskContextTracker: { pendingManagedTaskIds: Set<string> };
     backgroundJobSupervisor?: BackgroundJobSupervisor;
+    backgroundTaskConcurrency?: BackgroundTaskConcurrency;
+    getModelForAgent?: (
+      agentType: string,
+      parentSessionID?: string,
+    ) => string | undefined;
     getLifecycleEpoch?: () => number;
   },
 ): Promise<void> {
@@ -134,6 +143,7 @@ export async function handleToolExecuteBefore(
     label,
     background,
     lifecycleEpoch: deps.getLifecycleEpoch?.() ?? 0,
+    releaseLease: (lease) => deps.backgroundJobBoard.releaseLease(lease),
   };
   pendingCall.fullObjective = deriveFullObjective({
     description:
@@ -223,10 +233,29 @@ export async function handleToolExecuteBefore(
 
   try {
     deps.pendingCallTracker.add(pendingCall);
-  } catch (error) {
-    if (pendingCall.relaunchLease) {
-      deps.backgroundJobBoard.releaseLease(pendingCall.relaunchLease);
+    if (pendingCall.background && deps.backgroundTaskConcurrency) {
+      // Nested orchestration exemption: a session that is itself a managed
+      // task already holds an admission slot. Waiting for another one while
+      // the queue is saturated would deadlock — this session could never
+      // finish, so its own slot could never be released.
+      const isManagedTask = deps.backgroundJobBoard
+        .taskIDs()
+        .has(input.sessionID);
+      if (!isManagedTask) {
+        const ticket = deps.backgroundTaskConcurrency.acquire({
+          model: deps.getModelForAgent?.(
+            agentType,
+            pendingCall.parentSessionId,
+          ),
+        });
+        pendingCall.concurrencyTicket = ticket;
+        await ticket.ready;
+      }
     }
+  } catch (error) {
+    const tracked = deps.pendingCallTracker.take(pendingCall.callId);
+    if (tracked) deps.pendingCallTracker.release?.(tracked);
+    else pendingCall.concurrencyTicket?.releaseIfUnbound();
     throw error;
   }
   log(
@@ -249,7 +278,11 @@ export async function handleToolExecuteAfter(
     directory: string;
     backgroundJobBoard: BackgroundJobStore;
     pendingCallTracker: {
-      take(callID?: string, sessionID?: string): PendingTaskCall | undefined;
+      take(
+        callID?: string,
+        sessionID?: string,
+        ownerBoard?: BackgroundJobStore,
+      ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
     };
     taskContextTracker: {
@@ -263,6 +296,8 @@ export async function handleToolExecuteAfter(
     fallbackManager?: ForegroundFallbackManager;
     revivedRunTracker?: RevivedRunTracker;
     syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
+    bindConcurrencyTicket?: (taskID: string, pending: PendingTaskCall) => void;
+    releaseConcurrencyTask?: (taskID: string) => void;
     /** Record direct task cleanup even when the store is a thin facade. */
     recordLifecycleSuppression?: (taskID: string) => void;
     /** Clear a deletion guard when a new native task output proves a run exists. */
@@ -297,6 +332,7 @@ export async function handleToolExecuteAfter(
   const pending = deps.pendingCallTracker.take(
     exactCallID,
     exactCallID ? undefined : input.sessionID,
+    deps.backgroundJobBoard,
   );
   const exactCallConfirmed =
     exactCallID !== undefined && pending?.callId === exactCallID;
@@ -332,6 +368,7 @@ export async function handleToolExecuteAfter(
         deps,
       );
       if (!record) return;
+      deps.bindConcurrencyTicket?.(record.taskID, pending);
       deps.clearRehydrateTombstone?.(launch.taskID);
       if (exactCallConfirmed) deps.backgroundJobSupervisor?.onLaunch(record);
       log('[task-session-manager] background task launch registered', {
@@ -352,45 +389,6 @@ export async function handleToolExecuteAfter(
 
     const status = parseTaskStatusOutput(output.output);
     if (status) {
-      if (
-        status.state === 'completed' &&
-        status.result &&
-        isAntigravitySyntheticQuotaText(status.result) &&
-        deps.syntheticQuotaCoordinator
-      ) {
-        const record = registerTaskOutputLaunch(
-          status.taskID,
-          pending,
-          exactCallConfirmed,
-          deps,
-        );
-        if (record) {
-          deps.clearRehydrateTombstone?.(status.taskID);
-          const outcome =
-            await deps.syntheticQuotaCoordinator.handleTaskQuotaIncident({
-              taskID: status.taskID,
-              text: status.result,
-              client: deps.client,
-              directory: deps.directory,
-              backgroundJobBoard: deps.backgroundJobBoard,
-              fallbackManager: deps.fallbackManager,
-              revivedRunTracker: deps.revivedRunTracker,
-              pendingParentSessionId: pending.parentSessionId,
-              pendingLabel: pending.label,
-              pendingAgent: pending.agentType,
-            });
-          if (outcome.handled) {
-            if (isSyntheticQuotaContinuationActiveStatus(outcome.status)) {
-              output.output = renderRunningTaskPlaceholder(status.taskID);
-              deps.taskContextTracker.pendingManagedTaskIds.add(status.taskID);
-              return;
-            }
-            output.output = `<task id="${status.taskID}" state="error">\n<summary>Background task failed: ${pending.label}</summary>\n<task_error>\n${status.result}\n</task_error>\n</task>`;
-            return;
-          }
-        }
-      }
-
       const record = registerTaskOutputLaunch(
         status.taskID,
         pending,
@@ -398,16 +396,58 @@ export async function handleToolExecuteAfter(
         deps,
       );
       if (!record) return;
+      deps.bindConcurrencyTicket?.(record.taskID, pending);
       deps.clearRehydrateTombstone?.(status.taskID);
       normalizeLateCancelledTaskOutput(output, deps.backgroundJobBoard);
       if (exactCallConfirmed) deps.backgroundJobSupervisor?.onLaunch(record);
+
+      if (
+        status.state === 'completed' &&
+        status.result &&
+        isAntigravitySyntheticQuotaText(status.result) &&
+        deps.syntheticQuotaCoordinator
+      ) {
+        const outcome =
+          await deps.syntheticQuotaCoordinator.handleTaskQuotaIncident({
+            taskID: status.taskID,
+            text: status.result,
+            client: deps.client,
+            directory: deps.directory,
+            backgroundJobBoard: deps.backgroundJobBoard,
+            fallbackManager: deps.fallbackManager,
+            revivedRunTracker: deps.revivedRunTracker,
+            pendingParentSessionId: pending.parentSessionId,
+            pendingLabel: pending.label,
+            pendingAgent: pending.agentType,
+          });
+        if (outcome.handled) {
+          if (isSyntheticQuotaContinuationActiveStatus(outcome.status)) {
+            output.output = renderRunningTaskPlaceholder(status.taskID);
+            deps.taskContextTracker.pendingManagedTaskIds.add(status.taskID);
+            return;
+          }
+          deps.releaseConcurrencyTask?.(status.taskID);
+          output.output = `<task id="${status.taskID}" state="error">\n<summary>Background task failed: ${pending.label}</summary>\n<task_error>\n${status.result}\n</task_error>\n</task>`;
+          return;
+        }
+      }
+
+      const guarded = guardCompletedStatusText(
+        status.state,
+        status.result,
+        record.resultSummary,
+      );
       const updated = deps.backgroundJobBoard.updateStatus({
         taskID: status.taskID,
-        state: status.state,
+        state: guarded.state,
         expectedGeneration: record.generation,
         timedOut: status.timedOut,
-        resultSummary: status.result,
+        resultSummary: guarded.resultSummary,
+        lastStatusError: guarded.lastStatusError,
       });
+      if (updated?.state !== 'running') {
+        deps.releaseConcurrencyTask?.(status.taskID);
+      }
       log('[task-session-manager] foreground task status registered', {
         taskID: status.taskID,
         alias: updated?.alias ?? record.alias,
@@ -460,6 +500,7 @@ export async function handleToolExecuteAfter(
     if (pending.relaunchLease) {
       deps.backgroundJobBoard.releaseLease(pending.relaunchLease);
     }
+    pending.concurrencyTicket?.releaseIfUnbound();
   }
 }
 
@@ -489,7 +530,9 @@ function registerTaskOutputLaunch(
   if (resumed && pending.resumedTaskId !== taskID) return undefined;
 
   const existing = deps.backgroundJobBoard.get(taskID);
-  const earlyRegistrationGeneration = earlyRegistrationGenerations.get(pending);
+  const earlyRegistrationGeneration =
+    pending.earlyRegistration?.generation ??
+    earlyRegistrationGenerations.get(pending);
   if (
     pending.earlyRegisteredTaskID === taskID &&
     earlyRegistrationGeneration !== undefined &&

@@ -75,7 +75,7 @@ export function resolveRuntimeAgentName(
     }
   }
 
-  return normalized;
+  return AGENT_ALIASES[normalized] ?? normalized;
 }
 
 export function escapeRegExp(value: string): string {

@@ -65,6 +65,13 @@
                 }
               ]
             },
+            "inheritModelFrom": {
+              "type": "string",
+              "enum": [
+                "session",
+                "orchestrator"
+              ]
+            },
             "temperature": {
               "type": "number",
               "minimum": 0,
@@ -103,6 +110,27 @@
             "displayName": {
               "type": "string",
               "minLength": 1
+            },
+            "color": {
+              "description": "Agent display color as #RRGGBB or an OpenCode theme color",
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^#[0-9a-fA-F]{6}$"
+                },
+                {
+                  "type": "string",
+                  "enum": [
+                    "primary",
+                    "secondary",
+                    "accent",
+                    "success",
+                    "warning",
+                    "error",
+                    "info"
+                  ]
+                }
+              ]
             },
             "description": {
               "type": "string",
@@ -504,6 +532,13 @@
               }
             ]
           },
+          "inheritModelFrom": {
+            "type": "string",
+            "enum": [
+              "session",
+              "orchestrator"
+            ]
+          },
           "temperature": {
             "type": "number",
             "minimum": 0,
@@ -542,6 +577,27 @@
           "displayName": {
             "type": "string",
             "minLength": 1
+          },
+          "color": {
+            "description": "Agent display color as #RRGGBB or an OpenCode theme color",
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^#[0-9a-fA-F]{6}$"
+              },
+              {
+                "type": "string",
+                "enum": [
+                  "primary",
+                  "secondary",
+                  "accent",
+                  "success",
+                  "warning",
+                  "error",
+                  "info"
+                ]
+              }
+            ]
           },
           "description": {
             "type": "string",
@@ -1106,6 +1162,52 @@
           "type": "integer",
           "minimum": 5000,
           "maximum": 300000
+        },
+        "concurrency": {
+          "default": {
+            "defaultConcurrency": 0,
+            "providerConcurrency": {},
+            "modelConcurrency": {}
+          },
+          "type": "object",
+          "properties": {
+            "defaultConcurrency": {
+              "default": 0,
+              "description": "Maximum concurrently running native background tasks. 0 disables the default cap.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000
+            },
+            "providerConcurrency": {
+              "default": {},
+              "description": "Per-provider concurrency caps keyed by provider ID. The most specific configured cap wins: model > provider > default. 0 means unlimited for that provider.",
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "minLength": 1
+              },
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000
+              }
+            },
+            "modelConcurrency": {
+              "default": {},
+              "description": "Per-model concurrency caps keyed by provider/model ID. The most specific configured cap wins: model > provider > default. 0 means unlimited for that model.",
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "minLength": 1
+              },
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000
+              }
+            }
+          },
+          "additionalProperties": false
         },
         "waitForUserGuard": {
           "default": true,

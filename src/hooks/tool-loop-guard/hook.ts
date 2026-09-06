@@ -20,17 +20,24 @@ import { log } from '../../utils/logger';
  *   args call produced an output byte-identical to the prior call. A call
  *   that returns NEW information resets the run, so it can never accumulate
  *   toward a block (a legitimate re-read after the file changed).
+ * - task_status/task_result use a separate task-ID/lifecycle-state stream, so
+ *   alternating polls are still recognized without treating tool changes as
+ *   progress. The stream resets at a parent turn boundary or meaningful
+ *   action.
  * - tool.execute.before never increments the counter, so overlapping
  *   parallel calls cannot inflate the count before their results are known.
  *   A refusal only happens after the run is already confirmed identical.
  *
  * Scope is deliberately narrow to avoid breaking legitimate repeated calls:
- * - All tools warn at N confirmed-identical consecutive calls.
- * - Only the read-only file-analysis tools hard-block: polling tools
- *   (task_*, wait_for_*) legitimately re-issue identical calls waiting on a
- *   long-running background task and must never be refused.
- * - The task tool is exempt entirely for both axes; task-session-manager
- *   owns its own duplicate-spawn guards (#1056/#1070).
+ * - All non-exempt tools warn at N confirmed-identical consecutive calls.
+ * - Only read-only file-analysis tools (read, grep, glob) hard-block after M
+ *   confirmed identical results to prevent infinite loops (#1071).
+ * - External async process/task supervision tools (task_status, task_result)
+ *   warn at N calls but stay warn-only (never hard-block) to avoid deadlocking
+ *   terminal result retrieval for long-running background tasks.
+ * - Task management and lifecycle tools (task, task_cancel, task_message,
+ *   task_revive, wait_for_*) remain exempt; task-session-manager owns its
+ *   own duplicate-spawn guards (#1056/#1070).
  *
  * Precedent: json-error-recovery (output warning) and task-session-manager
  * (before-hook refusal).
@@ -40,13 +47,11 @@ const LOOP_GUARD_WARN_AT = 3;
 const LOOP_GUARD_BLOCK_AT = 5;
 
 /**
- * Tools exempt from the entire guard: long-lived task supervision/polling
+ * Tools exempt from the entire guard: long-lived task management / lifecycle
  * tools whose identical repeated invocation is legitimate.
  */
 const LOOP_GUARD_EXEMPT: Record<string, true> = {
   task: true,
-  task_status: true,
-  task_result: true,
   task_cancel: true,
   task_message: true,
   task_revive: true,
@@ -55,9 +60,10 @@ const LOOP_GUARD_EXEMPT: Record<string, true> = {
 };
 
 /**
- * Tools that may be hard-blocked when repeated. Read-only file analysis is
- * the reported loop surface (#1071); anything with side effects or that
- * polls external state stays warn-only.
+ * Tools that may be hard-blocked when repeated. Only read-only file analysis
+ * (read, grep, glob) hard-blocks after confirmed identical results (#1071).
+ * External task supervision tools (task_status, task_result) and tools with
+ * side effects stay warn-only to prevent terminal result retrieval deadlocks.
  */
 const LOOP_GUARD_BLOCK_TOOLS: Record<string, true> = {
   read: true,
@@ -109,6 +115,45 @@ interface SessionState {
   lastOutput: string;
 }
 
+interface CallState {
+  sessionID: string;
+  key: string;
+  taskID?: string;
+}
+
+interface TaskSupervisionState {
+  lifecycleState: string;
+  runs: number;
+}
+
+const TASK_SUPERVISION_TOOLS = new Set(['task_status', 'task_result']);
+
+function taskIDFromArgs(args: unknown): string | undefined {
+  if (!args || typeof args !== 'object' || Array.isArray(args))
+    return undefined;
+  const taskID = (args as Record<string, unknown>).task_id;
+  return typeof taskID === 'string' && taskID.trim() !== ''
+    ? taskID.trim()
+    : undefined;
+}
+
+function taskIDFromOutput(output: unknown): string | undefined {
+  if (typeof output !== 'string') return undefined;
+  const match = output.match(/(?:task_id:\s*|Task\s+[^\n(]*\()([^\s)]+)/i);
+  return match?.[1];
+}
+
+function lifecycleStateFromOutput(output: unknown): string | undefined {
+  if (typeof output !== 'string') return undefined;
+  const state = output.match(/^state:\s*([\w-]+)/im)?.[1]?.toLowerCase();
+  if (!state) return undefined;
+  const normalized = state === 'busy' ? 'running' : state;
+  const uncertain =
+    /state:\s*[^\n]*\(unconfirmed\)/i.test(output) ||
+    /^status_uncertain:\s*true$/im.test(output);
+  return uncertain ? `${normalized}:uncertain` : normalized;
+}
+
 export interface ToolLoopGuardHook {
   'tool.execute.before': (
     input: { tool: string; sessionID?: string; callID?: string },
@@ -118,14 +163,24 @@ export interface ToolLoopGuardHook {
     input: { tool: string; sessionID?: string; callID?: string },
     output: { output: unknown; metadata?: unknown },
   ) => Promise<void>;
+  observeNewUserMessage(sessionID: string, messageID: string): void;
+  resetTurn(sessionID: string): void;
   resetSession(sessionID: string): void;
   resetForTests(): void;
 }
 
 export function createToolLoopGuardHook(): ToolLoopGuardHook {
   const sessions = new Map<string, SessionState>();
-  /** Fingerprint per callID so `after` can re-check without re-deriving args. */
-  const callKeys = new Map<string, string>();
+  /** Per-call state so `after` can re-check without re-deriving args. */
+  const callKeys = new Map<string, CallState>();
+  /** Polling state is shared by task_status/task_result for each task. */
+  const taskSupervision = new Map<string, Map<string, TaskSupervisionState>>();
+  /** Last durable user-message identity observed for each session. */
+  const userMessageIdentities = new Map<string, string>();
+
+  function resetTaskSupervision(sessionID: string): void {
+    taskSupervision.delete(sessionID);
+  }
 
   /** Prune the session map to MAX_TRACKED_SESSIONS (FIFO by insertion). */
   function keepSessionsBounded(): void {
@@ -144,9 +199,26 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
       const sessionID = input.sessionID;
       if (!sessionID) return;
       const tool = input.tool.toLowerCase();
-      if (LOOP_GUARD_EXEMPT[tool]) return;
+      if (LOOP_GUARD_EXEMPT[tool]) {
+        resetTaskSupervision(sessionID);
+        return;
+      }
 
       const key = fingerprint(tool, output.args);
+      if (TASK_SUPERVISION_TOOLS.has(tool)) {
+        if (input.callID) {
+          callKeys.set(input.callID, {
+            sessionID,
+            key,
+            taskID: taskIDFromArgs(output.args),
+          });
+        }
+        return;
+      }
+
+      // A non-polling tool call is a meaningful action. It starts a new
+      // supervision observation, while alternating polling tools do not.
+      resetTaskSupervision(sessionID);
       const existing = sessions.get(sessionID);
 
       // Refuse only on a CONFIRMED identical run: the previous BLOCK_AT
@@ -168,7 +240,7 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
         );
       }
 
-      if (input.callID) callKeys.set(input.callID, key);
+      if (input.callID) callKeys.set(input.callID, { sessionID, key });
     },
 
     'tool.execute.after': async (
@@ -180,8 +252,45 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
       const tool = input.tool.toLowerCase();
       if (LOOP_GUARD_EXEMPT[tool]) return;
 
-      const key = input.callID ? callKeys.get(input.callID) : undefined;
+      const call = input.callID ? callKeys.get(input.callID) : undefined;
       if (input.callID) callKeys.delete(input.callID);
+      // An after hook without a matching before hook is stale. In particular,
+      // do not let a late after hook recreate state after session deletion.
+      if (!input.callID || !call) return;
+      if (TASK_SUPERVISION_TOOLS.has(tool)) {
+        const taskID = taskIDFromOutput(output.output) ?? call?.taskID;
+        const lifecycleState = lifecycleStateFromOutput(output.output);
+        if (!taskID || !lifecycleState) return;
+
+        let states = taskSupervision.get(sessionID);
+        if (!states) {
+          states = new Map();
+          taskSupervision.set(sessionID, states);
+        }
+        const previous = states.get(taskID);
+        const state: TaskSupervisionState = {
+          lifecycleState,
+          runs:
+            previous?.lifecycleState === lifecycleState ? previous.runs + 1 : 1,
+        };
+        states.set(taskID, state);
+        if (
+          state.runs >= LOOP_GUARD_WARN_AT &&
+          typeof output.output === 'string' &&
+          !output.output.includes(LOOP_GUARD_MARKER)
+        ) {
+          log('[tool-loop-guard] warned repeated task supervision', {
+            sessionID,
+            tool,
+            taskID,
+            lifecycleState,
+            runs: state.runs,
+          });
+          output.output += `\n${LOOP_GUARD_WARNING}`;
+        }
+        return;
+      }
+      const key = call?.key;
       const outputHash = fingerprint(tool, output.output);
 
       const existing = sessions.get(sessionID);
@@ -216,15 +325,34 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
       output.output += `\n${LOOP_GUARD_WARNING}`;
     },
 
+    /** Record a new durable user message, once per message identity. */
+    observeNewUserMessage(sessionID: string, messageID: string): void {
+      if (userMessageIdentities.get(sessionID) === messageID) return;
+      userMessageIdentities.set(sessionID, messageID);
+      resetTaskSupervision(sessionID);
+    },
+
+    /** Clear task supervision state at a completed parent turn. */
+    resetTurn(sessionID: string): void {
+      resetTaskSupervision(sessionID);
+    },
+
     /** Clear all state for a finished/deleted session. */
     resetSession(sessionID: string): void {
       sessions.delete(sessionID);
+      resetTaskSupervision(sessionID);
+      userMessageIdentities.delete(sessionID);
+      for (const [callID, call] of callKeys) {
+        if (call.sessionID === sessionID) callKeys.delete(callID);
+      }
     },
 
     /** Test seam: wipe state between cases. */
     resetForTests(): void {
       sessions.clear();
       callKeys.clear();
+      taskSupervision.clear();
+      userMessageIdentities.clear();
     },
   };
 }

@@ -70,6 +70,7 @@ const RETRYABLE_ERROR_PATTERNS = [
   /rate.?limit/i,
   /too many requests/i,
   /quota.?exceeded/i,
+  /\bquota\b.*\bexhausted/i,
   /quota.?threshold/i,
   /usage.?exceeded/i,
   /ExceededBudget/i,
@@ -100,6 +101,18 @@ const RETRYABLE_ERROR_PATTERNS = [
   // "provider returned error" wording, which wraps any provider 4xx (e.g. a
   // genuine 400 the next model would reproduce) and must stay a hard error.
   /\b401\b/,
+  // Content-policy moderation rejections (e.g. OpenAI "cyber_policy",
+  // "content_policy_violation") arrive as HTTP 400 invalid_request with a
+  // provider-specific policy code in the body. They are deterministic per
+  // provider — retrying the same model will fail again, but a different
+  // provider in the chain does not share the policy, so the next model
+  // should be tried. Match the structured codes and the exact provider
+  // wording; do NOT match generic "flagged"/"policy" words that could
+  // appear in ordinary error text.
+  /\bcyber_policy\b/,
+  /\bcontent_policy_violation\b/,
+  /flagged for possible cybersecurity risk/i,
+  /rejected as a result of our safety system/i,
 ];
 
 const OUTAGE_STATUS_CODES = new Set([500, 502, 503, 504]);
@@ -308,6 +321,20 @@ function getProcessFallbacksInProgress(): Set<string> {
   return globalWithStore[FALLBACK_IN_PROGRESS_KEY];
 }
 
+type SessionModelChangedCallback = (sessionID: string, model: string) => void;
+type ModelVariants = Record<string, Record<string, string | undefined>>;
+type TaskSessionPredicate = (sessionID: string) => boolean;
+
+function isCooldownRegistry(value: unknown): value is CooldownRegistry {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<CooldownRegistry>;
+  return (
+    typeof candidate.isDead === 'function' &&
+    typeof candidate.markFailure === 'function' &&
+    typeof candidate.list === 'function'
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Manager
 // ---------------------------------------------------------------------------
@@ -341,6 +368,17 @@ export class ForegroundFallbackManager {
    *   (one retry chance); 2 = exhausted again, aborted — stop intervening.
    *   Reset to 0 on successful responses or session deletion. */
   private readonly chainExhaustion = new Map<string, number>();
+  /** sessionID → notified when the session switched to a new model mid-flight
+   *  (e.g. after a fallback re-prompt). Lets the background-task admission
+   *  scheduler migrate provider/model accounting to the new model. */
+  private readonly onSessionModelChanged?: SessionModelChangedCallback;
+  /** Persistent cross-process model availability state. */
+  private readonly cooldownRegistry: CooldownRegistry;
+  /** Optional per-agent variants to preserve on fallback replays. */
+  private readonly modelVariants: ModelVariants;
+  /** Identifies task-owned sessions whose synthetic quota recovery is managed
+   *  by the task-session-manager rather than the foreground event path. */
+  private readonly isTaskSession: TaskSessionPredicate | undefined;
 
   /** Exposed for task-session-manager: prevents idle reconciliation
    *  while a fallback abort/re-prompt is in flight for this session. */
@@ -458,9 +496,36 @@ export class ForegroundFallbackManager {
     const originalRetries = sessionID
       ? this.sessionRetries.get(sessionID)
       : undefined;
-    const tried = new Set(originalTried);
-    if (currentModel) tried.add(currentModel);
+    let tried = new Set(originalTried);
+
+    // Match execFallback's upstream per-turn reset and terminal recovery. A
+    // synthetic quota continuation can be the first fallback event of a fresh
+    // turn too, so observing the configured primary must restart the descent
+    // rather than inherit the previous turn's tried/exhaustion state.
     let nextExhaustion = originalExhaustion;
+    const observedModel = sessionID
+      ? this.sessionModel.get(sessionID)
+      : undefined;
+    const startsFreshDescent =
+      observedModel !== undefined &&
+      observedModel === chain[0] &&
+      originalTried.size > 1;
+    if (startsFreshDescent) {
+      tried = new Set();
+      nextExhaustion = undefined;
+    }
+
+    // A terminal descent remains terminal until a genuinely observed primary
+    // starts a new turn. Returning no candidate here keeps synthetic quota
+    // recovery aligned with execFallback's bounded loop behavior.
+    if (nextExhaustion === 2) return undefined;
+
+    const previouslyTried = new Set(tried);
+    if (currentModel) tried.add(currentModel);
+    if (currentModel) {
+      const idx = chain.indexOf(currentModel);
+      for (let i = 0; i < idx; i++) tried.add(chain[i]);
+    }
 
     let nextModel = chain.find(
       (m) => !tried.has(m) && !this.cooldownRegistry.isDead(m),
@@ -469,8 +534,14 @@ export class ForegroundFallbackManager {
     if (!nextModel) {
       if (chain.length > 1) {
         const allCooling = chain.every((m) => this.cooldownRegistry.isDead(m));
-        if (allCooling) {
-          if ((originalExhaustion ?? 0) >= 1) return undefined;
+        const currentIndex = currentModel ? chain.indexOf(currentModel) : -1;
+        const descendedPastEarlierModel =
+          currentIndex > 0 &&
+          chain
+            .slice(0, currentIndex)
+            .some((model) => previouslyTried.has(model));
+        if (allCooling && !descendedPastEarlierModel) {
+          if ((nextExhaustion ?? 0) >= 1) return undefined;
           nextExhaustion = 1;
           const snapshot = this.cooldownRegistry.list();
           const soonest = [...chain].sort(
@@ -479,7 +550,7 @@ export class ForegroundFallbackManager {
           )[0];
           nextModel = soonest;
         } else {
-          if ((originalExhaustion ?? 0) >= 1) return undefined;
+          if ((nextExhaustion ?? 0) >= 1) return undefined;
           nextExhaustion = 1;
           const stickyFallback = chain[chain.length - 1];
           nextModel = stickyFallback;
@@ -515,6 +586,7 @@ export class ForegroundFallbackManager {
         } else {
           this.chainExhaustion.set(sessionID, nextExhaustion);
         }
+        this.onSessionModelChanged?.(sessionID, nextModel);
         return true;
       };
       return { model: nextModel, variant, commit };
@@ -535,13 +607,63 @@ export class ForegroundFallbackManager {
     /** Consecutive 429s tolerated on the same model before swap/abort. */
     private readonly maxRetries: number = 3,
     coordinator?: SessionLifecycle,
-    private readonly cooldownRegistry: CooldownRegistry = getCooldownRegistry(),
-    private readonly modelVariants: Record<
-      string,
-      Record<string, string | undefined>
-    > = {},
-    private readonly isTaskSession?: (sessionID: string) => boolean,
+    cooldownRegistryOrOnSessionModelChanged:
+      | CooldownRegistry
+      | SessionModelChangedCallback = getCooldownRegistry(),
+    cooldownRegistryOrModelVariants?: CooldownRegistry | ModelVariants,
+    modelVariantsOrIsTaskSession?: ModelVariants | TaskSessionPredicate,
+    isTaskSessionOrOnSessionModelChanged?:
+      | TaskSessionPredicate
+      | SessionModelChangedCallback,
   ) {
+    // Keep both constructor shapes valid across the merge: upstream supplies
+    // the admission callback in slot 6, while the fork already used that slot
+    // for its cooldown registry. The merged production path then supplies the
+    // fork's registry, variants, and task-session predicate after the callback.
+    let cooldownRegistry = getCooldownRegistry();
+    let modelVariants: ModelVariants = {};
+    let taskSessionPredicate: TaskSessionPredicate | undefined;
+    let onSessionModelChanged: SessionModelChangedCallback | undefined;
+
+    if (typeof cooldownRegistryOrOnSessionModelChanged === 'function') {
+      onSessionModelChanged = cooldownRegistryOrOnSessionModelChanged;
+      if (isCooldownRegistry(cooldownRegistryOrModelVariants)) {
+        cooldownRegistry = cooldownRegistryOrModelVariants;
+        if (typeof modelVariantsOrIsTaskSession === 'function') {
+          taskSessionPredicate = modelVariantsOrIsTaskSession;
+        } else {
+          modelVariants = modelVariantsOrIsTaskSession ?? {};
+          taskSessionPredicate = isTaskSessionOrOnSessionModelChanged as
+            | TaskSessionPredicate
+            | undefined;
+        }
+      } else {
+        modelVariants = cooldownRegistryOrModelVariants ?? {};
+        taskSessionPredicate =
+          typeof modelVariantsOrIsTaskSession === 'function'
+            ? modelVariantsOrIsTaskSession
+            : (isTaskSessionOrOnSessionModelChanged as
+                | TaskSessionPredicate
+                | undefined);
+      }
+    } else {
+      cooldownRegistry = cooldownRegistryOrOnSessionModelChanged;
+      if (!isCooldownRegistry(cooldownRegistryOrModelVariants)) {
+        modelVariants = cooldownRegistryOrModelVariants ?? {};
+      }
+      taskSessionPredicate =
+        typeof modelVariantsOrIsTaskSession === 'function'
+          ? modelVariantsOrIsTaskSession
+          : undefined;
+      onSessionModelChanged = isTaskSessionOrOnSessionModelChanged as
+        | SessionModelChangedCallback
+        | undefined;
+    }
+
+    this.cooldownRegistry = cooldownRegistry;
+    this.modelVariants = modelVariants;
+    this.isTaskSession = taskSessionPredicate;
+    this.onSessionModelChanged = onSessionModelChanged;
     if (coordinator) {
       coordinator.onSessionDeleted((id) => {
         this.sessionModel.delete(id);
@@ -991,11 +1113,8 @@ export class ForegroundFallbackManager {
   ): Promise<void> {
     const session = getClient(this.input).session;
     try {
-      // After the chain has been exhausted twice (reset retry failed and we
-      // aborted), do not intervene again for this session: re-entering would
-      // keep aborting in a loop. Surface errors to the user instead.
-      if (this.chainExhaustion.get(sessionID) === 2) return;
-      let currentModel = this.sessionModel.get(sessionID);
+      const observedModel = this.sessionModel.get(sessionID);
+      let currentModel = observedModel;
       const agentName = this.sessionAgent.get(sessionID);
       const chain = this.resolveChain(agentName, currentModel);
       // Callers pre-check via hasFallbackChain; keep as defensive guard only.
@@ -1014,21 +1133,81 @@ export class ForegroundFallbackManager {
       }
       // biome-ignore lint/style/noNonNullAssertion: We just set this above
       let tried = this.sessionTried.get(sessionID)!;
+
+      // A new user turn always re-sends the agent's configured primary:
+      // promptAsync's `model` is a per-message override, so a fallback never
+      // persists past the message it was applied to. Landing here on chain[0]
+      // with a tried set that already walked past it therefore means the
+      // previous descent has ended and its state is stale. Without this the
+      // next descent resumes one link deeper every turn (link 2, then 3, then
+      // 4...) until the chain is spent and the session aborts, instead of
+      // re-walking from link 2 each turn.
+      //
+      // This does not weaken the backward-fallback guard below: currentModel
+      // is re-added immediately after, so chain[0] still can never be picked.
+      // Only an OBSERVED chain[0] counts. execFallback infers
+      // `currentModel = chain[0]` above when no model was ever captured for
+      // this session, which is the opposite situation — resetting there would
+      // re-pick chain[1] on every error instead of descending.
+      // size > 1 means a previous descent actually selected a fallback
+      // (tried.add(nextModel) below), so there is stale state to clear. A
+      // single-entry chain never gets there and must stay terminal after its
+      // one abort rather than re-aborting on every error.
+      if (
+        observedModel !== undefined &&
+        observedModel === chain[0] &&
+        tried.size > 1
+      ) {
+        tried = new Set();
+        this.sessionTried.set(sessionID, tried);
+        // A descent that ended in a stage-2 abort is never followed by a
+        // successful assistant message, so the message.updated recovery path
+        // cannot clear chainExhaustion and fallback would stay disabled for
+        // the rest of the session. A fresh descent earns a fresh chance.
+        this.chainExhaustion.delete(sessionID);
+      }
+
+      // Capture descent history before adding the currently observed model and
+      // seeding earlier chain entries below. A model that was already visited
+      // in this descent must never become eligible again merely because every
+      // configured model now has a persistent cooldown. Conversely, a session
+      // that starts on a later model because its primary was already cooling
+      // has no such descent history and may perform the fork's one bounded
+      // soonest-reset probe.
+      const previouslyTried = new Set(tried);
+
+      // After the chain has been exhausted twice (reset retry failed and we
+      // aborted), do not intervene again for this session: re-entering would
+      // keep aborting in a loop. Surface errors to the user instead.
+      if (this.chainExhaustion.get(sessionID) === 2) return;
       if (currentModel) tried.add(currentModel);
+      // ponytail: seed chain entries at or before the current model's index
+      // to prevent backward fallback onto models the session already left.
+      if (currentModel) {
+        const idx = chain.indexOf(currentModel);
+        for (let i = 0; i < idx; i++) tried.add(chain[i]);
+      }
 
       let nextModel = chain.find(
         (m) => !tried.has(m) && !this.cooldownRegistry.isDead(m),
       );
       if (!nextModel) {
         if (chain.length > 1) {
-          // All models in the resolved chain are cooling: re-select the soonest
-          // resetting model (resolveChain already sorts the all-cooling chain by
-          // soonest reset) instead of the sticky-fallback path below, which
-          // would stick to the deepest fallback — the slowest reset.
+          // When all models are cooling and this session has not already
+          // descended past an earlier chain entry, allow one bounded probe of
+          // the soonest-reset model. Once a descent has actually left an
+          // earlier model, retain upstream's no-backtracking sticky-fallback
+          // semantics instead of reviving that model from persistent state.
           const allCooling = chain.every((m) =>
             this.cooldownRegistry.isDead(m),
           );
-          if (allCooling) {
+          const currentIndex = currentModel ? chain.indexOf(currentModel) : -1;
+          const descendedPastEarlierModel =
+            currentIndex > 0 &&
+            chain
+              .slice(0, currentIndex)
+              .some((model) => previouslyTried.has(model));
+          if (allCooling && !descendedPastEarlierModel) {
             if ((this.chainExhaustion.get(sessionID) ?? 0) >= 1) {
               this.chainExhaustion.set(sessionID, 2);
               log(
@@ -1181,6 +1360,7 @@ export class ForegroundFallbackManager {
       }
 
       this.sessionModel.set(sessionID, nextModel);
+      this.onSessionModelChanged?.(sessionID, nextModel);
       log('[foreground-fallback] switched to fallback model', {
         sessionID,
         agentName,

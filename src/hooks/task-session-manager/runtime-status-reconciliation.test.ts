@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils';
+import { buildPluginInput } from '../../v2/client-shim';
 import { createRuntimeStatusReconciler } from './runtime-status-reconciliation';
 
 function createReconciler(
@@ -1041,5 +1042,52 @@ describe('runtime status reconciliation', () => {
     await reconciliation;
 
     expect(board.get('child-1')).toMatchObject({ state: 'running' });
+  });
+
+  test('v2 shim client (no session.status) never confirms a stop', async () => {
+    // The v2 client shim deliberately omits session.status: an empty-but-
+    // valid status map from a fake stub would let stop-confirmation mark a
+    // still-running job `stopped` after the grace. Omission must surface
+    // as snapshot.error → markStatusUncertain, even far beyond the grace.
+    const board = new BackgroundJobBoard();
+    const contextFilesForPrompt = mock(() => []);
+    const prune = mock(() => {});
+    const reconciler = createRuntimeStatusReconciler({
+      input: {
+        directory: '/test/project',
+        client: buildPluginInput({} as never).client,
+      } as never,
+      backgroundJobBoard: board,
+      stopConfirmationGraceMs: 0,
+      taskContextTracker: {
+        pendingManagedTaskIds: new Set(['child-1']),
+        contextFilesForPrompt,
+        prune,
+      },
+    });
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'shim status omission',
+      now: 0,
+    });
+    const listener = mock(() => {});
+    board.addTerminalStateListener(listener);
+
+    await reconciler.reconcile();
+    await reconciler.reconcile();
+
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
+    });
+    expect(board.get('child-1')?.lastStatusError).toContain(
+      'Runtime status lookup failed',
+    );
+    expect(listener).not.toHaveBeenCalled();
+    expect(contextFilesForPrompt).not.toHaveBeenCalled();
+    expect(prune).not.toHaveBeenCalled();
+    reconciler.dispose();
   });
 });

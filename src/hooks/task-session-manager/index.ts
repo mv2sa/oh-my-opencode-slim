@@ -4,6 +4,7 @@ import {
   type BackgroundJobExecution,
   type BackgroundJobStore,
   type BackgroundJobSupervisor,
+  type BackgroundTaskConcurrency,
   clearBackgroundJobSuppression,
   deriveFullObjective,
   deriveTaskSessionLabel,
@@ -35,7 +36,10 @@ import { handleEvent } from './event-router';
 import { createIdleReconciler } from './idle-reconciliation';
 import { createIdleSessionTokens } from './idle-session-tokens';
 import { createInputWaitTracker } from './input-wait-tracker';
-import { createPendingCallTracker } from './pending-call-tracker';
+import {
+  createPendingCallTracker,
+  type PendingCallTracker,
+} from './pending-call-tracker';
 import type { RevivedRunTracker } from './revived-run-tracker';
 import { createRuntimeStatusReconciler } from './runtime-status-reconciliation';
 import { createTaskContextTracker } from './task-context-tracker';
@@ -61,6 +65,11 @@ function rehydrateHistoricalRunningTasks(
   shouldManageSession: (sessionID: string) => boolean,
   registerSessionAsOrchestrator?: (sessionID: string) => void,
   rehydrateTombstones?: ReadonlySet<string>,
+  backgroundTaskConcurrency?: BackgroundTaskConcurrency,
+  getModelForAgent?: (
+    agentType: string,
+    parentSessionID?: string,
+  ) => string | undefined,
 ): number {
   let rehydrated = 0;
   const managedOrchestratorSessionIDs = new Set<string>();
@@ -140,6 +149,16 @@ function rehydrateHistoricalRunningTasks(
         // to the first runtime-status reconciliation.
         now: 0,
       });
+      // Re-claim the admission slot this still-running task already holds.
+      // The scheduler is recreated on every plugin re-init (the factory re-
+      // runs on config updates), so without this restore a fresh scheduler
+      // would admit a second concurrent task past the configured cap. The
+      // model resolution mirrors admission so provider/model caps stay
+      // correct. Idempotent per taskID.
+      backgroundTaskConcurrency?.restoreTask(
+        taskID,
+        getModelForAgent?.(agent, parentSessionID),
+      );
       rehydrated += 1;
     }
   }
@@ -157,6 +176,13 @@ export function createTaskSessionManagerHook(
     readContextMaxFiles?: number;
     backgroundJobBoard?: BackgroundJobStore;
     backgroundJobSupervisor?: BackgroundJobSupervisor;
+    backgroundTaskConcurrency?: BackgroundTaskConcurrency;
+    /** Shared by plugin generations for one admission runtime. */
+    pendingCallTracker?: PendingCallTracker;
+    getModelForAgent?: (
+      agentType: string,
+      parentSessionID?: string,
+    ) => string | undefined;
     shouldManageSession: (sessionID: string) => boolean;
     /** Register a session as orchestrator when the transform hook detects
      *  an orchestrator message but the session isn't in the agent map yet. */
@@ -207,9 +233,11 @@ export function createTaskSessionManagerHook(
     }
   };
 
-  const pendingCallTracker = createPendingCallTracker({
-    releaseLease: (lease) => backgroundJobBoard.releaseLease(lease),
-  });
+  const pendingCallTracker =
+    options.pendingCallTracker ??
+    createPendingCallTracker({
+      releaseLease: (lease) => backgroundJobBoard.releaseLease(lease),
+    });
   const taskContextTracker = createTaskContextTracker();
   const syntheticQuotaCoordinator =
     options.syntheticQuotaCoordinator ?? createSyntheticQuotaCoordinator();
@@ -381,6 +409,15 @@ export function createTaskSessionManagerHook(
       // lose track of the task and report it as cancelled even though the
       // oracle actually completed.
       if (!options.isFallbackInProgress?.(sessionId)) {
+        options.backgroundTaskConcurrency?.releaseTask(sessionId);
+        // The parent's child tasks are about to be dropped from the board.
+        // Normally each child's own session.deleted releases its admission
+        // slot, but a recursive delete can arrive parent-first, and a child
+        // mid-fallback is skipped entirely — release every child's slot here
+        // so none is left holding capacity forever. Idempotent per taskID.
+        for (const child of backgroundJobBoard.list(sessionId)) {
+          options.backgroundTaskConcurrency?.releaseTask(child.taskID);
+        }
         options.backgroundJobSupervisor?.onSessionDeleted(sessionId);
         const hardTimedOut =
           backgroundJobBoard.field(sessionId, 'deadlineExceededAt') !==
@@ -441,6 +478,14 @@ export function createTaskSessionManagerHook(
     revivedRunTracker: options.revivedRunTracker,
     syntheticQuotaCoordinator,
   };
+
+  // Early session.created registrations belong to the pending native call,
+  // not to the factory-local board that first observed them. Move them before
+  // this generation can receive the task after-hook.
+  pendingCallTracker.adoptEarlyRegistrations(
+    backgroundJobBoard,
+    options.backgroundJobSupervisor,
+  );
 
   return {
     markRevivedRunPending: (taskID: string): void => {
@@ -520,6 +565,8 @@ export function createTaskSessionManagerHook(
         registerSessionAsOrchestrator: options.registerSessionAsOrchestrator,
         backgroundJobBoard,
         backgroundJobSupervisor: options.backgroundJobSupervisor,
+        backgroundTaskConcurrency: options.backgroundTaskConcurrency,
+        getModelForAgent: options.getModelForAgent,
         pendingCallTracker,
         taskContextTracker,
         getLifecycleEpoch: () => rehydrateState.nextEpoch,
@@ -537,6 +584,10 @@ export function createTaskSessionManagerHook(
         syntheticQuotaCoordinator,
         backgroundJobBoard,
         backgroundJobSupervisor: options.backgroundJobSupervisor,
+        bindConcurrencyTicket: (taskID, pending) =>
+          pending.concurrencyTicket?.bind(taskID),
+        releaseConcurrencyTask: (taskID) =>
+          options.backgroundTaskConcurrency?.releaseTask(taskID),
         recordLifecycleSuppression: (taskID) =>
           recordBackgroundJobSuppression(backgroundJobBoard, taskID),
         pendingCallTracker,
@@ -569,6 +620,8 @@ export function createTaskSessionManagerHook(
         options.shouldManageSession,
         options.registerSessionAsOrchestrator,
         rehydrateTombstones,
+        options.backgroundTaskConcurrency,
+        options.getModelForAgent,
       );
 
       for (const [messageIndex, message] of messages.entries()) {
@@ -714,6 +767,8 @@ export function createTaskSessionManagerHook(
         pendingInjectedTerminalJobsByParent,
         retainedBoardSnapshots: injectionState.retainedBoardSnapshots,
         backgroundJobSupervisor: options.backgroundJobSupervisor,
+        bindConcurrencyTicket: (taskID, pending) =>
+          pending.concurrencyTicket?.bind(taskID),
         observeSyntheticTerminalPart: (part) =>
           observeSyntheticTerminalPart(injectionState, part),
         revivedRunTracker: options.revivedRunTracker,

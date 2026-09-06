@@ -58,6 +58,12 @@ describe('resolveRuntimeAgentName', () => {
     );
   });
 
+  test('resolves legacy aliases to internal names', () => {
+    expect(
+      resolveRuntimeAgentName(runtimeFor({} as PluginConfig), 'explore'),
+    ).toBe('explorer');
+  });
+
   test('resolves displayName with @ prefix and whitespace', () => {
     const config = {
       agents: {

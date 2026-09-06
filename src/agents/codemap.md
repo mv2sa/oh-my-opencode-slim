@@ -27,8 +27,9 @@ Each agent is a **prompt-driven specialist** with a factory function that create
 
 - **Default prompts**: Each agent factory has a base prompt defined in its file (e.g., `explorer.ts`, `oracle.ts`)
 - **User overrides**: From `~/.config/opencode/oh-my-opencode-slim.json` via `loadAgentPrompt()`
+- **Agent colors**: Optional per-agent hex or theme-color overrides; no defaults (colorless agents get the host TUI's distinct palette colors)
 - **Permission wildcards**: Applied via `applyDefaultPermissions()` in `index.ts`
-- **Model resolution**: Supports both string models and priority-ordered arrays (`_modelArray`) for runtime fallback
+- **Model resolution**: Supports string models, explicit `inheritModelFrom` policies, and priority-ordered arrays (`_modelArray`) for runtime fallback
 - **Skill permissions**: Per-agent MCP and tool access controlled via `getSkillPermissionsForAgent()`
 
 ### Agent Lifecycle
@@ -121,6 +122,7 @@ export function getAgentConfigs(config?: PluginConfig): Record<string, SDKAgentC
 ### Model Resolution and Fallback
 
 - **Priority arrays**: When `model` is configured as an array in user config, it's stored as `_modelArray`
+- **Explicit inheritance**: `inheritModelFrom: "session"` leaves the agent model unset so OpenCode uses the parent session model; `"orchestrator"` follows the model resolved during configuration, not later runtime fallback
 - **Runtime fallback**: ForegroundFallbackManager resolves models at runtime when API errors occur
 - **Preset overrides**: Runtime presets can override model/variant/temperature per agent
 

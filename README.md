@@ -1,6 +1,6 @@
 <div align="center">
   <a href="https://github.com/alvinunreal/oh-my-opencode-slim/stargazers">
-    <img src="img/v2.webp" alt="oh-my-opencode-slim V2 Release" style="border-radius: 10px;">
+    <img src="img/v2.jpg" alt="oh-my-opencode-slim V2 Release" style="border-radius: 10px;">
   </a>
   <h3>✨ oh-my-opencode-slim ✨</h3>
 
@@ -132,6 +132,25 @@ bun install
 bun run build
 ```
 
+### OpenCode v2 (`opencode2`)
+
+The same package runs on both OpenCode v1 and v2. On v2 you get the full
+agent pantheon, delegation through the host `subagent` tool (bridged into the
+background job board), all built-in tools and slash commands, auto-registered
+MCPs, `/preset` in the TUI, webfetch secondary-model summaries, and
+rate-limit model fallback. Multiplexer panes and the orchestrator-wake
+scheduler stay v1-only by design (v2 renders and notifies subagents natively).
+
+v2 auto-refreshes unpinned plugins on startup, so pin an exact version while
+both v2 and this adapter evolve quickly:
+
+```json
+{ "plugin": ["oh-my-opencode-slim@2.2.17"] }
+```
+
+Details, the feature matrix, and per-feature minimum v2 builds:
+[OpenCode v2 Compatibility](docs/opencode-v2-compatibility.md).
+
 ### Getting Started
 
 The installer generates both OpenAI and OpenCode Go presets, with OpenAI active by default.
@@ -236,7 +255,7 @@ If any agent fails to respond, check your provider authentication and config fil
 <table>
   <tr>
     <td width="30%" align="center" valign="top">
-      <img src="img/orchestrator.png" width="240" style="border-radius: 10px;">
+      <img src="img/orchestrator.jpg" width="240" style="border-radius: 10px;">
       <br><sub><i>Forged in the void of complexity.</i></sub>
     </td>
     <td width="70%" valign="top">
@@ -277,7 +296,7 @@ If any agent fails to respond, check your provider authentication and config fil
 <table>
   <tr>
     <td width="30%" align="center" valign="top">
-      <img src="img/explorer.png" width="240" style="border-radius: 10px;">
+      <img src="img/explorer.jpg" width="240" style="border-radius: 10px;">
       <br><sub><i>The wind that carries knowledge.</i></sub>
     </td>
     <td width="70%" valign="top">
@@ -318,7 +337,7 @@ If any agent fails to respond, check your provider authentication and config fil
 <table>
   <tr>
     <td width="30%" align="center" valign="top">
-      <img src="img/oracle.png" width="240" style="border-radius: 10px;">
+      <img src="img/oracle.jpg" width="240" style="border-radius: 10px;">
       <br><sub><i>The voice at the crossroads.</i></sub>
     </td>
     <td width="70%" valign="top">
@@ -362,7 +381,7 @@ If any agent fails to respond, check your provider authentication and config fil
 <table>
   <tr>
     <td width="30%" align="center" valign="top">
-      <img src="img/council.png" width="240" style="border-radius: 10px;">
+      <img src="img/council.jpg" width="240" style="border-radius: 10px;">
       <br><sub><i>Many minds, one verdict.</i></sub>
     </td>
     <td width="70%" valign="top">
@@ -408,7 +427,7 @@ If any agent fails to respond, check your provider authentication and config fil
 <table>
   <tr>
     <td width="30%" align="center" valign="top">
-      <img src="img/librarian.png" width="240" style="border-radius: 10px;">
+      <img src="img/librarian.jpg" width="240" style="border-radius: 10px;">
       <br><sub><i>The weaver of understanding.</i></sub>
     </td>
     <td width="70%" valign="top">
@@ -449,7 +468,7 @@ If any agent fails to respond, check your provider authentication and config fil
 <table>
   <tr>
     <td width="30%" align="center" valign="top">
-      <img src="img/designer.png" width="240" style="border-radius: 10px;">
+      <img src="img/designer.jpg" width="240" style="border-radius: 10px;">
       <br><sub><i>Beauty is essential.</i></sub>
     </td>
     <td width="70%" valign="top">
@@ -490,7 +509,7 @@ If any agent fails to respond, check your provider authentication and config fil
 <table>
   <tr>
     <td width="30%" align="center" valign="top">
-      <img src="img/fixer.png" width="240" style="border-radius: 10px;">
+      <img src="img/fixer.jpg" width="240" style="border-radius: 10px;">
       <br><sub><i>The final step between vision and reality.</i></sub>
     </td>
     <td width="70%" valign="top">
@@ -661,6 +680,7 @@ Use this section as a map: start with installation, then jump to features, confi
 | Doc | What it covers |
 |-----|----------------|
 | **[Installation Guide](docs/installation.md)** | Install the plugin, use CLI flags, reset config, and troubleshoot setup |
+| **[OpenCode v2 Compatibility](docs/opencode-v2-compatibility.md)** | Run the same plugin on `opencode2`: feature matrix, minimum v2 builds, version pinning |
 | **[Configuration](docs/configuration.md)** | Config file locations, JSONC support, prompt overrides, and full option reference |
 | **[Project Customization](docs/project-local-customization.md)** | Repository-specific custom agents, prompt overrides, per-agent skills, and precedence |
 | **[Background Orchestration](docs/background-orchestration.md)** | Scheduler-first orchestrator model built around native background subagents |
@@ -678,7 +698,7 @@ Use this section as a map: start with installation, then jump to features, confi
   <p><sub>Every merged contribution leaves a mark on the realm.</sub></p>
 
   <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-104-orange.svg?style=flat-square)](#contributors-)
+[![All Contributors](https://img.shields.io/badge/all_contributors-107-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 </div>
 
@@ -828,6 +848,9 @@ Use this section as a map: start with installation, then jump to features, confi
     <tr>
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/zjm54321"><img src="https://avatars.githubusercontent.com/u/20168947?v=4?s=100" width="100px;" alt="落花有意"/><br /><sub><b>落花有意</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=zjm54321" title="Code">💻</a></td>
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/JoJohanse"><img src="https://avatars.githubusercontent.com/u/97782983?v=4?s=100" width="100px;" alt="JoJohanse"/><br /><sub><b>JoJohanse</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=JoJohanse" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/Alfiegerner"><img src="https://avatars.githubusercontent.com/u/596188?v=4?s=100" width="100px;" alt="Alfiegerner"/><br /><sub><b>Alfiegerner</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=Alfiegerner" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/leducmaxime"><img src="https://avatars.githubusercontent.com/u/37900355?v=4?s=100" width="100px;" alt="Maxime Leduc"/><br /><sub><b>Maxime Leduc</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=leducmaxime" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/vmvarela"><img src="https://avatars.githubusercontent.com/u/11040851?v=4?s=100" width="100px;" alt="Victor M. Varela"/><br /><sub><b>Victor M. Varela</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=vmvarela" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

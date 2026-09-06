@@ -1,5 +1,8 @@
 import { z } from 'zod';
-import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from './constants';
+import {
+  AGENT_THEME_COLORS,
+  DEFAULT_MAX_RETAINED_SNAPSHOTS,
+} from './constants';
 import { CouncilConfigSchema } from './council-schema';
 
 export const ProviderModelIdSchema = z
@@ -49,7 +52,19 @@ export const PermissionConfigSchema = z.union([
   PermissionObjectSchema,
 ]);
 
+export const AgentColorSchema = z.union([
+  z
+    .string()
+    .regex(/^#[0-9a-fA-F]{6}$/, 'Expected a six-digit hex color (#RRGGBB)'),
+  z.enum(AGENT_THEME_COLORS),
+]);
+
 // Agent override configuration (distinct from SDK's AgentConfig)
+export const ModelInheritanceSourceSchema = z.enum(['session', 'orchestrator']);
+export type ModelInheritanceSource = z.infer<
+  typeof ModelInheritanceSourceSchema
+>;
+
 export const AgentOverrideConfigSchema = z
   .object({
     model: z
@@ -68,6 +83,7 @@ export const AgentOverrideConfigSchema = z
           .min(1),
       ])
       .optional(),
+    inheritModelFrom: ModelInheritanceSourceSchema.optional(),
     temperature: z.number().min(0).max(2).optional(),
     variant: z.string().optional().catch(undefined),
     skills: z.array(z.string()).optional(), // skills this agent can use ("*" = all, "!item" = exclude)
@@ -76,6 +92,9 @@ export const AgentOverrideConfigSchema = z
     orchestratorPrompt: z.string().min(1).optional(),
     options: z.record(z.string(), z.unknown()).optional(), // provider-specific model options (e.g., textVerbosity, thinking budget)
     displayName: z.string().min(1).optional(),
+    color: AgentColorSchema.optional().describe(
+      'Agent display color as #RRGGBB or an OpenCode theme color',
+    ),
     description: z.string().min(1).optional(),
     permission: PermissionConfigSchema.optional(), // tool-level permission rules enforced by the SDK
   })
@@ -155,6 +174,43 @@ export const InterviewConfigSchema = z.object({
 
 export type InterviewConfig = z.infer<typeof InterviewConfigSchema>;
 
+const ConcurrencyLimitSchema = z.number().int().min(0).max(1000);
+
+export const BackgroundTaskConcurrencyConfigSchema = z
+  .object({
+    defaultConcurrency: z
+      .number()
+      .int()
+      .min(0)
+      .max(1000)
+      .default(0)
+      .describe(
+        'Maximum concurrently running native background tasks. 0 disables the default cap.',
+      ),
+    providerConcurrency: z
+      .record(z.string().min(1), ConcurrencyLimitSchema)
+      .default({})
+      .describe(
+        'Per-provider concurrency caps keyed by provider ID. The most specific configured cap wins: model > provider > default. 0 means unlimited for that provider.',
+      ),
+    modelConcurrency: z
+      .record(z.string().min(1), ConcurrencyLimitSchema)
+      .default({})
+      .describe(
+        'Per-model concurrency caps keyed by provider/model ID. The most specific configured cap wins: model > provider > default. 0 means unlimited for that model.',
+      ),
+  })
+  .strict()
+  .default({
+    defaultConcurrency: 0,
+    providerConcurrency: {},
+    modelConcurrency: {},
+  });
+
+export type BackgroundTaskConcurrencyConfig = z.infer<
+  typeof BackgroundTaskConcurrencyConfigSchema
+>;
+
 export const BackgroundJobsConfigSchema = z.object({
   strategy: z
     .enum(['latest', 'checkpoint-compatible'])
@@ -221,6 +277,7 @@ export const BackgroundJobsConfigSchema = z.object({
     .describe(
       'Sustained child-idle interval required after the parent can accept terminal delivery before a task is reported stopped (5,000–300,000ms).',
     ),
+  concurrency: BackgroundTaskConcurrencyConfigSchema,
   waitForUserGuard: z
     .boolean()
     .default(true)

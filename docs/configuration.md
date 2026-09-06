@@ -37,6 +37,10 @@ The TUI sidebar uses the compact layout by default. Set `compactSidebar` to
 }
 ```
 
+While an agent session reports `busy` or `retry`, the sidebar shows an
+animated Braille indicator after that agent's name. The indicator disappears
+after every active session for that agent becomes idle or is deleted.
+
 ---
 
 ## Prompt Overriding
@@ -116,6 +120,7 @@ Presets can also be switched at runtime without restarting using the `/preset` c
 | `presets.<name>.<agent>.temperature` | number | - | Optional temperature (0–2); when omitted, OpenCode chooses its default |
 | `presets.<name>.<agent>.variant` | string | - | Reasoning effort: `"low"`, `"medium"`, `"high"`, or `"max"` (provider-specific) |
 | `presets.<name>.<agent>.displayName` | string | - | Custom user-facing alias for the agent (e.g. `"advisor"` for `oracle`) |
+| `presets.<name>.<agent>.color` | string | - | Agent display color as `#RRGGBB` or a theme color: `primary`, `secondary`, `accent`, `success`, `warning`, `error`, or `info` |
 | `presets.<name>.<agent>.skills` | string[] | - | Skills the agent can use (`"*"`, `"!item"`, explicit list) |
 | `presets.<name>.<agent>.mcps` | string[] | - | MCPs the agent can use (`"*"`, `"!item"`, explicit list) |
 | `presets.<name>.<agent>.options` | object | - | Provider-specific model options passed to the AI SDK (e.g., `textVerbosity`, `thinking` budget) |
@@ -124,6 +129,7 @@ Presets can also be switched at runtime without restarting using the `/preset` c
 | `agents.<customAgent>.orchestratorPrompt` | string | - | Exact `@agent` block injected into the orchestrator prompt; must start with `@<agent-name>` |
 | `agents.<agent>.permission` | object \| string | - | Tool-level permission rules enforced by the SDK. See [Agent Permissions](#agent-permissions) |
 | `agents.<agent>.displayName` | string | - | Custom user-facing alias for the agent in the active config |
+| `agents.<agent>.color` | string | - | Agent display color as `#RRGGBB` or a theme color: `primary`, `secondary`, `accent`, `success`, `warning`, `error`, or `info` |
 | `agents.<agent>.description` | string | generated | Description shown to OpenCode and the orchestrator; defaults to `Custom subagent '<name>'` for custom agents |
 | `acpAgents.<name>.command` | string | - | Command for an external ACP-compatible agent; creates a wrapper subagent named `<name>` See [ACP-connected agents](#acp-connected-agents). |
 | `acpAgents.<name>.args` | string[] | `[]` | Arguments for the ACP agent command See [ACP-connected agents](#acp-connected-agents). |
@@ -156,6 +162,9 @@ Presets can also be switched at runtime without restarting using the `/preset` c
 | `backgroundJobs.wallClockTimeoutMs` | integer | `0` | **Opt-in wall-clock supervisor.** `0` disables it. Otherwise, only native `task(..., background: true)` child sessions are supervised; accepted values are `60000`–`2147483647` milliseconds See [Background Job Management](#background-job-management). |
 | `backgroundJobs.abortGraceMs` | integer | `10000` | Grace period after a wall-clock deadline for a terminal confirmation. Accepted values are `1000`–`60000` milliseconds; a hanging or failed abort does not extend this grace See [Background Job Management](#background-job-management). |
 | `backgroundJobs.stopConfirmationMs` | integer | `30000` | Sustained child-idle interval required after the parent can accept terminal delivery before a task is reported stopped (`5000`–`300000` milliseconds). Missing runtime status is uncertainty, not stop evidence. See [Background Orchestration](background-orchestration.md#runtime-liveness-reconciliation). |
+| `backgroundJobs.concurrency.defaultConcurrency` | integer | `0` | Maximum concurrently running native background tasks. `0` means unlimited; accepted values are `0`–`1000` See [Background Job Management](#background-job-management). |
+| `backgroundJobs.concurrency.providerConcurrency` | object | `{}` | Per-provider caps keyed by provider ID. Each value must be `0`–`1000`, where `0` means unlimited for that provider. The most specific configured cap wins: model > provider > default See [Background Job Management](#background-job-management). |
+| `backgroundJobs.concurrency.modelConcurrency` | object | `{}` | Per-model caps keyed by `provider/model` ID. Each value must be `0`–`1000`, where `0` means unlimited for that model. The most specific configured cap wins: model > provider > default See [Background Job Management](#background-job-management). |
 | `backgroundJobs.waitForUserGuard` | boolean | `true` | When true, intercepts `wait_for_user` calls while background tasks are still running and the orchestrator wake scheduler is enabled, returning guidance to end the turn instead of blocking on manual input. See [Background Job Management](#background-job-management). |
 | `disabled_mcps` | string[] | `[]` | MCP server IDs to disable globally |
 | `fallback.enabled` | boolean | `true` | Enable Slim's foreground model-chain failover. It does not configure OpenCode provider/AI-SDK retries. |
@@ -307,7 +316,16 @@ The wall-clock supervisor is separately opt-in and remains disabled unless
       "intervalMs": 300000
     },
     "wallClockTimeoutMs": 900000,
-    "abortGraceMs": 10000
+    "abortGraceMs": 10000,
+    "concurrency": {
+      "defaultConcurrency": 2,
+      "providerConcurrency": {
+        "openai": 2
+      },
+      "modelConcurrency": {
+        "openai/gpt-5.6-luna": 1
+      }
+    }
   }
 }
 ```
@@ -317,6 +335,36 @@ Set `enabled: false` to keep idle reconciliation and background-job orchestratio
 without periodic wake prompts. See the
 [Background Orchestration](background-orchestration.md) guide for the concept,
 defaults, and examples.
+
+`concurrency` limits only native background tasks with
+`task(..., background: true)`. Foreground tasks are unchanged. A task waits
+for admission before OpenCode creates its child session, so queued work does
+not consume a provider request. `0` means unlimited.
+
+Only the most specific configured cap applies to a task, matching the
+reference implementation's priority: a model cap for the task's model wins
+over a provider cap for its provider, which wins over the default cap. For
+example, with `defaultConcurrency: 2`, `providerConcurrency: {"openai": 5}`
+and `modelConcurrency: {"openai/gpt-4o": 10}`, up to 10 `openai/gpt-4o`
+tasks run concurrently. Queued tasks are admitted in order among tasks whose
+resolved cap has capacity. Terminal completion, cancellation, failure,
+session deletion, and plugin disposal release the slot. A task that switches
+models mid-flight (e.g. foreground model fallback) moves its accounting to
+the new model. The scheduler is process-scoped: when the plugin re-inits on a
+config update, running slots and queued tickets survive, so admission state
+is not reset mid-run.
+
+Two behaviors to know about when concurrency is enabled:
+
+- Sessions that are themselves managed tasks (a background subagent
+  orchestrating its own nested `task(..., background: true)` calls) are
+  exempt from admission. They already hold a slot while running, so waiting
+  for a second one would self-deadlock once the queue saturates.
+- Admission has no timeout of its own. A running task that never reaches a
+  terminal state keeps its slot forever, and queued tasks as well as the
+  orchestrator's `task` calls block behind it. When you enable
+  `concurrency`, pair it with an opt-in `wallClockTimeoutMs` so stalled
+  tasks are eventually forced to a terminal state and release their slots.
 
 Configurations that still use the removed `backgroundJobs.continueOnIdle` key
 emit a deprecation warning and migrate its boolean value to
@@ -361,6 +409,70 @@ Notes:
 - `@` prefixes and surrounding whitespace are normalized automatically
 - Display names must be unique
 - Display names cannot conflict with internal agent names like `oracle` or `explorer`
+
+### Independent agent model inheritance
+
+By default, the `fixer` agent inherits the `librarian` model when no fixer
+model is configured. To decouple agents, set `inheritModelFrom` on the agent
+that should follow the current session or the configured orchestrator model:
+
+```jsonc
+{
+  "agents": {
+    "librarian": {
+      "model": "ollama/qwen3.8:27B"
+    },
+    "fixer": {
+      "inheritModelFrom": "session"
+    }
+  }
+}
+```
+
+Supported values are:
+
+- `session`: omit the agent model so OpenCode uses the current session model
+- `orchestrator`: use the orchestrator model resolved during configuration; if
+  none is configured, fall back to the current session model
+
+`orchestrator` means the model resolved during plugin configuration. It does
+not dynamically follow a later foreground fallback to another model.
+Runtime fallback behavior is independent of `inheritModelFrom`.
+
+Model selection follows these rules:
+
+- If the same effective agent override contains both `model` and
+  `inheritModelFrom`, the explicit `model` wins.
+- If `model` is omitted, `inheritModelFrom` is an explicit higher-layer
+  directive: it clears a lower-layer `model` value, including a model supplied
+  by the host agent configuration, and resolves the requested source.
+- If neither field is present, the existing model precedence and the historical
+  fixer-to-librarian fallback remain unchanged.
+
+The setting works in both root `agents` overrides and preset agent overrides.
+
+### Agent Colors
+
+Built-in agents ship without a default `color`, so the OpenCode TUI assigns
+each one a distinct color from its own theme-aware palette. Set `color`
+explicitly if you want a fixed color for a built-in or custom agent, using a
+six-digit hex value or an OpenCode theme color:
+
+```jsonc
+{
+  "agents": {
+    "oracle": { "color": "#FF5733" },
+    "reviewer": {
+      "model": "openai/gpt-5.6",
+      "color": "info"
+    }
+  }
+}
+```
+
+Theme colors adapt to the active OpenCode theme. Dynamic councillors inherit
+the configured `council` color unless `agents.councillor.color` overrides it.
+`color` works in top-level `agents` overrides and inside `presets`.
 
 ### Per-preset agent configuration
 

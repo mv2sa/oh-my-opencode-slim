@@ -11,7 +11,11 @@ import {
   recordBackgroundJobSuppression,
 } from './background-job-store';
 import { log } from './logger';
-import { parseTaskStatusOutput, type TaskOutputState } from './task';
+import {
+  guardCompletedStatusText,
+  parseTaskStatusOutput,
+  type TaskOutputState,
+} from './task';
 
 export interface ContextFile {
   path: string;
@@ -413,11 +417,18 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     const status = parseTaskStatusOutput(output);
     if (!status) return undefined;
 
+    const guarded = guardCompletedStatusText(
+      status.state,
+      status.result,
+      this.get(status.taskID)?.resultSummary,
+    );
+
     return this.updateStatus({
       taskID: status.taskID,
-      state: status.state,
+      state: guarded.state,
       timedOut: status.timedOut,
-      resultSummary: status.result,
+      resultSummary: guarded.resultSummary,
+      lastStatusError: guarded.lastStatusError,
     });
   }
 

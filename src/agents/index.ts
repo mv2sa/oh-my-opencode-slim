@@ -50,18 +50,23 @@ const TASK_CONTROL_TOOL_NAMES = [
 ] as const;
 const SAFE_AGENT_ALIAS_RE = /^[a-z][a-z0-9_-]*$/i;
 
+export function resolvePrimaryModelValue(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const first = value[0];
+  return typeof first === 'string'
+    ? first
+    : first && typeof first === 'object' && 'id' in first
+      ? typeof first.id === 'string'
+        ? first.id
+        : undefined
+      : undefined;
+}
+
 function getPrimaryModelFromOverride(
   override: AgentOverrideConfig | undefined,
 ): string | undefined {
-  const model = override?.model;
-  if (typeof model === 'string') {
-    return model;
-  }
-  if (Array.isArray(model) && model.length > 0) {
-    const first = model[0];
-    return typeof first === 'string' ? first : first?.id;
-  }
-  return undefined;
+  return resolvePrimaryModelValue(override?.model);
 }
 
 /**
@@ -182,6 +187,7 @@ function applyOverrides(
   if (override.variant) agent.config.variant = override.variant;
   if (override.temperature !== undefined)
     agent.config.temperature = override.temperature;
+  if (override.color) agent.config.color = override.color;
   if (override.options) {
     agent.config.options = {
       ...agent.config.options,
@@ -197,6 +203,124 @@ function applyOverrides(
   // Outcome manager enforces an immutable read-only / no-authority security boundary.
   if (override.permission && agent.name !== 'outcome-manager') {
     agent.config.permission = override.permission;
+  }
+}
+
+/**
+ * Apply an explicit model inheritance policy after the agent factory has
+ * supplied its built-in fallback model. OpenCode uses the parent session model
+ * when an agent config does not specify `model`.
+ */
+function applyModelInheritance(
+  agent: AgentDefinition,
+  override: AgentOverrideConfig | undefined,
+  orchestratorModel: string | undefined,
+): void {
+  if (override?.model !== undefined) return;
+
+  if (
+    override?.inheritModelFrom === 'session' ||
+    (override?.inheritModelFrom === 'orchestrator' &&
+      orchestratorModel === undefined)
+  ) {
+    delete agent.config.model;
+  }
+}
+
+/**
+ * Resolve the model an agent's final config carries, mirroring the combined
+ * effect of `createAgents` fallbacks, `applyOverrides`, and the inheritance
+ * passes. Returns `undefined` exactly when the agent config ends up with NO
+ * model key — i.e. `inheritModelFrom: 'session'` (or `'orchestrator'` with no
+ * configured orchestrator model) — in which case OpenCode serves the agent
+ * with the parent session's current model.
+ *
+ * This is the single resolution source for both agent definition building and
+ * background-task admission, so provider/model concurrency accounting keys off
+ * the model the spawned subagent actually uses. Explicit `model` wins; then
+ * `inheritModelFrom`; then the historical fixer → librarian fallback; then
+ * the preset primary model; then the per-agent default.
+ */
+export function resolveAgentConfigModel(
+  runtime: RuntimeConfig,
+  name: string,
+): string | undefined {
+  const mergedAgents = runtime.agents();
+  const override = getOverrideFromAgents(mergedAgents, name);
+  if (override?.model !== undefined) {
+    return getPrimaryModelFromOverride(override);
+  }
+  if (override?.inheritModelFrom === 'session') {
+    return undefined;
+  }
+  if (override?.inheritModelFrom === 'orchestrator') {
+    return getPrimaryModelFromOverride(
+      getOverrideFromAgents(mergedAgents, 'orchestrator'),
+    );
+  }
+  // Dynamic councillors are defined outside `agents()` under the selected
+  // council preset. Their generated agent config carries the preset model.
+  if (name.startsWith('councillor-')) {
+    const seat = name.slice('councillor-'.length);
+    const preset =
+      runtime.council?.presets?.[runtime.council.default_preset ?? 'default'];
+    return preset?.[seat]?.models?.[0]?.id;
+  }
+  // ACP agents are generated from `acpAgents`; admission is for the wrapper
+  // session, so account for its configured wrapper model when present.
+  if (runtime.acpAgents[name]?.wrapperModel) {
+    return runtime.acpAgents[name].wrapperModel;
+  }
+  if (name === 'fixer') {
+    const librarianModel = getPrimaryModelFromOverride(
+      getOverrideFromAgents(mergedAgents, 'librarian'),
+    );
+    return librarianModel ?? runtime.primaryModel ?? DEFAULT_MODELS.librarian;
+  }
+  return (
+    runtime.primaryModel ??
+    (DEFAULT_MODELS as Record<string, string | undefined>)[name]
+  );
+}
+
+/**
+ * Apply model inheritance to the final host agent config after the host layer
+ * has been merged. This clears stale host models for `session` inheritance,
+ * which cannot be handled by the agent definition alone.
+ */
+export function applyModelInheritanceToConfig(
+  configAgent: Record<string, unknown>,
+  runtime: RuntimeConfig,
+): void {
+  const mergedAgents = runtime.agents();
+  const orchestratorModel = getPrimaryModelFromOverride(
+    runtime.agent('orchestrator'),
+  );
+
+  for (const agentName of Object.keys(configAgent)) {
+    const override = getOverrideFromAgents(mergedAgents, agentName);
+    if (!override) continue;
+    if (
+      override.model !== undefined ||
+      override.inheritModelFrom === undefined
+    ) {
+      continue;
+    }
+
+    const resolvedName = AGENT_ALIASES[agentName] ?? agentName;
+    const entry = configAgent[resolvedName];
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      continue;
+    }
+
+    const agentConfig = entry as Record<string, unknown>;
+    if (override.inheritModelFrom === 'session') {
+      delete agentConfig.model;
+    } else if (orchestratorModel === undefined) {
+      delete agentConfig.model;
+    } else {
+      agentConfig.model = orchestratorModel;
+    }
   }
 }
 
@@ -229,6 +353,7 @@ function buildCustomAgentDefinition(
   override: AgentOverrideConfig,
   filePrompt?: string,
   fileAppendPrompt?: string,
+  fallbackModel?: string,
 ): AgentDefinition {
   const defaultPrompt = appendTaskRejectionInstruction(
     `You are the ${name} specialist.`,
@@ -240,7 +365,7 @@ function buildCustomAgentDefinition(
     name,
     description,
     config: {
-      model: primaryModel ?? DEFAULT_MODELS.oracle,
+      model: primaryModel ?? fallbackModel ?? DEFAULT_MODELS.oracle,
       prompt: resolvePrompt(
         name,
         override.prompt,
@@ -370,14 +495,27 @@ export function createAgents(
   }
 
   const primaryModel = runtime.primaryModel;
+  const orchestratorOverride = getOverrideFromAgents(
+    mergedAgents,
+    'orchestrator',
+  );
+  const configuredOrchestratorModel =
+    getPrimaryModelFromOverride(orchestratorOverride);
 
-  // TEMP: If fixer has no config, inherit from librarian's model to avoid breaking
-  // existing users who don't have fixer in their config yet
+  // Preserve the historical fixer → librarian fallback unless an explicit
+  // inheritance policy opts the fixer into a different source.
   const getModelForAgent = (name: SubagentName): string => {
-    if (
-      name === 'fixer' &&
-      !getOverrideFromAgents(mergedAgents, 'fixer')?.model
-    ) {
+    const override = getOverrideFromAgents(mergedAgents, name);
+    if (override?.model === undefined) {
+      if (override?.inheritModelFrom === 'orchestrator') {
+        return configuredOrchestratorModel ?? (DEFAULT_MODELS[name] as string);
+      }
+      if (override?.inheritModelFrom === 'session') {
+        return primaryModel ?? (DEFAULT_MODELS[name] as string);
+      }
+    }
+
+    if (name === 'fixer' && override?.model === undefined) {
       const librarianOverride = getOverrideFromAgents(
         mergedAgents,
         'librarian',
@@ -451,7 +589,10 @@ export function createAgents(
 
   const protoCustomAgents = customAgentNames.flatMap((name) => {
     const override = getOverrideFromAgents(mergedAgents, name);
-    if (!hasCustomAgentModel(override)) {
+    if (
+      !hasCustomAgentModel(override) &&
+      override?.inheritModelFrom === undefined
+    ) {
       console.warn(
         `[oh-my-opencode] Custom agent '${name}' skipped: 'model' is required`,
       );
@@ -469,6 +610,9 @@ export function createAgents(
         override,
         customPrompts.prompt,
         customPrompts.appendPrompt,
+        override.inheritModelFrom === 'orchestrator'
+          ? configuredOrchestratorModel
+          : primaryModel,
       ),
     ];
   });
@@ -507,6 +651,7 @@ export function createAgents(
     if (override) {
       applyOverrides(agent, override);
     }
+    applyModelInheritance(agent, override, configuredOrchestratorModel);
     applyDefaultPermissions(
       agent,
       agent.name === 'outcome-manager' ? [] : override?.skills,
@@ -520,6 +665,7 @@ export function createAgents(
     if (override) {
       applyOverrides(agent, override);
     }
+    applyModelInheritance(agent, override, configuredOrchestratorModel);
     applyDefaultPermissions(agent, override?.skills, runtime.disabledSkills);
     return agent;
   });
@@ -532,8 +678,15 @@ export function createAgents(
   // Build dynamic councillor agents from council config (flatten mode).
   // Each councillor becomes a dispatchable subagent with its own model,
   // so the orchestrator can task() them with native panes at depth 1.
+  // Only a *configured* color is inherited: councillor override first, then
+  // council override. No default fallback — unconfigured councillors stay
+  // colorless so the host TUI palette keeps assigning distinct colors.
+  const councillorColor =
+    getOverrideFromAgents(mergedAgents, 'councillor')?.color ??
+    getOverrideFromAgents(mergedAgents, 'council')?.color;
   const councillorAgents = buildCouncillorAgents(runtime, disabled).map(
     (agent) => {
+      if (councillorColor) agent.config.color ??= councillorColor;
       applyDefaultPermissions(agent, undefined, runtime.disabledSkills);
       return agent;
     },
@@ -555,10 +708,6 @@ export function createAgents(
   // 3. Create Orchestrator (with its own overrides and custom prompts)
   // DEFAULT_MODELS.orchestrator is undefined; model is resolved via override or
   // left unset so the runtime chat.message hook can pick it from _modelArray.
-  const orchestratorOverride = getOverrideFromAgents(
-    mergedAgents,
-    'orchestrator',
-  );
   const orchestratorModel =
     orchestratorOverride?.model ?? DEFAULT_MODELS.orchestrator;
   const orchestratorPrompts = loadAgentPrompt('orchestrator', {
@@ -589,6 +738,11 @@ export function createAgents(
   if (orchestratorOverride) {
     applyOverrides(orchestrator, orchestratorOverride);
   }
+  applyModelInheritance(
+    orchestrator,
+    orchestratorOverride,
+    configuredOrchestratorModel,
+  );
   applyDefaultPermissions(
     orchestrator,
     orchestratorOverride?.skills,

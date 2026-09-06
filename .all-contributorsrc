@@ -947,6 +947,33 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "Alfiegerner",
+      "name": "Alfiegerner",
+      "avatar_url": "https://avatars.githubusercontent.com/u/596188?v=4",
+      "profile": "https://github.com/Alfiegerner",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "leducmaxime",
+      "name": "Maxime Leduc",
+      "avatar_url": "https://avatars.githubusercontent.com/u/37900355?v=4",
+      "profile": "https://github.com/leducmaxime",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "vmvarela",
+      "name": "Victor M. Varela",
+      "avatar_url": "https://avatars.githubusercontent.com/u/11040851?v=4",
+      "profile": "https://github.com/vmvarela",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"
