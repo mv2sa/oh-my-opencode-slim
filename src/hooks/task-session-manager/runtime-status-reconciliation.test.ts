@@ -165,6 +165,33 @@ test('inactive terminal history does not arm perpetual polling', async () => {
   await new Promise((resolve) => setTimeout(resolve, 20));
   expect(status).not.toHaveBeenCalled();
 });
+test('a gate-committed terminal does not arm perpetual polling', async () => {
+  const status = mock(async () => ({ data: {} }));
+  const h = harness(status);
+  const token = h.gate.capture(h.run);
+  if (!token) throw new Error('missing observation');
+  h.gate.observe(token, {
+    kind: 'quiescent',
+    origin: 'session.status',
+    readStartedAt: token.readStartedAt,
+  });
+  const result = await h.gate.reconcile(h.run, {
+    kind: 'output',
+    status: {
+      taskID: h.run.taskID,
+      state: 'completed',
+      result: 'answer',
+      timedOut: false,
+    },
+    origin: { kind: 'native', run: h.run, callID: 'call' },
+  });
+  expect(result.kind).toBe('committed');
+  expect(h.board.get('child')?.state).toBe('completed');
+
+  h.reconciler.schedule();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(status).not.toHaveBeenCalled();
+});
 test('dispose fences a pending batch', async () => {
   let resolve!: (response: unknown) => void;
   const h = harness(

@@ -1,5 +1,9 @@
 import { describe, expect, mock, test } from 'bun:test';
+import type { ToolContext } from '@opencode-ai/plugin';
+import { BackgroundJobBoard as ProductionBackgroundJobBoard } from '../utils/background-job-board';
 import { BackgroundJobBoard } from '../utils/background-job-fixture';
+import type { BackgroundJobStore } from '../utils/background-job-store';
+import { createBackgroundJobTerminalGate } from '../utils/background-job-terminal-gate';
 import { createTaskMessageTool } from './task-message';
 
 let client: Record<string, any>;
@@ -32,19 +36,33 @@ function makeSession(prompt: ReturnType<typeof mock>) {
   };
 }
 
-function createTool(board: BackgroundJobBoard) {
+function createTool(board: BackgroundJobStore) {
   return createTaskMessageTool({
     input: { directory: '/test' } as any,
     backgroundJobBoard: board,
   }).task_message;
 }
 
-function createToolWithTimeout(board: BackgroundJobBoard, timeoutMs: number) {
+function createToolWithTimeout(board: BackgroundJobStore, timeoutMs: number) {
   return createTaskMessageTool({
     input: { directory: '/test' } as any,
     backgroundJobBoard: board,
     messageTimeoutMs: timeoutMs,
   }).task_message;
+}
+
+/** Fully-typed host context so the new production-seeded tests need no cast. */
+function toolContext(sessionID = 'parent-1'): ToolContext {
+  return {
+    sessionID,
+    messageID: 'message-1',
+    agent: 'orchestrator',
+    directory: '/test',
+    worktree: '/test',
+    abort: new AbortController().signal,
+    metadata: () => {},
+    ask: async () => {},
+  };
 }
 
 describe('task_message', () => {
@@ -404,6 +422,60 @@ describe('task_message', () => {
     if (terminalLease) board.releaseLease(terminalLease);
   });
 
+  test('rejects a gate-committed terminal child before any prompt transport', async () => {
+    const board = new ProductionBackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: 'ses_child1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'implement',
+      now: 0,
+    });
+    const gate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      baselineFor: () => 'baseline',
+      readTerminalEvidence: async () => ({
+        data: [
+          { info: { id: 'baseline', role: 'user' }, parts: [] },
+          {
+            info: {
+              id: 'answer',
+              role: 'assistant',
+              time: { completed: 100 },
+              finish: 'stop',
+            },
+            parts: [{ type: 'text', text: 'answer' }],
+          },
+        ],
+      }),
+      graceMs: 5,
+      now: () => 1,
+    });
+    const token = gate.capture(run);
+    if (!token) throw new Error('missing quiescent observation token');
+    gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'test',
+      readStartedAt: token.readStartedAt,
+    });
+    expect((await gate.reconcile(run)).kind).toBe('committed');
+    expect(board.get(run.taskID)?.state).toBe('completed');
+
+    const prompt = makePrompt();
+    const promptAsync = mock(async () => ({}));
+    client = { session: { prompt, promptAsync } };
+
+    await expect(
+      createTool(board).execute(
+        { task_id: 'ses_child1', message: 'Too late' },
+        toolContext(),
+      ),
+    ).rejects.toThrow('not running');
+    expect(prompt).not.toHaveBeenCalled();
+    expect(promptAsync).not.toHaveBeenCalled();
+    gate.dispose();
+  });
+
   test('serializes message transport against cancellation and relaunch', async () => {
     const board = new BackgroundJobBoard();
     registerRunningChild(board);
@@ -552,6 +624,58 @@ describe('task_message', () => {
       ),
     ).rejects.toThrow('cancellation was requested');
     expect(cancellingPrompt).not.toHaveBeenCalled();
+  });
+
+  test('rejects a gate-committed cancelled child before any prompt transport', async () => {
+    const board = new ProductionBackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: 'ses_child1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'implement',
+      now: 0,
+    });
+    const gate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      now: () => 1,
+    });
+    const lease = board.acquireCancellationLease(run.taskID, run.generation);
+    if (!lease) throw new Error('missing cancellation lease');
+    const token = gate.capture(run);
+    if (!token) throw new Error('missing quiescent observation token');
+    gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'cancel-verifier',
+      readStartedAt: token.readStartedAt,
+      stable: true,
+    });
+    expect(
+      (
+        await gate.reconcile(run, {
+          kind: 'cancel',
+          lease,
+          reason: 'stop requested',
+        })
+      ).kind,
+    ).toBe('committed');
+    expect(board.get(run.taskID)).toMatchObject({
+      state: 'cancelled',
+      cancellationRequested: true,
+    });
+
+    const prompt = makePrompt();
+    const promptAsync = mock(async () => ({}));
+    client = { session: { prompt, promptAsync } };
+
+    await expect(
+      createTool(board).execute(
+        { task_id: 'ses_child1', message: 'Do not send' },
+        toolContext(),
+      ),
+    ).rejects.toThrow('cancellation was requested');
+    expect(prompt).not.toHaveBeenCalled();
+    expect(promptAsync).not.toHaveBeenCalled();
+    gate.dispose();
   });
 
   test('rejects a child owned by another parent', async () => {

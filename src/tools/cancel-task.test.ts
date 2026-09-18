@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { parseTaskStatusOutput } from '../utils';
+import { BackgroundJobBoard as ProductionBackgroundJobBoard } from '../utils/background-job-board';
 import { BackgroundJobBoard } from '../utils/background-job-fixture';
+import type { BackgroundJobStore } from '../utils/background-job-store';
+import { createBackgroundJobTerminalGate } from '../utils/background-job-terminal-gate';
 import { createCancelTaskTool } from './cancel-task';
 
 let mockClient: Record<string, unknown>;
@@ -10,6 +13,7 @@ mock.module('../utils/opencode-client', () => ({
 }));
 
 function createTool(overrides?: {
+  board?: BackgroundJobStore;
   abort?: () => Promise<unknown>;
   status?: () => Promise<unknown>;
   shouldManageSession?: (sessionID: string) => boolean;
@@ -17,7 +21,7 @@ function createTool(overrides?: {
   abortRetryIntervalMs?: number;
   stableStoppedMs?: number;
 }) {
-  const board = new BackgroundJobBoard();
+  const board = overrides?.board ?? new BackgroundJobBoard();
   const abort = mock(overrides?.abort ?? (async () => ({})));
   const status = mock(
     overrides?.status ?? (async () => ({ data: { ses_1: { type: 'idle' } } })),
@@ -287,6 +291,52 @@ describe('task_cancel tool', () => {
     expect(String(foreign)).toContain('state: unknown');
     expect(String(stale)).toContain('stale/uncertain cancellation');
     expect(String(parent)).toContain('cannot cancel parent session');
+  });
+
+  test('refuses a gate-committed completed task as a stale cancellation', async () => {
+    const board = new ProductionBackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: 'ses_done',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+    });
+    const gate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      baselineFor: () => 'baseline',
+      readTerminalEvidence: async () => ({
+        data: [
+          { info: { id: 'baseline', role: 'user' }, parts: [] },
+          {
+            info: {
+              id: 'answer',
+              role: 'assistant',
+              time: { completed: 100 },
+              finish: 'stop',
+            },
+            parts: [{ type: 'text', text: 'answer' }],
+          },
+        ],
+      }),
+      graceMs: 5,
+      now: () => 1,
+    });
+    const token = gate.capture(run);
+    if (!token) throw new Error('missing observation token');
+    gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'test',
+      readStartedAt: token.readStartedAt,
+    });
+    expect((await gate.reconcile(run)).kind).toBe('committed');
+    expect(board.get('ses_done')?.state).toBe('completed');
+
+    const { abort, taskCancel } = createTool({ board });
+
+    const output = await taskCancel.execute({ task_id: 'ses_done' }, context);
+
+    expect(abort).not.toHaveBeenCalled();
+    expect(String(output)).toContain('stale/uncertain cancellation');
+    gate.dispose();
   });
 
   test('enforces orchestrator ownership', async () => {

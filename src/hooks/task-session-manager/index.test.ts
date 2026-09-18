@@ -10854,4 +10854,143 @@ describe('gate-backed synthetic quota publication (production board)', () => {
       resultSummary: 'continuation answer',
     });
   });
+
+  test('deferred quota terminal releases the admission slot once and the later terminal listener does not corrupt capacity', async () => {
+    // Capacity-vs-board divergence: the interception site
+    // (tool-execute-hooks releaseConcurrencyTask) releases the admission slot
+    // as soon as the synthetic-quota outcome is terminal, while the
+    // gate-backed terminal publication defers until the runtime is quiescent
+    // (the board still reads `running`). The production terminal listener
+    // (src/index.ts addTerminalOutcomeListener) then releases the same task
+    // again when the claim finally commits. `releaseTask` is idempotent, and
+    // that second call must neither underflow capacity nor free a slot owned
+    // by another task.
+    const taskID = 'quota-deferred-cap';
+    let runtime: 'busy' | 'quiescent' = 'busy';
+
+    class CountingConcurrency extends BackgroundTaskConcurrency {
+      readonly releaseCalls: string[] = [];
+      override releaseTask(id: string): void {
+        this.releaseCalls.push(id);
+        super.releaseTask(id);
+      }
+    }
+    const concurrency = new CountingConcurrency({
+      defaultConcurrency: 1,
+      providerConcurrency: {},
+      modelConcurrency: {},
+    });
+
+    const board = new ProductionBackgroundJobBoard();
+    const gate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      readRuntime: async (_run, readStartedAt) => ({
+        kind: runtime,
+        origin: 'test',
+        readStartedAt,
+      }),
+      readTerminalEvidence: async () => quotaTranscript(),
+      baselineFor: () => 'baseline',
+    });
+    gates.push(gate);
+
+    // Mirrors the production terminal listener; registered on the production
+    // board so the real gate commit path fires it (the fixture would bypass
+    // the terminal publication entirely and false-pass).
+    board.addTerminalStateListener((id) => concurrency.releaseTask(id));
+
+    const promptAsync = mock(async () => ({}));
+    const quotaMessages = mock(async () => quotaTranscript());
+    const registry = createTestCooldownRegistry();
+    const fallbackManager = new ForegroundFallbackManager(
+      { oracle: ['google/antigravity-gemini-3-flash'] },
+      true,
+      { directory: '/tmp' } as never,
+      1,
+      undefined,
+      registry,
+    );
+    const quota = createSyntheticQuotaCoordinator({
+      terminalGate: gate,
+      callerWaitTimeoutMs: 100,
+      hardTransportTimeoutMs: 200,
+    });
+
+    const { hook } = createHook({
+      // Narrow cast: the production board implements BackgroundJobStore; the
+      // fixture type only narrows updateStatus, which this path never calls.
+      backgroundJobBoard: board as unknown as BackgroundJobBoard,
+      terminalGate: gate,
+      backgroundTaskConcurrency: concurrency,
+      fallbackManager,
+      syntheticQuotaCoordinator: quota,
+      sessionClient: { promptAsync, messages: quotaMessages },
+      runtimeStatusReconcileDelayMs: 60_000,
+    });
+
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-cap', callID: 'call-cap' },
+      {
+        args: {
+          description: 'quota cap',
+          subagent_type: 'oracle',
+          prompt: 'solve problem',
+          background: true,
+        },
+      },
+    );
+    expect(concurrency.snapshot()).toEqual({ active: 1, queued: 0 });
+
+    const output = {
+      output: [
+        `task_id: ${taskID}`,
+        'state: completed',
+        '',
+        '<task_result>',
+        quotaText,
+        '</task_result>',
+      ].join('\n'),
+    };
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-cap', callID: 'call-cap' },
+      output,
+    );
+
+    await flushGate();
+    // Interception site released the slot exactly once...
+    expect(concurrency.releaseCalls).toEqual([taskID]);
+    expect(concurrency.snapshot()).toEqual({ active: 0, queued: 0 });
+    // ...while the gate claim is still deferred: the board shows it running.
+    expect(board.get(taskID)).toMatchObject({
+      state: 'running',
+      terminalRevision: 0,
+    });
+    expect(output.output).toContain('state="error"');
+
+    // The freed capacity is genuinely usable while the deferred task still
+    // reads as running on the board.
+    const second = concurrency.acquire({});
+    await second.ready;
+    second.bind('quota-cap-second');
+    expect(concurrency.snapshot()).toEqual({ active: 1, queued: 0 });
+
+    // Runtime becomes quiescent: the held claim commits and the terminal
+    // listener releases the already-released task again.
+    const generation = board.get(taskID)?.generation ?? 0;
+    runtime = 'quiescent';
+    await gate.reconcile({ taskID, generation });
+    await flushGate();
+    expect(board.get(taskID)).toMatchObject({
+      state: 'error',
+      terminalRevision: 1,
+    });
+    // Both release paths ran...
+    expect(concurrency.releaseCalls).toEqual([taskID, taskID]);
+    // ...but the second is a no-op: the second task's slot is untouched and
+    // capacity never underflows.
+    expect(concurrency.snapshot()).toEqual({ active: 1, queued: 0 });
+
+    second.release();
+    expect(concurrency.snapshot()).toEqual({ active: 0, queued: 0 });
+  });
 });

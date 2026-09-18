@@ -1,6 +1,8 @@
 import { describe, expect, mock, test } from 'bun:test';
+import { BackgroundJobBoard as ProductionBackgroundJobBoard } from './background-job-board';
 import { BackgroundJobCoordinator } from './background-job-coordinator';
 import { BackgroundJobBoard, boardFixture } from './background-job-fixture';
+import { createBackgroundJobTerminalGate } from './background-job-terminal-gate';
 
 function createMockBoard(isRunning = false) {
   return {
@@ -253,6 +255,57 @@ describe('BackgroundJobCoordinator', () => {
     ).toBeUndefined();
     if (!lease) throw new Error('terminal notification lease was not acquired');
     expect(coordinator.releaseLease(lease)).toBe(true);
+  });
+
+  test('issues a terminal notification lease after a gate-committed completion', async () => {
+    const board = new ProductionBackgroundJobBoard();
+    const coordinator = new BackgroundJobCoordinator(board);
+    const job = coordinator.registerLaunch({
+      taskID: 'ses_terminal_notification_gate',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    const gate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      baselineFor: () => 'baseline',
+      readTerminalEvidence: async () => ({
+        data: [
+          { info: { id: 'baseline', role: 'user' }, parts: [] },
+          {
+            info: {
+              id: 'answer',
+              role: 'assistant',
+              time: { completed: 100 },
+              finish: 'stop',
+            },
+            parts: [{ type: 'text', text: 'answer' }],
+          },
+        ],
+      }),
+      graceMs: 5,
+      now: () => 1,
+    });
+    const token = gate.capture(job);
+    if (!token) throw new Error('missing observation token');
+    gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'test',
+      readStartedAt: token.readStartedAt,
+    });
+    expect((await gate.reconcile(job)).kind).toBe('committed');
+    expect(coordinator.get(job.taskID)?.state).toBe('completed');
+
+    const lease = coordinator.acquireTerminalNotificationLease(
+      job.taskID,
+      job.generation,
+    );
+    expect(lease).toMatchObject({ kind: 'terminal-notification' });
+    expect(
+      coordinator.acquireRelaunchLease(job.taskID, job.generation),
+    ).toBeUndefined();
+    if (!lease) throw new Error('terminal notification lease was not acquired');
+    expect(coordinator.releaseLease(lease)).toBe(true);
+    gate.dispose();
   });
 
   test('notifies launch identity on accepted register, drop, and clearParent', () => {
