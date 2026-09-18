@@ -169,7 +169,6 @@ type HookOptions = {
   sessionClient?: Record<string, unknown>;
   idleReconcileDelayMs?: number;
   runtimeStatusReconcileDelayMs?: number;
-  stopConfirmationMs?: number;
   isFallbackInProgress?: (sessionID: string) => boolean;
   willAttemptFallback?: (sessionID: string) => boolean;
   coordinator?: SessionLifecycle;
@@ -260,7 +259,6 @@ function createHook(options?: HookOptions) {
       coordinator: options?.coordinator,
       idleReconcileDelayMs: options?.idleReconcileDelayMs,
       runtimeStatusReconcileDelayMs: options?.runtimeStatusReconcileDelayMs,
-      stopConfirmationMs: options?.stopConfirmationMs,
       fallbackManager: options?.fallbackManager,
       revivedRunTracker: options?.revivedRunTracker,
       syntheticQuotaCoordinator: options?.syntheticQuotaCoordinator,

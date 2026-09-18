@@ -42,7 +42,6 @@ function createHook(
       maxSessionsPerAgent: 2,
       backgroundJobBoard: board,
       shouldManageSession: () => true,
-      stopConfirmationMs: 0,
       idleReconcileDelayMs: 0,
       ...extra,
     },

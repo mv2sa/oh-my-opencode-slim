@@ -82,7 +82,6 @@ const DEFAULT_BACKGROUND_JOBS: BackgroundJobsConfig = {
   orchestratorWake: { enabled: true, intervalMs: 300_000, mode: 'auto' },
   wallClockTimeoutMs: 0,
   abortGraceMs: 10_000,
-  stopConfirmationMs: 30_000,
   concurrency: {
     defaultConcurrency: 0,
     providerConcurrency: {},

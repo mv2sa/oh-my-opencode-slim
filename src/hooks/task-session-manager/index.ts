@@ -218,8 +218,6 @@ export function createTaskSessionManagerHook(
     idleReconcileDelayMs?: number;
     /** Test seam only; production uses the runtime reconciliation delay. */
     runtimeStatusReconcileDelayMs?: number;
-    /** Confirmed-idle grace; production supplies the configured value. */
-    stopConfirmationMs?: number;
     revivedRunTracker?: RevivedRunTracker;
     fallbackManager?: ForegroundFallbackManager;
     syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
@@ -386,76 +384,9 @@ export function createTaskSessionManagerHook(
   >();
   /** Managed sessions with a deferred inline 401/410 awaiting fallback outcome. */
   const deferredInlineErrors = new Set<string>();
-  type ParentActivity = {
-    active: boolean;
-    revision: number;
-    observedAt?: number;
-  };
-  const parentActivity = new Map<string, ParentActivity>();
-
-  const updateParentActivity = (
-    parentSessionID: string,
-    active: boolean,
-    observedAt?: number,
-  ): boolean => {
-    const existing = parentActivity.get(parentSessionID);
-    if (
-      existing?.observedAt !== undefined &&
-      observedAt !== undefined &&
-      observedAt < existing.observedAt
-    ) {
-      return false;
-    }
-    parentActivity.set(parentSessionID, {
-      active,
-      revision: (existing?.revision ?? 0) + 1,
-      observedAt: observedAt ?? existing?.observedAt,
-    });
-    return true;
-  };
-
-  const isParentActivityBlocking = (parentSessionID: string): boolean =>
-    parentActivity.get(parentSessionID)?.active === true;
-
-  const clearParentActivityIfUnchanged = (
-    parentSessionID: string,
-    expectedRevision: number,
-  ): void => {
-    const existing = parentActivity.get(parentSessionID);
-    if (!existing?.active || existing.revision !== expectedRevision) return;
-    parentActivity.set(parentSessionID, {
-      ...existing,
-      active: false,
-      revision: existing.revision + 1,
-    });
-  };
 
   const parentOwnsTrackedJobs = (parentSessionID: string): boolean =>
     backgroundJobBoard.list(parentSessionID).length > 0;
-
-  const eventActivityAt = (properties: {
-    activityAt?: number;
-    timestamp?: number;
-    time?: { updated?: number };
-    info?: {
-      activityAt?: number;
-      timestamp?: number;
-      time?: { updated?: number };
-    };
-  }): number | undefined => {
-    const candidates = [
-      properties.activityAt,
-      properties.timestamp,
-      properties.time?.updated,
-      properties.info?.activityAt,
-      properties.info?.timestamp,
-      properties.info?.time?.updated,
-    ];
-    return candidates.find(
-      (value): value is number =>
-        typeof value === 'number' && Number.isFinite(value),
-    );
-  };
 
   const clearChildStopConfirmations = (parentSessionID: string): void => {
     for (const job of backgroundJobBoard.list(parentSessionID)) {
@@ -558,11 +489,7 @@ export function createTaskSessionManagerHook(
         options.isFallbackInProgress?.(sessionId) &&
         parentOwnsTrackedJobs(sessionId)
       ) {
-        if (updateParentActivity(sessionId, true)) {
-          clearChildStopConfirmations(sessionId);
-        }
-      } else {
-        parentActivity.delete(sessionId);
+        clearChildStopConfirmations(sessionId);
       }
     });
   }
@@ -825,18 +752,13 @@ export function createTaskSessionManagerHook(
       const ownsTrackedJobs = eventSessionID
         ? parentOwnsTrackedJobs(eventSessionID)
         : false;
-      const activityObservedAt = input.event.properties
-        ? eventActivityAt(input.event.properties)
-        : undefined;
       if (
         eventSessionID &&
         ownsTrackedJobs &&
         input.event.type === 'session.status' &&
         (eventStatus === 'busy' || eventStatus === 'retry')
       ) {
-        if (updateParentActivity(eventSessionID, true, activityObservedAt)) {
-          clearChildStopConfirmations(eventSessionID);
-        }
+        clearChildStopConfirmations(eventSessionID);
       } else if (
         eventSessionID &&
         ownsTrackedJobs &&
@@ -844,28 +766,13 @@ export function createTaskSessionManagerHook(
         (options.isFallbackInProgress?.(eventSessionID) ||
           options.willAttemptFallback?.(eventSessionID))
       ) {
-        if (updateParentActivity(eventSessionID, true, activityObservedAt)) {
-          clearChildStopConfirmations(eventSessionID);
-        }
+        clearChildStopConfirmations(eventSessionID);
       } else if (
         eventSessionID &&
-        (input.event.type === 'session.idle' ||
-          (input.event.type === 'session.status' && eventStatus === 'idle') ||
-          input.event.type === 'session.error' ||
-          input.event.type === 'session.deleted')
+        input.event.type === 'session.deleted' &&
+        options.isFallbackInProgress?.(eventSessionID)
       ) {
-        if (
-          input.event.type === 'session.deleted' &&
-          options.isFallbackInProgress?.(eventSessionID)
-        ) {
-          if (updateParentActivity(eventSessionID, true, activityObservedAt)) {
-            clearChildStopConfirmations(eventSessionID);
-          }
-        } else if (input.event.type === 'session.deleted') {
-          parentActivity.delete(eventSessionID);
-        } else if (ownsTrackedJobs) {
-          updateParentActivity(eventSessionID, false, activityObservedAt);
-        }
+        clearChildStopConfirmations(eventSessionID);
       }
 
       if (input.event.type === 'session.deleted') {
@@ -884,7 +791,6 @@ export function createTaskSessionManagerHook(
 
       if (input.event.type === 'server.instance.disposed') {
         syntheticQuotaCoordinator.dispose();
-        parentActivity.clear();
         runtimeStatusReconciler.dispose();
         if (!options.terminalGate) terminalGate.dispose();
       }

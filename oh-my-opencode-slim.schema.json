@@ -1195,13 +1195,6 @@
           "minimum": 1000,
           "maximum": 60000
         },
-        "stopConfirmationMs": {
-          "default": 30000,
-          "description": "Sustained child-idle interval required after the parent can accept terminal delivery before a task is reported stopped (5,000–300,000ms).",
-          "type": "integer",
-          "minimum": 5000,
-          "maximum": 300000
-        },
         "concurrency": {
           "default": {
             "defaultConcurrency": 0,
