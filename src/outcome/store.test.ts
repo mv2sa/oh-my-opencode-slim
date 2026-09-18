@@ -1427,6 +1427,98 @@ describe('OutcomeStore protocol and integrity', () => {
     expect(reviewed.data.waitCondition?.reason).toHaveLength(512);
   });
 
+  test('oversized wait fields report the field, actual length, and cap', () => {
+    const root = 'root_wait_field_bounds';
+    const store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_wait_bounds',
+      randomId: () => root,
+      clock: () => 100,
+    });
+    const created = store.init(root, { contract: contract() });
+    expectSuccess(created);
+    const revision = created.data.revision;
+
+    const oversizedReason = store.mutate(root, revision, {
+      type: 'set_wait',
+      wait: {
+        kind: 'external_handoff',
+        referenceId: 'ext_restart',
+        reason: 'r'.repeat(513),
+        createdAt: 100,
+        createdRevision: revision + 1,
+        originatingServerEpoch: 'epoch_wait_bounds',
+      },
+    });
+    expect(oversizedReason.success).toBe(false);
+    if (oversizedReason.success) return;
+    expect(oversizedReason.error.message).toBe(
+      'waitCondition.reason is 513 characters; maximum is 512',
+    );
+
+    const oversizedInstructions = store.mutate(root, revision, {
+      type: 'set_wait',
+      wait: {
+        kind: 'external_handoff',
+        referenceId: 'ext_restart',
+        reason: 'In-bounds reason',
+        instructions: 'i'.repeat(600),
+        createdAt: 100,
+        createdRevision: revision + 1,
+        originatingServerEpoch: 'epoch_wait_bounds',
+      },
+    });
+    expect(oversizedInstructions.success).toBe(false);
+    if (oversizedInstructions.success) return;
+    expect(oversizedInstructions.error.message).toBe(
+      'waitCondition.instructions is 600 characters; maximum is 512',
+    );
+
+    // In-bounds values still persist: the acceptance boundary is unchanged.
+    const accepted = store.mutate(root, revision, {
+      type: 'set_wait',
+      wait: {
+        kind: 'external_handoff',
+        referenceId: 'ext_restart',
+        reason: 'In-bounds reason',
+        instructions: 'In-bounds instructions',
+        createdAt: 100,
+        createdRevision: revision + 1,
+        originatingServerEpoch: 'epoch_wait_bounds',
+      },
+    });
+    expectSuccess(accepted);
+    expect(accepted.data.waitCondition?.reason).toBe('In-bounds reason');
+
+    // Whitespace padding must not push a schema-valid value over the cap:
+    // the pre-check mirrors the durable schema's trim() semantics.
+    const paddedRoot = 'root_wait_trim_bounds';
+    const paddedStore = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_wait_bounds',
+      randomId: () => paddedRoot,
+      clock: () => 100,
+    });
+    const paddedCreated = paddedStore.init(paddedRoot, {
+      contract: contract(),
+    });
+    expectSuccess(paddedCreated);
+    const paddedRevision = paddedCreated.data.revision;
+    const padded = paddedStore.mutate(paddedRoot, paddedRevision, {
+      type: 'set_wait',
+      wait: {
+        kind: 'external_handoff',
+        referenceId: 'ext_restart',
+        reason: `${'p'.repeat(500)}${' '.repeat(20)}`,
+        createdAt: 100,
+        createdRevision: paddedRevision + 1,
+        originatingServerEpoch: 'epoch_wait_bounds',
+      },
+    });
+    expectSuccess(padded);
+    expect(padded.data.waitCondition?.reason).toBe('p'.repeat(500));
+  });
+
   test('finalizes only satisfied contract with completed kickoff and matching final attestations', () => {
     const candidate = hash('candidate');
     const store = new OutcomeStore({

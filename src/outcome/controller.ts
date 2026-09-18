@@ -25,6 +25,7 @@ import {
   type OutcomeUserMessageReceipt,
 } from './controller-schema';
 import { effectiveHandoff, projectHandoff } from './handoff-amendments';
+import { type OutcomeHost, resolveOutcomeHost } from './host';
 import { safeParseOutcomeReview } from './parser';
 import { getProcessEpoch } from './process-epoch';
 import type {
@@ -265,6 +266,20 @@ export function buildOutcomeReviewExactPayload(
   };
 }
 
+/**
+ * Caps enforced when the Manager's payload is persisted. Surfaced in the
+ * review packet so the authoring agent can size fields up front instead of
+ * losing a digest-bound review to a schema-bound rejection.
+ */
+const OUTCOME_REVIEW_PAYLOAD_LIMITS = [
+  '## Payload Limits (keep emitted fields within these caps)',
+  '- `summary` ≤ 1024 characters',
+  '- `userDecision.decisionNeeded` ≤ 512, `userDecision.impact` ≤ 512, each `userDecision.options[]` entry ≤ 256 (max 16 options)',
+  '- `handoff.summary` ≤ 512, each `handoff.verificationSteps[]` entry ≤ 512',
+  '- `candidateFingerprint`, when present, must be a non-empty `sha256:<64 hex>`; OMIT the key entirely for a kickoff review (an empty string is rejected)',
+  '- `outcome_control`: `external_handoff.instructions` and `external_handoff.expectedPostRestartCheck` ≤ 512; `finalize.summary` ≤ 1024',
+].join('\n');
+
 export function buildOutcomeReviewPacket(
   record: OutcomeRecord,
   checkpoint: OutcomeCheckpointClaim,
@@ -344,6 +359,8 @@ export function buildOutcomeReviewPacket(
     '```json',
     exactJson,
     '```',
+    '',
+    OUTCOME_REVIEW_PAYLOAD_LIMITS,
   );
 
   return lines.join('\n');
@@ -605,25 +622,17 @@ export type OutcomeNudge =
       message: string;
     };
 
-export interface OutcomeControllerOptions {
+export interface OutcomeControllerOptions extends OutcomeHost {
   projectDirectory?: string;
   storeDirectory?: string;
   serverEpoch?: string;
   store?: OutcomeStore;
-  getManagerTaskRecord?: (
-    taskId: string,
-  ) => ManagerTaskVerification | undefined;
-  readChildSessionResult?: (
-    childSessionId: string,
-  ) => Promise<ChildSessionReaderResult | undefined>;
-  consumeManagerTask?: (
-    rootSessionId: string,
-    taskId: string,
-    generation: number,
-  ) => boolean;
-  hasRunningChildren?: (rootSessionId: string) => boolean;
-  hasTerminalUnreconciledChildren?: (rootSessionId: string) => boolean;
-  resolveAgentName?: (agent: string) => string;
+  /**
+   * Explicit host port. When present, its callbacks are preferred per field;
+   * the flat legacy callbacks inherited from `OutcomeHost` remain the
+   * per-field fallback.
+   */
+  host?: OutcomeHost;
   clock?: () => number;
   randomId?: () => string;
 }
@@ -657,14 +666,15 @@ export class OutcomeController {
     this.#clock = options.clock ?? Date.now;
     this.#randomId = options.randomId ?? randomUUID;
     this.#claimSecrets = getGlobalClaimSecrets();
-    this.#getManagerTaskRecord = options.getManagerTaskRecord;
-    this.#readChildSessionResult = options.readChildSessionResult;
-    this.#consumeManagerTask = options.consumeManagerTask;
-    this.#hasRunningChildren = options.hasRunningChildren;
+    const host = resolveOutcomeHost(options);
+    this.#getManagerTaskRecord = host.getManagerTaskRecord;
+    this.#readChildSessionResult = host.readChildSessionResult;
+    this.#consumeManagerTask = host.consumeManagerTask;
+    this.#hasRunningChildren = host.hasRunningChildren;
     this.#hasTerminalUnreconciledChildren =
-      options.hasTerminalUnreconciledChildren;
+      host.hasTerminalUnreconciledChildren;
     this.#resolveAgentName =
-      options.resolveAgentName ?? ((agent: string) => agent);
+      host.resolveAgentName ?? ((agent: string) => agent);
 
     this.#store =
       options.store ??

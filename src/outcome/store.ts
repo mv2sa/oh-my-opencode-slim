@@ -3528,6 +3528,18 @@ function applyMutation(
         throw new Error(
           'Wait createdRevision must equal its persisted revision',
         );
+      assertBoundedText(
+        mutation.wait.reason.trim(),
+        512,
+        'waitCondition.reason',
+      );
+      if (mutation.wait.instructions !== undefined) {
+        assertBoundedText(
+          mutation.wait.instructions.trim(),
+          512,
+          'waitCondition.instructions',
+        );
+      }
       next.waitCondition = mutation.wait;
       next.phase =
         mutation.wait.kind === 'user_decision'
@@ -3888,11 +3900,7 @@ function applyMutation(
         throw new Error('Supersession reason must be a non-empty string');
       }
       const trimmedReason = mutation.reason.trim();
-      if (trimmedReason.length > 512) {
-        throw new Error(
-          'Supersession reason exceeds maximum length of 512 characters',
-        );
-      }
+      assertBoundedText(trimmedReason, 512, 'supersession.reason');
 
       delete next.waitCondition;
       const receipt: OutcomeHandoffSupersessionReceipt = {
@@ -4062,11 +4070,7 @@ function applyMutation(
         throw new Error('Retirement reason must be a non-empty string');
       }
       const trimmedReason = mutation.reason.trim();
-      if (trimmedReason.length > 512) {
-        throw new Error(
-          'Retirement reason exceeds maximum length of 512 characters',
-        );
-      }
+      assertBoundedText(trimmedReason, 512, 'retirement.reason');
       const recoveryNote = formatMisboundRetirementNote(
         mutation.boundResultDigest,
         mutation.observedResultDigest,
@@ -4182,6 +4186,11 @@ function applyMutation(
     case 'finalize':
       assertFinalizable(next);
       {
+        assertBoundedText(
+          mutation.summary.trim(),
+          1024,
+          'finalCertificate.summary',
+        );
         const claim = next.checkpoint as OutcomeCheckpointClaim;
         const review = next.reviewSummaries.find(
           (entry) =>
@@ -4291,6 +4300,12 @@ function recordParsedReview(
     resultDigest,
     review,
   });
+  const boundedSummary = boundedText(review.summary, 1024);
+  // Invariant at the durable review-summary site: oversized Manager values
+  // are intentionally truncated (never rejected) so a digest-bound review
+  // cannot be lost, so this can only fire if `boundedText` stops honoring
+  // its cap.
+  assertBoundedText(boundedSummary, 1024, 'review.summary');
   const summary: OutcomeManagerReviewSummary = {
     reviewId: `review_${randomId().slice(0, 16)}`,
     checkpointId: claim.checkpointId,
@@ -4306,7 +4321,7 @@ function recordParsedReview(
     ...(review.candidateFingerprint
       ? { candidateFingerprint: review.candidateFingerprint }
       : {}),
-    summary: boundedText(review.summary, 1024),
+    summary: boundedSummary,
     evaluatedAt,
   };
   record.reviewSummaries.push(summary);
@@ -4344,19 +4359,34 @@ function recordParsedReview(
       // Manager-supplied fields can exceed the durable schema bounds
       // (decisionNeeded/impact: Text 512, options: ShortText 256, max 16).
       // Bound them here so one oversized value cannot fail the whole record
-      // parse, mirroring the review-summary bound above.
+      // parse, mirroring the review-summary bound above. The cap asserts are
+      // invariants over the bounded values (never rejection): they can only
+      // fire if `boundedText` stops honoring its cap.
+      const boundedDecisionNeeded = boundedText(
+        review.userDecision.decisionNeeded,
+        512,
+      );
+      assertBoundedText(
+        boundedDecisionNeeded,
+        512,
+        'userDecision.decisionNeeded',
+      );
+      const boundedImpact = review.userDecision.impact
+        ? boundedText(review.userDecision.impact, 512)
+        : undefined;
+      if (boundedImpact !== undefined) {
+        assertBoundedText(boundedImpact, 512, 'userDecision.impact');
+      }
       const decisionReceipt: OutcomeDecisionReceipt = {
         id: decisionId,
-        decisionNeeded: boundedText(review.userDecision.decisionNeeded, 512),
+        decisionNeeded: boundedDecisionNeeded,
         options: review.userDecision.options
           .slice(0, 16)
           .map((option) => boundedText(option, 256)),
         blocking: review.userDecision.blocking,
         createdAt: evaluatedAt,
         createdRevision: persistedRevision,
-        ...(review.userDecision.impact
-          ? { impact: boundedText(review.userDecision.impact, 512) }
-          : {}),
+        ...(boundedImpact ? { impact: boundedImpact } : {}),
       };
       record.receipts.decisions.push(decisionReceipt);
     }
@@ -4390,6 +4420,24 @@ function recordParsedReview(
 function boundedText(value: string, maxLength = 512): string {
   if (value.length <= maxLength) return value;
   return `${value.slice(0, maxLength - 3)}...`;
+}
+
+/**
+ * Reject a value that would fail a durable schema cap, naming the field, its
+ * actual length and the cap so the authoring agent can resize and retry.
+ * Call this only where the value is NOT already truncated by `boundedText`:
+ * the accepted/rejected boundary is unchanged (the same values the schema
+ * would reject now carry a legible message).
+ */
+function assertBoundedText(
+  value: string,
+  maxLength: number,
+  fieldName: string,
+): void {
+  if (value.length <= maxLength) return;
+  throw new Error(
+    `${fieldName} is ${value.length} characters; maximum is ${maxLength}`,
+  );
 }
 
 function authenticateReview(

@@ -65,6 +65,7 @@ import {
   startAvailabilityCheck,
 } from './multiplexer';
 import { OutcomeController } from './outcome';
+import type { OutcomeHost } from './outcome/host';
 import {
   ast_grep_replace,
   ast_grep_search,
@@ -882,8 +883,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     pruneRevivedContext = taskSessionManagerHook.pruneTaskContext;
 
     if (outcomeManagementEnabled) {
-      outcomeController = new OutcomeController({
-        projectDirectory: ctx.directory,
+      const outcomeHost: OutcomeHost = {
         getManagerTaskRecord: (taskId: string) =>
           backgroundJobCoordinator.get(taskId),
         readChildSessionResult: async (childSessionId: string) => {
@@ -919,6 +919,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           backgroundJobCoordinator.hasTerminalUnreconciled(rootSessionId),
         resolveAgentName: (agent: string) =>
           resolveRuntimeAgentName(runtime, agent),
+      };
+      outcomeController = new OutcomeController({
+        projectDirectory: ctx.directory,
+        host: outcomeHost,
       });
     }
 

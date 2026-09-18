@@ -8,6 +8,7 @@ import {
   formatOutcomeDispatchMarker,
   type ManagerTaskVerification,
   OutcomeController,
+  type OutcomeControllerOptions,
 } from './controller';
 import {
   canonicalDigest,
@@ -17,6 +18,7 @@ import {
   type OutcomeContract,
   OutcomeContractSchema,
 } from './controller-schema';
+import type { OutcomeHost } from './host';
 import type { OutcomeReview } from './schema';
 import { OutcomeStore, OutcomeStoreError } from './store';
 
@@ -191,6 +193,33 @@ describe('OutcomeController service over frozen store', () => {
       expect(nudge.marker.claimToken.length).toBeGreaterThan(16);
       expect(nudge.instruction).toContain(nudge.marker.claimToken);
     }
+  });
+
+  test('review packet documents the payload caps the Manager must respect', () => {
+    const controller = new OutcomeController({ storeDirectory: tempDir });
+    const root = 'ses_packet_limits';
+    const begun = controller.begin(root, testContract());
+    expect(begun.success).toBe(true);
+    if (!begun.success) return;
+    const recRes = controller.readRecord(root);
+    expect(recRes.success).toBe(true);
+    if (!recRes.success || !recRes.data.checkpoint) return;
+
+    const packet = buildOutcomeReviewPacket(
+      recRes.data,
+      recRes.data.checkpoint,
+    );
+
+    expect(packet).toContain('## Payload Limits');
+    expect(packet).toContain('`summary` ≤ 1024 characters');
+    expect(packet).toContain('each `userDecision.options[]` entry ≤ 256');
+    expect(packet).toContain('each `handoff.verificationSteps[]` entry ≤ 512');
+    expect(packet).toContain(
+      'OMIT the key entirely for a kickoff review (an empty string is rejected)',
+    );
+    expect(packet).toContain('`finalize.summary` ≤ 1024');
+    // The authenticated block shape is unchanged: the note is appended after.
+    expect(packet).toContain('## Exact Controller-Authenticated Review Values');
   });
 
   test('repeated begin uses normalized contract authority and is idempotent after goal progress', () => {
@@ -396,6 +425,70 @@ describe('OutcomeController service over frozen store', () => {
 
     const status = controller.getStatus(root);
     expect(status.checkpoint?.state).toBe('running');
+  });
+
+  test('host port and legacy flat options resolve to the same behavior', () => {
+    const root = 'ses_host_equivalence';
+    // The alias proves `resolveAgentName` is actually resolved through the
+    // port; the point of the test is host-dependent behavior, not identity.
+    const boardRecord: ManagerTaskVerification = {
+      taskID: 'mgr_host_equiv',
+      parentSessionID: root,
+      agent: 'manager-alias',
+      generation: 3,
+      state: 'running',
+    };
+    const host: OutcomeHost = {
+      getManagerTaskRecord: (taskID) =>
+        taskID === boardRecord.taskID ? boardRecord : undefined,
+      readChildSessionResult: async () => undefined,
+      consumeManagerTask: () => true,
+      hasRunningChildren: () => false,
+      hasTerminalUnreconciledChildren: () => false,
+      resolveAgentName: (agent) =>
+        agent === 'manager-alias' ? 'outcome-manager' : agent,
+    };
+
+    const runScenario = (options: OutcomeControllerOptions) => {
+      const controller = new OutcomeController(options);
+      const begin = controller.begin(root, testContract());
+      expect(begin.success).toBe(true);
+      if (!begin.success) return undefined;
+      controller.validateAndMarkDispatching(
+        root,
+        'call_host_equiv',
+        dispatchInstruction(controller, root),
+      );
+      const bound = controller.bindManagerTask(
+        root,
+        'call_host_equiv',
+        boardRecord.taskID,
+      );
+      return {
+        success: bound.success,
+        state: controller.getStatus(root).checkpoint?.state,
+      };
+    };
+
+    const viaHost = runScenario({
+      storeDirectory: `${tempDir}/host`,
+      host,
+    });
+    const viaFlat = runScenario({
+      storeDirectory: `${tempDir}/flat`,
+      ...host,
+    });
+    // Explicit host port wins, but the flat fields remain the per-callback
+    // fallback when the port omits one.
+    const viaHostWithFlatFallback = runScenario({
+      storeDirectory: `${tempDir}/host-fallback`,
+      host: { ...host, getManagerTaskRecord: undefined },
+      getManagerTaskRecord: host.getManagerTaskRecord,
+    });
+
+    expect(viaHost).toEqual(viaFlat);
+    expect(viaHostWithFlatFallback).toEqual(viaHost);
+    expect(viaHost).toEqual({ success: true, state: 'running' });
   });
 
   test('reconcileReview validates authoritative board record and child session result', async () => {
