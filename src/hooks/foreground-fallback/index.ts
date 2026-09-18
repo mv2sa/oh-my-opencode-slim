@@ -18,7 +18,10 @@
  */
 
 import type { PluginInput } from '@opencode-ai/plugin';
-import { responseError } from '../../utils/child-transcript';
+import {
+  extractTrailingAssistantTurn,
+  responseError,
+} from '../../utils/child-transcript';
 import { isRecord } from '../../utils/guards';
 import { createInternalAgentTextPart } from '../../utils/internal-initiator';
 import { log } from '../../utils/logger';
@@ -45,7 +48,6 @@ import {
   type AntigravityMessageEvidence,
   isAntigravitySyntheticQuotaMessage,
   isAntigravitySyntheticQuotaText,
-  launchContinuationPrompt,
   verifyChildAntigravityEvidence,
 } from './synthetic-quota';
 
@@ -59,7 +61,6 @@ export {
   type FailureVerdict,
   isAntigravitySyntheticQuotaMessage,
   isAntigravitySyntheticQuotaText,
-  launchContinuationPrompt,
   verifyChildAntigravityEvidence,
 };
 
@@ -935,21 +936,12 @@ export class ForegroundFallbackManager {
                 path: { id: sessionID },
                 query: { directory: this.input.directory },
               });
-              const data = Array.isArray(res?.data)
-                ? (res.data as unknown[])
-                : [];
-              const last = data.at(-1) as
-                | { parts?: Array<{ type?: string; text?: string }> }
-                | undefined;
-              const fetchedText = (last?.parts ?? [])
-                .filter(
-                  (p) =>
-                    (p.type === 'text' || p.type === 'reasoning') &&
-                    typeof p.text === 'string',
-                )
-                .map((p) => p.text as string)
-                .join('\n\n')
-                .trim();
+              // Walk past trailing structural/system items to the trailing
+              // ASSISTANT turn (shared with verifyChildAntigravityEvidence, the
+              // revived-run tracker, and the terminal gate). A trailing system
+              // item must not hide the quota notice and suppress failover.
+              const turn = extractTrailingAssistantTurn(res);
+              const fetchedText = turn?.text ?? '';
               if (
                 isAntigravitySyntheticQuotaMessage(
                   candidateEvidence,

@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
 import { createBackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
+import type { ForegroundFallbackManager } from './index';
 import {
   createSyntheticQuotaCoordinator,
   verifyChildAntigravityEvidence,
@@ -114,6 +115,121 @@ describe('synthetic quota publication with a trailing system item', () => {
       });
       expect(board.get('child-quota')?.state).not.toBe('completed');
       expect(run.generation).toBe(1);
+    } finally {
+      quota.dispose();
+      gate.dispose();
+    }
+  });
+});
+
+describe('synthetic quota quarantine bound', () => {
+  const fallbackManager = {
+    markModelCooldown: () => {},
+    prepareNextModel: () => ({
+      model: 'anthropic/claude-opus-4-5',
+      commit: () => true,
+    }),
+  } as unknown as ForegroundFallbackManager;
+
+  async function waitFor(
+    predicate: () => boolean,
+    timeoutMs = 1_000,
+  ): Promise<void> {
+    const startedAt = Date.now();
+    while (!predicate()) {
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error('waitFor timed out');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+  }
+
+  test('records when quarantine began and reports the held duration against a 2x transport bound', async () => {
+    const board = new BackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: 'child-quarantine-bound',
+      parentSessionID: 'parent',
+      agent: 'oracle',
+      background: true,
+    });
+    const gate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      readRuntime: async (_run, readStartedAt) => ({
+        kind: 'quiescent' as const,
+        origin: 'test',
+        readStartedAt,
+      }),
+    });
+    const now = { value: 1_000 };
+    const quota = createSyntheticQuotaCoordinator({
+      terminalGate: gate,
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 20,
+      now: () => now.value,
+    });
+    try {
+      // The continuation transport never resolves, so the hard quarantine
+      // deadline (20ms) is the only disposition the incident can reach.
+      const outcome = await quota.handleTaskQuotaIncident({
+        taskID: run.taskID,
+        text: quotaText,
+        verifiedEvidence: {
+          model: 'google/antigravity-gemini-3-flash',
+          failedMessageID: 'asst-quota',
+        },
+        client: { session: { promptAsync: async () => new Promise(() => {}) } },
+        directory: '/tmp',
+        backgroundJobBoard: board,
+        fallbackManager,
+      });
+      expect(outcome.status).toBe('launched');
+      expect(outcome.quarantineBoundMs).toBeUndefined();
+
+      await waitFor(
+        () =>
+          board
+            .get(run.taskID)
+            ?.lastStatusError?.includes('quarantine deadline exceeded') ===
+          true,
+      );
+      expect(board.get(run.taskID)?.state).toBe('running');
+
+      // A duplicate observation reports how long the incident has been held
+      // against the bound derived from the configured transport timeout.
+      const withinBound = await quota.handleTaskQuotaIncident({
+        taskID: run.taskID,
+        text: quotaText,
+        verifiedEvidence: {
+          model: 'google/antigravity-gemini-3-flash',
+          failedMessageID: 'asst-quota',
+        },
+        client: { session: { promptAsync: async () => new Promise(() => {}) } },
+        directory: '/tmp',
+        backgroundJobBoard: board,
+        fallbackManager,
+      });
+      expect(withinBound.status).toBe('quarantined');
+      expect(withinBound.quarantineHeldMs).toBe(0);
+      expect(withinBound.quarantineBoundMs).toBe(40);
+
+      // Past the bound the coordinator reports the exceeded duration; the
+      // gate evidence hook turns this into the error override.
+      now.value = 1_041;
+      const pastBound = await quota.handleTaskQuotaIncident({
+        taskID: run.taskID,
+        text: quotaText,
+        verifiedEvidence: {
+          model: 'google/antigravity-gemini-3-flash',
+          failedMessageID: 'asst-quota',
+        },
+        client: { session: { promptAsync: async () => new Promise(() => {}) } },
+        directory: '/tmp',
+        backgroundJobBoard: board,
+        fallbackManager,
+      });
+      expect(pastBound.status).toBe('quarantined');
+      expect(pastBound.quarantineHeldMs).toBe(41);
+      expect(pastBound.quarantineBoundMs).toBe(40);
     } finally {
       quota.dispose();
       gate.dispose();

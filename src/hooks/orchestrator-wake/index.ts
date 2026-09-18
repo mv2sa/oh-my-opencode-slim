@@ -54,7 +54,6 @@ import {
   rearmWakeProgress,
   recordRestartRecoveryFailure,
   releaseRestartRecovery,
-  releaseUncommittedWakeEvaluation,
   releaseWakeEvaluation,
   retryAfterWakeEvaluation,
   setObservedWakeModel,
@@ -2446,9 +2445,7 @@ export function createOrchestratorWakeScheduler(
       if (canObserveSelection(sessionID)) {
         // Errors / retry are external lifecycle — rearm.
         clearExpectingWakeBusy(sessionID);
-        const shouldRearm = options.shouldManageSession?.(sessionID)
-          ? false
-          : true;
+        const shouldRearm = !options.shouldManageSession?.(sessionID);
         endIdleSpell(sessionID, shouldRearm);
       }
     }

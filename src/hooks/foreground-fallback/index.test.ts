@@ -3732,6 +3732,78 @@ describe('ForegroundFallbackManager - Antigravity synthetic quota', () => {
     expect(registry.isDead('google/antigravity-gemini-3-flash')).toBe(true);
   });
 
+  test('detects a quota notice hidden behind a trailing structural item in the fetched transcript', async () => {
+    const { mocks } = createMockClient({
+      messagesData: [
+        {
+          info: { id: 'baseline', role: 'user' },
+          parts: [{ type: 'text', text: 'solve the problem' }],
+        },
+        {
+          info: {
+            id: 'asst-quota',
+            role: 'assistant',
+            providerID: 'google',
+            modelID: 'antigravity-gemini-3-flash',
+            finish: 'stop',
+            tokens: { input: 0, output: 33 },
+            time: { completed: Date.now() },
+          },
+          parts: [{ type: 'text', text: quotaText1 }],
+        },
+        // Trailing structural/system item: the absolute last entry. It must
+        // not hide the assistant quota turn above.
+        {
+          info: { id: 'sys-tail', role: 'system' },
+          parts: [{ type: 'text', text: 'structural tail' }],
+        },
+      ],
+    });
+    const registry = new CooldownRegistry();
+    const mgr = new ForegroundFallbackManager(
+      {
+        oracle: [
+          'google/antigravity-gemini-3-flash',
+          'google/antigravity-gemini-3.7-flash',
+          'anthropic/claude-opus-4-5',
+        ],
+      },
+      true,
+      { directory: '/test' } as never,
+      1,
+      undefined,
+      registry,
+    );
+
+    // The event itself carries no text: detection falls back to the fetched
+    // transcript, which ends at a structural item after the quota turn.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'ses-antigravity-trailing-structural',
+          role: 'assistant',
+          agent: 'oracle',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+          finish: 'stop',
+          tokens: { input: 0, output: 33 },
+          time: { completed: Date.now() },
+        },
+        parts: [],
+      },
+    });
+
+    // Failover fired from the hidden quota notice.
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.abort).not.toHaveBeenCalled();
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+      providerID: 'google',
+      modelID: 'antigravity-gemini-3.7-flash',
+    });
+    expect(registry.isDead('google/antigravity-gemini-3-flash')).toBe(true);
+  });
+
   test('cascades through multiple Antigravity synthetic quota failures to replacement model', async () => {
     const { mocks } = createMockClient();
     const registry = new CooldownRegistry();

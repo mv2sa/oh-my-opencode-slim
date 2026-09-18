@@ -746,8 +746,28 @@ export function createRevivedRunTracker(options: {
       // Re-registration for a continuation keeps the same generation; a
       // superseded generation must not drive this observation.
       if (current?.generation !== run.generation) return { kind: 'proceed' };
-      if (isSyntheticQuotaContinuationActiveStatus(outcome.status))
+      if (isSyntheticQuotaContinuationActiveStatus(outcome.status)) {
+        // An active continuation holds publication so it can deliver its
+        // result. A quarantine, however, is only a transport deadline, not
+        // proof of liveness: hold while within the coordinator's bound, but
+        // once the incident has been quarantined past it, override to an
+        // error. Publication still rides the gate's quiescence check, so a
+        // genuinely busy child is never overwritten.
+        const quarantineExceededBound =
+          outcome.status === 'quarantined' &&
+          outcome.quarantineHeldMs !== undefined &&
+          outcome.quarantineBoundMs !== undefined &&
+          outcome.quarantineHeldMs > outcome.quarantineBoundMs;
+        if (quarantineExceededBound) {
+          return {
+            kind: 'override',
+            state: 'error',
+            resultSummary:
+              'Synthetic quota continuation stayed quarantined past twice the hard transport timeout; no continuation result was delivered.',
+          };
+        }
         return { kind: 'hold' };
+      }
       if (outcome.handled)
         return { kind: 'override', state: 'error', resultSummary: turn.text };
       return { kind: 'proceed' };

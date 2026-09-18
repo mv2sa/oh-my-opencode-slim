@@ -118,6 +118,29 @@ async function flushNotify(): Promise<void> {
   for (let i = 0; i < 50; i += 1) await Promise.resolve();
 }
 
+/** Poll for a real-timer-driven condition (e.g. the hard transport deadline
+ *  firing) without a fixed sleep that could race on a slow runner. */
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error('waitFor timed out');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+}
+
+/** Continuation dispatches target the child; parent notifications target
+ *  'parent' and must not be counted as a re-dispatch. */
+function continuationCalls(prompt: ReturnType<typeof mock>): unknown[] {
+  return prompt.mock.calls.filter(
+    ([args]) => (args as { path?: { id?: string } })?.path?.id === 'ses_child',
+  );
+}
+
 /** Toggle-able transcript: baseline only until `probe` flips true, then a
  * completed assistant turn after the baseline. */
 function completedTranscript(
@@ -1161,7 +1184,14 @@ describe('gate evidence hook (synthetic quota)', () => {
       prepareNextModel: () => undefined,
     }) as unknown as ForegroundFallbackManager;
 
-  function createGateHarness(fallbackManager: ForegroundFallbackManager) {
+  function createGateHarness(
+    fallbackManager: ForegroundFallbackManager,
+    options: {
+      callerWaitTimeoutMs?: number;
+      hardTransportTimeoutMs?: number;
+      now?: () => number;
+    } = {},
+  ) {
     const board = new ProductionBackgroundJobBoard();
     const run = board.registerLaunch({
       taskID: 'ses_child',
@@ -1201,8 +1231,9 @@ describe('gate evidence hook (synthetic quota)', () => {
     gates.push(gate);
     const coordinator = createSyntheticQuotaCoordinator({
       terminalGate: gate,
-      callerWaitTimeoutMs: 100,
-      hardTransportTimeoutMs: 200,
+      callerWaitTimeoutMs: options.callerWaitTimeoutMs ?? 100,
+      hardTransportTimeoutMs: options.hardTransportTimeoutMs ?? 200,
+      ...(options.now ? { now: options.now } : {}),
     });
     tracker = createRevivedRunTracker({
       input,
@@ -1262,5 +1293,84 @@ describe('gate evidence hook (synthetic quota)', () => {
     expect(text).not.toContain('<task_result>');
     // The quota text rides the error payload, never a completed result.
     expect(text).toContain(quotaText1);
+  });
+
+  test('quarantined incident within the bound still holds publication', async () => {
+    // Injectable clock: the hard transport deadline still fires on a real
+    // timer, but the held duration is measured from the injected instant so
+    // the scenario stays deterministic.
+    const now = { value: 1_000 };
+    const h = createGateHarness(continuationManager(), {
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 20,
+      now: () => now.value,
+    });
+    // The continuation transport never resolves, so the incident reaches the
+    // hard quarantine deadline instead of settling.
+    h.promptAsync.mockImplementation(async (args) => {
+      const id = (args as { path?: { id?: string } })?.path?.id;
+      if (id === 'ses_child') return new Promise(() => {});
+      return {};
+    });
+
+    await h.gate.reconcile(h.run);
+    await waitFor(
+      () =>
+        h.board
+          .get('ses_child')
+          ?.lastStatusError?.includes('quarantine deadline exceeded') === true,
+    );
+    expect(h.board.get('ses_child')).toMatchObject({
+      state: 'running',
+      terminalRevision: 0,
+    });
+
+    // Held 0ms of a 2x20ms bound: the gate must keep deferring, not publish.
+    await h.gate.reconcile(h.run);
+    expect(h.board.get('ses_child')).toMatchObject({
+      state: 'running',
+      terminalRevision: 0,
+    });
+    expect(h.board.get('ses_child')?.state).not.toBe('error');
+    expect(continuationCalls(h.promptAsync)).toHaveLength(1);
+  });
+
+  test('quarantined incident past the bound overrides to error and publishes through the gate', async () => {
+    const now = { value: 1_000 };
+    const h = createGateHarness(continuationManager(), {
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 20,
+      now: () => now.value,
+    });
+    h.promptAsync.mockImplementation(async (args) => {
+      const id = (args as { path?: { id?: string } })?.path?.id;
+      if (id === 'ses_child') return new Promise(() => {});
+      return {};
+    });
+
+    await h.gate.reconcile(h.run);
+    await waitFor(
+      () =>
+        h.board
+          .get('ses_child')
+          ?.lastStatusError?.includes('quarantine deadline exceeded') === true,
+    );
+
+    // Quarantine persisted past twice the hard transport timeout.
+    now.value = 1_000 + 20 * 2 + 1;
+    await h.gate.reconcile(h.run);
+    await flushNotify();
+
+    // The gate published the override only because the (test) runtime is
+    // quiescent; the child never went idle on its own.
+    expect(h.board.get('ses_child')).toMatchObject({
+      state: 'error',
+      terminalRevision: 1,
+    });
+    expect(h.board.get('ses_child')?.resultSummary).toContain('quarantined');
+    expect(h.board.get('ses_child')?.state).not.toBe('running');
+    // No second continuation dispatch: the incident was terminalized, not
+    // retried, and only the parent notification rode the gate's commit.
+    expect(continuationCalls(h.promptAsync)).toHaveLength(1);
   });
 });

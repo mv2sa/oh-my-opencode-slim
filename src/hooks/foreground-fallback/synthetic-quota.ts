@@ -22,13 +22,6 @@ export const ANTIGRAVITY_TEMPLATE_2 =
 export const DEFAULT_CONTINUATION_CALLER_WAIT_MS = 2_000;
 export const DEFAULT_CONTINUATION_TRANSPORT_TIMEOUT_MS = 10_000;
 
-export class ContinuationTransportTimeoutError extends Error {
-  constructor() {
-    super('Continuation prompt transport timed out');
-    this.name = 'ContinuationTransportTimeoutError';
-  }
-}
-
 export interface AntigravityMessageEvidence {
   role?: unknown;
   providerID?: unknown;
@@ -217,71 +210,6 @@ function errorText(error: unknown): string {
   }
 }
 
-export async function launchContinuationPrompt(options: {
-  client: unknown;
-  directory?: string;
-  taskID: string;
-  agent?: string;
-  model?: string;
-  variant?: string;
-  timeoutMs?: number;
-}): Promise<void> {
-  if (!options.client || typeof options.client !== 'object') {
-    throw new Error('client unavailable');
-  }
-  const sessionClient = (options.client as Record<string, unknown>).session;
-  if (
-    !sessionClient ||
-    typeof sessionClient !== 'object' ||
-    typeof (sessionClient as Record<string, unknown>).promptAsync !== 'function'
-  ) {
-    throw new Error('session.promptAsync unavailable');
-  }
-  const ref = options.model ? parseModelReference(options.model) : undefined;
-  const promptBody = {
-    path: { id: options.taskID },
-    ...(options.directory ? { query: { directory: options.directory } } : {}),
-    body: {
-      parts: [
-        createInternalAgentTextPart(
-          "<system-reminder>\nThe previous model request failed and is being retried with a fallback model. Continue processing the user's original request above. Do not respond to this reminder.\n</system-reminder>",
-        ),
-      ],
-      ...(ref ? { model: ref } : {}),
-      ...(options.variant ? { variant: options.variant } : {}),
-      ...(options.agent ? { agent: options.agent } : {}),
-    },
-  };
-
-  const dispatchPromise = (async (): Promise<void> => {
-    const response = await (
-      sessionClient as {
-        promptAsync: (args: unknown) => Promise<unknown>;
-      }
-    ).promptAsync(promptBody);
-    const err = responseError(response);
-    if (err !== undefined) {
-      throw new Error(errorText(err));
-    }
-  })();
-
-  const timeoutMs =
-    options.timeoutMs ?? DEFAULT_CONTINUATION_TRANSPORT_TIMEOUT_MS;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new ContinuationTransportTimeoutError());
-    }, timeoutMs);
-    timer.unref?.();
-  });
-
-  try {
-    await Promise.race([dispatchPromise, timeoutPromise]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
 export type SyntheticQuotaIncidentStatus =
   | 'launching'
   | 'launched'
@@ -304,6 +232,9 @@ export function isSyntheticQuotaContinuationActiveStatus(
 export interface SyntheticQuotaCoordinatorOptions {
   callerWaitTimeoutMs?: number;
   hardTransportTimeoutMs?: number;
+  /** Clock seam; production reads `Date.now`. Used to bound how long a
+   *  quarantine may hold terminal publication. */
+  now?: () => number;
   /** Gate-bound publication: quota terminals are committed only through the
    *  gate's runtime confirmation, never a raw running-only board write. */
   terminalGate?: BackgroundJobTerminalGate;
@@ -342,6 +273,12 @@ export interface SyntheticQuotaCoordinator {
     nextModel?: string;
     variant?: string;
     failedMessageID?: string;
+    /** Milliseconds the incident has been quarantined at report time. Only
+     *  present while `status === 'quarantined'`; the gate evidence hook uses
+     *  it (with `quarantineBoundMs`) to bound an otherwise indefinite hold. */
+    quarantineHeldMs?: number;
+    /** Twice the hard transport timeout that produced this quarantine. */
+    quarantineBoundMs?: number;
   }>;
 }
 
@@ -350,6 +287,12 @@ interface IncidentReservation {
   status: SyntheticQuotaIncidentStatus;
   model: string;
   quarantineTimer?: ReturnType<typeof setTimeout>;
+  /** Wall clock at which the hard transport deadline quarantined the
+   *  incident. Absent until `status === 'quarantined'`. */
+  quarantineStartedAt?: number;
+  /** Bound (2x the effective hard transport timeout) past which the
+   *  quarantine may no longer hold terminal publication. */
+  quarantineBoundMs?: number;
   activeLease?: {
     board: BackgroundJobStore;
     lease: NonNullable<ReturnType<BackgroundJobStore['acquireMessageLease']>>;
@@ -364,6 +307,7 @@ export function createSyntheticQuotaCoordinator(
   const defaultHardTransportTimeoutMs =
     options?.hardTransportTimeoutMs ??
     DEFAULT_CONTINUATION_TRANSPORT_TIMEOUT_MS;
+  const now = options?.now ?? Date.now;
   const terminalGate = options?.terminalGate;
 
   // taskID:generation:failedMessageID -> reservation state
@@ -463,11 +407,23 @@ export function createSyntheticQuotaCoordinator(
           existing.status === 'launching' || existing.status === 'launched'
             ? 'already_active'
             : existing.status;
+        // A quarantined incident reports how long it has been held so the
+        // gate evidence hook can stop holding once the bound is exceeded.
+        const quarantine =
+          status === 'quarantined' &&
+          existing.quarantineStartedAt !== undefined &&
+          existing.quarantineBoundMs !== undefined
+            ? {
+                quarantineHeldMs: now() - existing.quarantineStartedAt,
+                quarantineBoundMs: existing.quarantineBoundMs,
+              }
+            : {};
         return {
           handled: true,
           status,
           nextModel: existing.model,
           failedMessageID,
+          ...quarantine,
         };
       }
       if (
@@ -593,6 +549,12 @@ export function createSyntheticQuotaCoordinator(
         // Deduplication disposition for that exact incident
         reservation.status = 'quarantined';
         reservation.model = next.model;
+        // Bound the hold: twice the effective hard transport timeout (the
+        // only configured transport value) past quarantine onset. Within it
+        // the incident keeps holding terminal publication; past it the gate
+        // evidence hook overrides to an error once the runtime is quiescent.
+        reservation.quarantineStartedAt = now();
+        reservation.quarantineBoundMs = hardTransportTimeoutMs * 2;
 
         // Mark still-current running board generation status uncertain
         const current = input.backgroundJobBoard.get(input.taskID);
