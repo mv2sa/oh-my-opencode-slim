@@ -486,3 +486,41 @@ describe('PluginConfigSchema backgroundJobs', () => {
     }
   });
 });
+
+describe('PluginConfigSchema outcomeManagement', () => {
+  it('defaults enabled to true when the section is omitted or empty', () => {
+    const omitted = PluginConfigSchema.safeParse({});
+    expect(omitted.success).toBe(true);
+    if (omitted.success) {
+      expect(omitted.data.outcomeManagement).toBeUndefined();
+    }
+
+    const empty = PluginConfigSchema.safeParse({ outcomeManagement: {} });
+    expect(empty.success).toBe(true);
+    if (empty.success) {
+      expect(empty.data.outcomeManagement?.enabled).toBe(true);
+    }
+  });
+
+  it('accepts an explicit false kill switch', () => {
+    const result = PluginConfigSchema.safeParse({
+      outcomeManagement: { enabled: false },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.outcomeManagement?.enabled).toBe(false);
+    }
+  });
+
+  it('rejects non-boolean enabled and unknown keys', () => {
+    expect(
+      PluginConfigSchema.safeParse({ outcomeManagement: { enabled: 'no' } })
+        .success,
+    ).toBe(false);
+    expect(
+      PluginConfigSchema.safeParse({
+        outcomeManagement: { enabled: true, unknown: 1 },
+      }).success,
+    ).toBe(false);
+  });
+});

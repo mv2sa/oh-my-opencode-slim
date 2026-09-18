@@ -38,6 +38,7 @@ import type {
   CompanionConfig,
   FailoverConfig,
   MultiplexerConfig,
+  OutcomeManagementConfig,
   PluginConfig,
   WebfetchConfig,
 } from './schema';
@@ -97,6 +98,8 @@ const DEFAULT_FALLBACK: FailoverConfig = {
   initialRetryDelayMs: 0,
   retryDelayMs: 500,
 };
+
+const DEFAULT_OUTCOME_MANAGEMENT: OutcomeManagementConfig = { enabled: true };
 
 /** First model from an override's model field (string or array). */
 function primaryModelFromOverride(
@@ -340,6 +343,10 @@ export class RuntimeConfig {
 
   get backgroundJobs(): BackgroundJobsConfig {
     return this.pluginConfig?.backgroundJobs ?? DEFAULT_BACKGROUND_JOBS;
+  }
+
+  get outcomeManagement(): OutcomeManagementConfig {
+    return this.pluginConfig?.outcomeManagement ?? DEFAULT_OUTCOME_MANAGEMENT;
   }
 
   get fallback(): FailoverConfig {

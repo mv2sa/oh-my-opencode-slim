@@ -1261,6 +1261,17 @@
         }
       }
     },
+    "outcomeManagement": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "When false, the Outcome Manager controller is not wired: the outcome hook and outcome_control tool are not registered, and wait_for_user no longer consults managed-outcome state. On-disk outcome records are left untouched; re-enabling resumes from them. Default enabled.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
     "fallback": {
       "type": "object",
       "properties": {

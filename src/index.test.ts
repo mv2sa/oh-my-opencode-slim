@@ -15,6 +15,7 @@ import { CooldownRegistry } from './hooks/foreground-fallback/cooldown-registry'
 import pluginModuleDefault, {
   consumeCompletedManagerTask,
   OhMyOpenCodeLite as plugin,
+  selectLiveOrSoonestReset,
   sessionManagerMultiplexerConfig,
   shouldEnableMultiplexer,
 } from './index';
@@ -23,7 +24,9 @@ import {
   serializeOutcomeRecord,
 } from './outcome/controller-schema';
 import { readTuiSnapshot, snapshotSectionsEqual } from './tui-state';
+import { BackgroundJobBoard as ProductionBackgroundJobBoard } from './utils/background-job-board';
 import { BackgroundJobBoard } from './utils/background-job-fixture';
+import { createBackgroundJobTerminalGate } from './utils/background-job-terminal-gate';
 import { BackgroundTaskConcurrency } from './utils/background-task-concurrency';
 import { createInternalAgentTextPart } from './utils/internal-initiator';
 import { SessionMetadataStore } from './utils/session-metadata';
@@ -200,6 +203,231 @@ describe('Outcome Manager board consumption composition', () => {
         ),
       ).toBe(false);
     }
+  });
+
+  test('consumes a completed Manager task published through the real terminal gate', async () => {
+    // Existing tests above use the fixture board, which fabricates terminal
+    // publication through a private commit seam. Production updateStatus
+    // no-ops terminal transitions, so only a gate-driven commit proves that
+    // consumeCompletedManagerTask works against real terminal publication.
+    const board = new ProductionBackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: 'manager_gated',
+      parentSessionID: 'root-gated',
+      agent: 'outcome-manager',
+      background: true,
+      now: 0,
+    });
+    const gate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      baselineFor: () => 'baseline',
+      readTerminalEvidence: async () => ({
+        data: [
+          { info: { id: 'baseline', role: 'user' }, parts: [] },
+          {
+            info: {
+              id: 'answer',
+              role: 'assistant',
+              time: { completed: 100 },
+              finish: 'stop',
+            },
+            parts: [{ type: 'text', text: 'answer' }],
+          },
+        ],
+      }),
+      graceMs: 5,
+      now: () => 1,
+    });
+
+    try {
+      const token = gate.capture(run);
+      if (!token) throw new Error('missing observation');
+      gate.observe(token, {
+        kind: 'quiescent',
+        readStartedAt: token.readStartedAt,
+        origin: 'test',
+      });
+
+      const committed = await gate.reconcile(run);
+      expect(committed.kind).toBe('committed');
+      expect(board.get(run.taskID)).toMatchObject({
+        state: 'completed',
+        terminalState: 'completed',
+      });
+
+      expect(
+        consumeCompletedManagerTask(
+          board,
+          run.parentSessionID,
+          run.taskID,
+          run.generation,
+        ),
+      ).toBe(true);
+      expect(board.get(run.taskID)).toMatchObject({
+        state: 'reconciled',
+        terminalState: 'completed',
+        generation: run.generation,
+      });
+    } finally {
+      gate.dispose();
+    }
+  });
+});
+
+describe('outcome management kill switch', () => {
+  let originalEnv: typeof process.env;
+  let configDir: string;
+
+  const writeConfig = (config: Record<string, unknown>) =>
+    writeFile(
+      `${configDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({ autoUpdate: false, ...config }),
+    );
+
+  const createHooks = () =>
+    plugin({
+      client: createPluginClient(async () => ({})),
+      directory: configDir,
+      worktree: configDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    configDir = await mkdtemp('/tmp/omos-outcome-kill-switch-');
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_CONFIG_HOME: configDir,
+      XDG_DATA_HOME: `${configDir}/data`,
+      XDG_CACHE_HOME: `${configDir}/cache`,
+      OPENCODE_LOG_DIR: `${configDir}/logs`,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(configDir, { recursive: true, force: true });
+  });
+
+  test('omits outcome_control but keeps wait_for_user when disabled', async () => {
+    await writeConfig({ outcomeManagement: { enabled: false } });
+    const hooks = await createHooks();
+    try {
+      expect(hooks.tool?.outcome_control).toBeUndefined();
+      expect(hooks.tool?.wait_for_user).toBeDefined();
+      await expect(
+        hooks.tool?.wait_for_user?.execute(
+          { reason: 'Approve the external step.' },
+          { sessionID: 'kill-switch-root', agent: 'orchestrator' } as never,
+        ),
+      ).resolves.toContain('state: waiting_for_user');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('registers outcome_control by default', async () => {
+    await writeConfig({});
+    const hooks = await createHooks();
+    try {
+      expect(hooks.tool?.outcome_control).toBeDefined();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('re-enabling after disable resumes outcome_control registration', async () => {
+    await writeConfig({ outcomeManagement: { enabled: false } });
+    const disabled = await createHooks();
+    expect(disabled.tool?.outcome_control).toBeUndefined();
+    await disabled.dispose?.();
+
+    await writeConfig({ outcomeManagement: { enabled: true } });
+    const enabled = await createHooks();
+    try {
+      expect(enabled.tool?.outcome_control).toBeDefined();
+    } finally {
+      await enabled.dispose?.();
+    }
+  });
+});
+
+describe('cooldown bootstrap filtering', () => {
+  let originalEnv: typeof process.env;
+  let configDir: string;
+  let cooldownFile: string;
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    configDir = await mkdtemp('/tmp/omos-cooldown-bootstrap-');
+    cooldownFile = `${configDir}/cooldowns.json`;
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_CONFIG_HOME: configDir,
+      XDG_DATA_HOME: `${configDir}/data`,
+      XDG_CACHE_HOME: `${configDir}/cache`,
+      OPENCODE_LOG_DIR: `${configDir}/logs`,
+      OMOS_COOLDOWN_FILE: cooldownFile,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await writeFile(
+      `${configDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        autoUpdate: false,
+        agents: {
+          fixer: { model: ['a/primary', 'b/fallback'] },
+        },
+      }),
+    );
+    new CooldownRegistry(cooldownFile).markFailure('a/primary', {
+      class: 'quota',
+      cooldownMs: 60_000,
+      reason: 'bootstrap test',
+    });
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(configDir, { recursive: true, force: true });
+  });
+
+  test('config hook startup skips a dead primary for the next live model', async () => {
+    const hooks = await plugin({
+      client: createPluginClient(async () => ({})),
+      directory: configDir,
+      worktree: configDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+    try {
+      const host: Record<string, unknown> = { agent: {} };
+      await hooks.config?.(host);
+      const fixer = (host.agent as Record<string, { model?: string }>).fixer;
+      expect(fixer.model).toBe('b/fallback');
+      expect(fixer.model).not.toBe('a/primary');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('selection helper picks the live candidate, or the soonest reset when all cool', () => {
+    const registry = new CooldownRegistry(cooldownFile);
+    const candidates = [{ id: 'a/primary' }, { id: 'b/fallback' }];
+
+    const withLive = selectLiveOrSoonestReset(candidates, registry);
+    expect(withLive?.selected.id).toBe('b/fallback');
+    expect(withLive?.allCooling).toBe(false);
+
+    registry.markFailure('b/fallback', {
+      class: 'quota',
+      cooldownMs: 120_000,
+      reason: 'all cooling',
+    });
+    const allCooling = selectLiveOrSoonestReset(candidates, registry);
+    expect(allCooling?.selected.id).toBe('a/primary');
+    expect(allCooling?.allCooling).toBe(true);
   });
 });
 

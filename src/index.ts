@@ -46,7 +46,10 @@ import {
   formatStoppedJobDelta,
   SessionLifecycle,
 } from './hooks';
-import { getCooldownRegistry } from './hooks/foreground-fallback/cooldown-registry';
+import {
+  type CooldownRegistry,
+  getCooldownRegistry,
+} from './hooks/foreground-fallback/cooldown-registry';
 import { createSyntheticQuotaCoordinator } from './hooks/foreground-fallback/synthetic-quota';
 import { processImageAttachments } from './hooks/image-hook';
 import { createBackgroundFallbackHandoff } from './hooks/task-session-manager/fallback-observation-transfer';
@@ -168,6 +171,44 @@ function mergeProtectedOutcomeManagerConfig(
 // Debounce: only show image-skipped toast once per 60 seconds per project
 const lastImageSkippedToastByDir = new Map<string, number>();
 const IMAGE_SKIPPED_DEBOUNCE_MS = 60_000;
+
+/**
+ * Pick one model from a configured chain given persistent cooldowns: the
+ * first live candidate in configured order, or — when every candidate is
+ * cooling — the one with the soonest reset. The sort is stable, so equal
+ * reset times keep the configured order, matching the pre-extraction
+ * config-hook behavior at both startup model-array resolution and runtime
+ * preset application.
+ *
+ * `onDead` is invoked once per cooling candidate examined before the first
+ * live one (used by startup logging); it is never called for a live chain.
+ */
+export function selectLiveOrSoonestReset<T extends { id: string }>(
+  candidates: readonly T[],
+  registry: CooldownRegistry,
+  onDead?: (candidate: T, deadUntil: number | undefined) => void,
+): { selected: T; allCooling: boolean } | undefined {
+  if (candidates.length === 0) return undefined;
+
+  let live: T | undefined;
+  for (const candidate of candidates) {
+    if (!registry.isDead(candidate.id)) {
+      live = candidate;
+      break;
+    }
+    onDead?.(candidate, registry.list()[candidate.id]?.deadUntil);
+  }
+
+  const snapshot = registry.list();
+  const selected =
+    live ??
+    [...candidates].sort(
+      (a, b) =>
+        (snapshot[a.id]?.deadUntil ?? 0) - (snapshot[b.id]?.deadUntil ?? 0),
+    )[0];
+
+  return { selected, allCooling: live === undefined };
+}
 
 export function consumeCompletedManagerTask(
   backgroundJobs: Pick<
@@ -447,9 +488,16 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let postFileToolNudgeAfter: (i: unknown, o: unknown) => Promise<void>;
   let jsonErrorRecoveryAfter: (i: unknown, o: unknown) => Promise<void>;
   let taskSessionManagerAfter: (i: unknown, o: unknown) => Promise<void>;
-  let outcomeController: OutcomeController;
-  let outcomeControllerHook: ReturnType<typeof createOutcomeControllerHook>;
-  let outcomeControlTools: ReturnType<typeof createOutcomeControlTool>;
+  let outcomeController: OutcomeController | undefined;
+  let outcomeControllerHook:
+    | ReturnType<typeof createOutcomeControllerHook>
+    | undefined;
+  let outcomeControlTools:
+    | ReturnType<typeof createOutcomeControlTool>
+    | undefined;
+  // Narrow, independent kill switch for the Outcome Manager surface.
+  // Records already on disk are never touched; re-enabling resumes from them.
+  let outcomeManagementEnabled: boolean;
   let backgroundJobBoard: BackgroundJobBoard;
   let backgroundJobSupervisor: BackgroundJobSupervisor;
   let backgroundTaskConcurrency: BackgroundTaskConcurrency;
@@ -521,6 +569,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     }
 
     runtime = RuntimeConfig.get(ctx.directory);
+    outcomeManagementEnabled = runtime.outcomeManagement.enabled;
     rewriteDisplayNameMentions = createDisplayNameMentionRewriter(runtime);
     // Host flavor marker ('v2' on OpenCode v2 hosts, set by the v2 client
     // shim; absent on v1). Threads the native delegation vocabulary into
@@ -832,44 +881,46 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     getRevivedContextFiles = taskSessionManagerHook.contextFilesForTask;
     pruneRevivedContext = taskSessionManagerHook.pruneTaskContext;
 
-    outcomeController = new OutcomeController({
-      projectDirectory: ctx.directory,
-      getManagerTaskRecord: (taskId: string) =>
-        backgroundJobCoordinator.get(taskId),
-      readChildSessionResult: async (childSessionId: string) => {
-        try {
-          const res = await extractFinalSessionResult(
-            ctx.client,
-            childSessionId,
-            { directory: ctx.directory },
-          );
-          return {
-            text: res.text,
-            empty: res.empty,
-            terminal: res.terminal ?? false,
-          };
-        } catch {
-          return undefined;
-        }
-      },
-      consumeManagerTask: (
-        rootSessionId: string,
-        taskId: string,
-        generation: number,
-      ) =>
-        consumeCompletedManagerTask(
-          backgroundJobCoordinator,
-          rootSessionId,
-          taskId,
-          generation,
-        ),
-      hasRunningChildren: (rootSessionId: string) =>
-        backgroundJobCoordinator.hasRunning(rootSessionId),
-      hasTerminalUnreconciledChildren: (rootSessionId: string) =>
-        backgroundJobCoordinator.hasTerminalUnreconciled(rootSessionId),
-      resolveAgentName: (agent: string) =>
-        resolveRuntimeAgentName(runtime, agent),
-    });
+    if (outcomeManagementEnabled) {
+      outcomeController = new OutcomeController({
+        projectDirectory: ctx.directory,
+        getManagerTaskRecord: (taskId: string) =>
+          backgroundJobCoordinator.get(taskId),
+        readChildSessionResult: async (childSessionId: string) => {
+          try {
+            const res = await extractFinalSessionResult(
+              ctx.client,
+              childSessionId,
+              { directory: ctx.directory },
+            );
+            return {
+              text: res.text,
+              empty: res.empty,
+              terminal: res.terminal ?? false,
+            };
+          } catch {
+            return undefined;
+          }
+        },
+        consumeManagerTask: (
+          rootSessionId: string,
+          taskId: string,
+          generation: number,
+        ) =>
+          consumeCompletedManagerTask(
+            backgroundJobCoordinator,
+            rootSessionId,
+            taskId,
+            generation,
+          ),
+        hasRunningChildren: (rootSessionId: string) =>
+          backgroundJobCoordinator.hasRunning(rootSessionId),
+        hasTerminalUnreconciledChildren: (rootSessionId: string) =>
+          backgroundJobCoordinator.hasTerminalUnreconciled(rootSessionId),
+        resolveAgentName: (agent: string) =>
+          resolveRuntimeAgentName(runtime, agent),
+      });
+    }
 
     orchestratorWakeScheduler = createOrchestratorWakeScheduler(ctx, {
       config: runtime.backgroundJobs.orchestratorWake,
@@ -974,20 +1025,22 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     jsonErrorRecovery = createJsonErrorRecoveryHook(ctx);
     toolLoopGuard = createToolLoopGuardHook();
 
-    outcomeControllerHook = createOutcomeControllerHook(ctx, {
-      controller: outcomeController,
-      shouldManageSession: (sessionID) =>
-        sessionMetadata.getAgent(sessionID) === 'orchestrator',
-      backgroundJobBoard: backgroundJobCoordinator,
-      resolveAgentName: (agent) => resolveRuntimeAgentName(runtime, agent),
-    });
+    if (outcomeManagementEnabled && outcomeController) {
+      outcomeControllerHook = createOutcomeControllerHook(ctx, {
+        controller: outcomeController,
+        shouldManageSession: (sessionID) =>
+          sessionMetadata.getAgent(sessionID) === 'orchestrator',
+        backgroundJobBoard: backgroundJobCoordinator,
+        resolveAgentName: (agent) => resolveRuntimeAgentName(runtime, agent),
+      });
 
-    outcomeControlTools = createOutcomeControlTool({
-      controller: outcomeController,
-      shouldManageSession: (sessionID) =>
-        sessionMetadata.getAgent(sessionID) === 'orchestrator',
-      resolveAgentName: (agent) => resolveRuntimeAgentName(runtime, agent),
-    });
+      outcomeControlTools = createOutcomeControlTool({
+        controller: outcomeController,
+        shouldManageSession: (sessionID) =>
+          sessionMetadata.getAgent(sessionID) === 'orchestrator',
+        resolveAgentName: (agent) => resolveRuntimeAgentName(runtime, agent),
+      });
+    }
 
     // Pre-created wrapped handlers for tool.execute.after (error-isolated)
     postFileToolNudgeAfter = wrapPostToolHook('post-file-tool-nudge', (i, o) =>
@@ -1037,6 +1090,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       backgroundJobBoard: backgroundJobCoordinator,
       activityTracker: taskActivityTracker,
     });
+    // Capture the (possibly undefined) controller so the optional
+    // validateManagedWait callback is omitted entirely — not passed as
+    // undefined — when outcome management is disabled.
+    const managedWaitController = outcomeController;
     waitForUserTools = createWaitForUserTool({
       shouldManageSession: (sessionID) =>
         sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
@@ -1053,8 +1110,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       hasOutstandingBackgroundTasks: (sessionID) =>
         runtime.backgroundJobs.orchestratorWake.enabled &&
         backgroundJobCoordinator.hasRunning(sessionID),
-      validateManagedWait: (sessionID) =>
-        outcomeController.validateManagedWait(sessionID),
+      ...(managedWaitController
+        ? {
+            validateManagedWait: (sessionID: string) =>
+              managedWaitController.validateManagedWait(sessionID),
+          }
+        : {}),
     });
 
     const shouldRegisterWebfetch = runtime.webfetch.enabled !== false;
@@ -1065,7 +1126,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       ...taskReviveTools,
       ...taskStatusTools,
       ...waitForUserTools,
-      ...outcomeControlTools,
+      ...(outcomeControlTools ?? {}),
       ...acpRunTools,
       ...(shouldRegisterWebfetch ? { webfetch } : {}),
       ast_grep_search,
@@ -1288,25 +1349,19 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           // at config-hook time, so we cannot gate on the provider config
           // keys. Runtime failover is handled separately by
           // ForegroundFallbackManager.
-          const live = models.find((candidate) => {
-            const dead = cooldownRegistry.isDead(candidate.id);
-            if (dead) {
+          const selection = selectLiveOrSoonestReset(
+            models,
+            cooldownRegistry,
+            (candidate, deadUntil) => {
               log('[cooldown] initial model skipped', {
                 agent: agentName,
                 model: candidate.id,
-                deadUntil: cooldownRegistry.list()[candidate.id]?.deadUntil,
+                deadUntil,
               });
-            }
-            return !dead;
-          });
-          const snapshot = cooldownRegistry.list();
-          const chosen =
-            live ??
-            [...models].sort(
-              (a, b) =>
-                (snapshot[a.id]?.deadUntil ?? 0) -
-                (snapshot[b.id]?.deadUntil ?? 0),
-            )[0];
+            },
+          );
+          if (!selection) continue;
+          const { selected: chosen, allCooling } = selection;
           const chosenVariant =
             chosen.variant ??
             (typeof runtime.agents()[agentName]?.variant === 'string'
@@ -1328,7 +1383,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
               log('[cooldown] initial model selected', {
                 agent: agentName,
                 model: chosen.id,
-                allCooling: live === undefined,
+                allCooling,
               });
             }
           } else {
@@ -1372,17 +1427,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             const candidates = override.model.map((model) =>
               typeof model === 'string' ? { id: model } : model,
             );
-            const first =
-              candidates.find(
-                (candidate) => !getCooldownRegistry().isDead(candidate.id),
-              ) ??
-              [...candidates].sort((a, b) => {
-                const snapshot = getCooldownRegistry().list();
-                return (
-                  (snapshot[a.id]?.deadUntil ?? 0) -
-                  (snapshot[b.id]?.deadUntil ?? 0)
-                );
-              })[0];
+            const selection = selectLiveOrSoonestReset(
+              candidates,
+              getCooldownRegistry(),
+            );
+            if (!selection) continue;
+            const first = selection.selected;
             entry.model = first.id;
             // Extract inline variant from array-form model entry
             if (first.variant) {
@@ -1766,7 +1816,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
       // Outcome liveness must observe the board after task-session lifecycle
       // reconciliation and before unrelated wake/fallback/update hooks.
-      await outcomeControllerHook.event(input as never);
+      await outcomeControllerHook?.event(input as never);
 
       await orchestratorWakeScheduler.event(
         input as {
@@ -1849,7 +1899,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     dispose: async () => {
       terminalGate?.dispose();
-      await outcomeControllerHook.event({
+      await outcomeControllerHook?.event({
         event: { type: 'server.instance.disposed' },
       });
       await taskSessionManagerHook.event({
@@ -1880,7 +1930,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         input as never,
         output as never,
       );
-      const managerReservation = outcomeControllerHook.reserveManagerDispatch(
+      const managerReservation = outcomeControllerHook?.reserveManagerDispatch(
         input as never,
         output as never,
       );
@@ -1889,7 +1939,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           input as never,
           output as never,
         );
-        await outcomeControllerHook['tool.execute.before'](
+        await outcomeControllerHook?.['tool.execute.before'](
           input as never,
           output as never,
         );
@@ -1903,7 +1953,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       } catch (error) {
         if (managerReservation) {
           const reason = error instanceof Error ? error.message : String(error);
-          outcomeControllerHook.failReservedManagerDispatch(
+          outcomeControllerHook?.failReservedManagerDispatch(
             managerReservation,
             `Manager dispatch rejected before native launch: ${reason}`,
           );
@@ -2105,7 +2155,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         );
         backgroundTaskConcurrency.migrateTask(input.sessionID, model);
       }
-      await outcomeControllerHook['chat.message'](input, output);
+      await outcomeControllerHook?.['chat.message'](input, output);
       taskSessionManagerHook.observeChatMessage(input, output);
       orchestratorWakeScheduler.observeChatMessage(input, output);
       if (messageID) {
@@ -2258,10 +2308,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         input as never,
         typedOutput as never,
       );
-      await outcomeControllerHook['experimental.chat.messages.transform'](
-        input as never,
-        typedOutput as never,
-      );
+      if (outcomeControllerHook) {
+        await outcomeControllerHook['experimental.chat.messages.transform'](
+          input as never,
+          typedOutput as never,
+        );
+      }
       await taskSessionManagerHook.injectBackgroundJobBoard(input, typedOutput);
     },
 
@@ -2273,7 +2325,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         output as never,
       );
       await taskSessionManagerAfter(input, output);
-      await outcomeControllerHook['tool.execute.after'](
+      await outcomeControllerHook?.['tool.execute.after'](
         input as never,
         output as never,
       );
