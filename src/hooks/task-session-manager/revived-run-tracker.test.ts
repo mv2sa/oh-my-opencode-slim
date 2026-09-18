@@ -1190,6 +1190,7 @@ describe('gate evidence hook (synthetic quota)', () => {
       callerWaitTimeoutMs?: number;
       hardTransportTimeoutMs?: number;
       now?: () => number;
+      untrackedRun?: boolean;
     } = {},
   ) {
     const board = new ProductionBackgroundJobBoard();
@@ -1199,6 +1200,10 @@ describe('gate evidence hook (synthetic quota)', () => {
       agent: 'oracle',
       description: 'quota child',
       background: true,
+      // The no-baseline transcript path compares the trailing assistant's
+      // completion time against the record's runStartedAt; anchor it low so
+      // an untracked quota turn is still attributable without a baseline.
+      ...(options.untrackedRun ? { now: 0 } : {}),
     });
     const promptAsync = mock(async () => ({}));
     const messages = mock(async () => quotaTranscript());
@@ -1243,13 +1248,15 @@ describe('gate evidence hook (synthetic quota)', () => {
       fallbackManager,
       notificationRetryDelayMs: 0,
     });
-    tracker.register({
-      taskID: run.taskID,
-      generation: run.generation,
-      parentSessionID: 'parent',
-      baselineMessageID: 'baseline-msg',
-      description: 'quota child',
-    });
+    if (!options.untrackedRun) {
+      tracker.register({
+        taskID: run.taskID,
+        generation: run.generation,
+        parentSessionID: 'parent',
+        baselineMessageID: 'baseline-msg',
+        description: 'quota child',
+      });
+    }
     return { board, run, gate, tracker, promptAsync, messages, coordinator };
   }
 
@@ -1371,6 +1378,56 @@ describe('gate evidence hook (synthetic quota)', () => {
     expect(h.board.get('ses_child')?.state).not.toBe('running');
     // No second continuation dispatch: the incident was terminalized, not
     // retried, and only the parent notification rode the gate's commit.
+    expect(continuationCalls(h.promptAsync)).toHaveLength(1);
+  });
+
+  test('untracked-run quarantine holds within bound and overrides to error past it', async () => {
+    const now = { value: 1_000 };
+    // No tracker entry: models an incident observed by the tool-output or
+    // injected-completion lane while its continuation transport is pending.
+    const h = createGateHarness(continuationManager(), {
+      callerWaitTimeoutMs: 5,
+      hardTransportTimeoutMs: 20,
+      now: () => now.value,
+      untrackedRun: true,
+    });
+    h.promptAsync.mockImplementation(async (args) => {
+      const id = (args as { path?: { id?: string } })?.path?.id;
+      if (id === 'ses_child') return new Promise(() => {});
+      return {};
+    });
+
+    await h.gate.reconcile(h.run);
+    await waitFor(
+      () =>
+        h.board
+          .get('ses_child')
+          ?.lastStatusError?.includes('quarantine deadline exceeded') === true,
+    );
+    // The hook ran despite the missing tracker entry and dispatched exactly
+    // one continuation (the coordinator's reservation dedupe).
+    expect(continuationCalls(h.promptAsync)).toHaveLength(1);
+
+    // Within the 2x20ms bound the incident holds: the gate must not publish
+    // the transcript-derived `completed`.
+    await h.gate.reconcile(h.run);
+    expect(h.board.get('ses_child')).toMatchObject({
+      state: 'running',
+      terminalRevision: 0,
+    });
+    expect(h.board.get('ses_child')?.state).not.toBe('completed');
+
+    // Past the bound, the untracked incident overrides to error through the
+    // gate on the (test) quiescent runtime — again, never `completed`.
+    now.value = 1_000 + 20 * 2 + 1;
+    await h.gate.reconcile(h.run);
+    await flushNotify();
+    expect(h.board.get('ses_child')).toMatchObject({
+      state: 'error',
+      terminalRevision: 1,
+    });
+    expect(h.board.get('ses_child')?.state).not.toBe('completed');
+    expect(h.board.get('ses_child')?.resultSummary).toContain('quarantined');
     expect(continuationCalls(h.promptAsync)).toHaveLength(1);
   });
 });

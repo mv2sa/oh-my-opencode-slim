@@ -213,7 +213,12 @@ describe('OutcomeController service over frozen store', () => {
     expect(packet).toContain('## Payload Limits');
     expect(packet).toContain('`summary` ≤ 1024 characters');
     expect(packet).toContain('each `userDecision.options[]` entry ≤ 256');
-    expect(packet).toContain('each `handoff.verificationSteps[]` entry ≤ 512');
+    // Handoff fields are not durably capped; the note must not advertise a
+    // bound that is not enforced.
+    expect(packet).toContain(
+      'each `handoff.verificationSteps[]` entry: keep concise (not durably capped)',
+    );
+    expect(packet).not.toContain('handoff.verificationSteps[]` entry ≤ 512');
     expect(packet).toContain(
       'OMIT the key entirely for a kickoff review (an empty string is rejected)',
     );

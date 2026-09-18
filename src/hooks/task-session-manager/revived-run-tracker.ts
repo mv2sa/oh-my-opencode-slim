@@ -699,8 +699,22 @@ export function createRevivedRunTracker(options: {
    *  supplies the quota incident disposition the gate cannot derive. */
   const handleTerminalEvidence: RevivedRunTracker['handleTerminalEvidence'] =
     async (input) => {
+      if (disposed) return { kind: 'proceed' };
       const run = runs.get(input.run.taskID);
-      if (run?.generation !== input.run.generation || disposed)
+      // A tracker entry exists only once a continuation transport SETTLES or
+      // task_revive registers one. Incidents observed by the tool-output or
+      // injected-completion lanes have no entry while their transport is
+      // pending, so fall back to the durable board record (generation-checked)
+      // instead of bailing. The coordinator's (taskID, generation,
+      // failedMessageID) reservation dedupes against the tracked path, so an
+      // already-handled incident reports `quarantined` and the hold/bound
+      // still applies.
+      const trackedRun =
+        run?.generation === input.run.generation ? run : undefined;
+      const record = trackedRun
+        ? undefined
+        : options.backgroundJobBoard.get(input.run.taskID);
+      if (!trackedRun && record?.generation !== input.run.generation)
         return { kind: 'proceed' };
       const turn = extractTrailingAssistantTurn(input.response);
       if (!turn) return { kind: 'proceed' };
@@ -724,7 +738,7 @@ export function createRevivedRunTracker(options: {
           : options.fallbackManager;
       const outcome =
         await options.syntheticQuotaCoordinator.handleTaskQuotaIncident({
-          taskID: run.taskID,
+          taskID: input.run.taskID,
           text: turn.text,
           failedMessageID,
           verifiedEvidence: {
@@ -737,15 +751,20 @@ export function createRevivedRunTracker(options: {
           backgroundJobBoard: options.backgroundJobBoard,
           fallbackManager: input.fallbackManager ?? configuredFallback,
           revivedRunTracker: tracker,
-          pendingParentSessionId: run.parentSessionID,
-          pendingLabel: run.description,
+          pendingParentSessionId:
+            trackedRun?.parentSessionID ?? record?.parentSessionID,
+          pendingLabel: trackedRun?.description ?? record?.description,
           pendingAgent: typeof info.agent === 'string' ? info.agent : undefined,
         });
       if (disposed) return { kind: 'proceed' };
-      const current = runs.get(run.taskID);
-      // Re-registration for a continuation keeps the same generation; a
-      // superseded generation must not drive this observation.
-      if (current?.generation !== run.generation) return { kind: 'proceed' };
+      // A tracked run re-registered for a continuation keeps the same
+      // generation; a superseded generation must not drive this observation.
+      // Untracked runs have no tracker identity to fence on.
+      if (trackedRun) {
+        const current = runs.get(input.run.taskID);
+        if (current?.generation !== input.run.generation)
+          return { kind: 'proceed' };
+      }
       if (isSyntheticQuotaContinuationActiveStatus(outcome.status)) {
         // An active continuation holds publication so it can deliver its
         // result. A quarantine, however, is only a transport deadline, not

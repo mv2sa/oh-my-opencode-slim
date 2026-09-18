@@ -47,7 +47,8 @@ after every active session for that agent becomes idle or is deleted.
 
 When a provider reports a quota or rate-limit failure, oh-my-opencode-slim
 records a durable cooldown for that model and does not select it again until the
-reported reset time (capped at 5 hours). The registry is a state file, not part
+reported reset time (capped at 5 hours, or 7 days when the failure is a
+monthly-window exhaustion). The registry is a state file, not part
 of the plugin's JSON/JSONC config:
 
 | Path | Purpose |

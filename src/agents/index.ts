@@ -446,6 +446,12 @@ export function createAgents(
     // The bare councillor is only meaningful as part of configured Council Mode.
     disabled.add('councillor');
   }
+  // The outcome-management kill switch covers the whole surface. The
+  // orchestrator prompt is frozen for cache safety, so a disabled setup must
+  // not register the agent it would delegate to.
+  if (!runtime.outcomeManagement.enabled) {
+    disabled.add('outcome-manager');
+  }
 
   const primaryModel = runtime.primaryModel;
   const orchestratorOverride = getOverrideFromAgents(

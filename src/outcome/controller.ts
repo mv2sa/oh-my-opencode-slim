@@ -275,7 +275,7 @@ const OUTCOME_REVIEW_PAYLOAD_LIMITS = [
   '## Payload Limits (keep emitted fields within these caps)',
   '- `summary` ≤ 1024 characters',
   '- `userDecision.decisionNeeded` ≤ 512, `userDecision.impact` ≤ 512, each `userDecision.options[]` entry ≤ 256 (max 16 options)',
-  '- `handoff.summary` ≤ 512, each `handoff.verificationSteps[]` entry ≤ 512',
+  '- `handoff.summary` and each `handoff.verificationSteps[]` entry: keep concise (not durably capped)',
   '- `candidateFingerprint`, when present, must be a non-empty `sha256:<64 hex>`; OMIT the key entirely for a kickoff review (an empty string is rejected)',
   '- `outcome_control`: `external_handoff.instructions` and `external_handoff.expectedPostRestartCheck` ≤ 512; `finalize.summary` ≤ 1024',
 ].join('\n');

@@ -308,7 +308,7 @@ export const OutcomeManagementConfigSchema = z
       .boolean()
       .default(true)
       .describe(
-        'When false, the Outcome Manager controller is not wired: the outcome hook and outcome_control tool are not registered, and wait_for_user no longer consults managed-outcome state. On-disk outcome records are left untouched; re-enabling resumes from them. Default enabled.',
+        'When false, the Outcome Manager surface is not wired: the outcome hook and outcome_control tool are not registered, the outcome-manager agent is not registered, and wait_for_user no longer consults managed-outcome state. On-disk outcome records are left untouched; re-enabling resumes from them. Default enabled.',
       ),
   })
   .strict();
