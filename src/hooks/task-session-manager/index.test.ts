@@ -20,6 +20,8 @@ import {
   getBackgroundJobLifecycleLedger,
   SLIM_INTERNAL_INITIATOR_MARKER,
 } from '../../utils';
+import { BackgroundJobBoard as ProductionBackgroundJobBoard } from '../../utils/background-job-board';
+import { BackgroundJobCoordinator } from '../../utils/background-job-coordinator';
 import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import {
   type BackgroundJobTerminalGate,
@@ -8585,6 +8587,8 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
       { tool: 'task', sessionID: 'parent-1', callID: 'call-2' },
       output,
     );
+    // Gate-backed publication is asynchronous (runtime-confirmed).
+    await flushContinuation();
 
     expect(output.output).toContain('state="error"');
     expect(output.output).toContain('Background task failed');
@@ -9012,6 +9016,8 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
       { tool: 'task', sessionID: 'parent-1', callID: 'call-err-1' },
       output,
     );
+    // Gate-backed publication is asynchronous (runtime-confirmed).
+    await flushContinuation();
 
     // Because prompt transport failed, output is error (not false running)
     expect(output.output).toContain('state="error"');
@@ -10240,12 +10246,23 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
       undefined,
       registry,
     );
+    const terminalGate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      readRuntime: async (_run, readStartedAt) => ({
+        kind: 'quiescent',
+        origin: 'test',
+        readStartedAt,
+      }),
+      readTerminalEvidence: async () => messagesMock(),
+    });
     const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
       callerWaitTimeoutMs: 5,
       hardTransportTimeoutMs: 200,
+      terminalGate,
     });
     const { hook } = createHook({
       backgroundJobBoard: board,
+      terminalGate,
       fallbackManager: fallbackMgr,
       syntheticQuotaCoordinator,
       sessionClient: { promptAsync, messages: messagesMock },
@@ -10284,6 +10301,8 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
     // Late prompt rejection occurs before quarantine deadline
     rejectPrompt(new Error('Connection terminated by host'));
     await new Promise((resolve) => setTimeout(resolve, 20));
+    // Gate-backed publication is asynchronous (runtime-confirmed).
+    await flushContinuation();
 
     // Terminalizes to error on board
     expect(board.get('ses-child-late-pre-err-1')?.state).toBe('error');
@@ -10451,5 +10470,390 @@ describe('task-session-manager Antigravity synthetic quota fallback', () => {
         currentModel: 'google/antigravity-gemini-3-flash',
       })?.model,
     ).toBe('google/antigravity-gemini-3.7-flash');
+  });
+});
+
+describe('gate-backed synthetic quota publication (production board)', () => {
+  const quotaText =
+    'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
+  const gates: BackgroundJobTerminalGate[] = [];
+  afterEach(() => {
+    for (const gate of gates.splice(0)) gate.dispose();
+  });
+
+  const flushGate = async (): Promise<void> => {
+    for (let i = 0; i < 25; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  };
+
+  const quotaTranscript = () => ({
+    data: [
+      { info: { id: 'baseline', role: 'user' }, parts: [] },
+      {
+        info: {
+          id: 'asst-quota',
+          role: 'assistant',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+          finish: 'stop',
+          tokens: { input: 0, output: 33 },
+          time: { completed: 1 },
+        },
+        parts: [{ type: 'text', text: quotaText }],
+      },
+    ],
+  });
+
+  function setup(options: {
+    taskID: string;
+    chain: string[];
+    readRuntime?: (
+      run: { taskID: string; generation: number },
+      readStartedAt: number,
+    ) => Promise<{
+      kind: 'busy' | 'quiescent';
+      origin: string;
+      readStartedAt: number;
+    }>;
+    fallbackManager?: ForegroundFallbackManager;
+    transcript?: () => unknown;
+  }) {
+    const board = new ProductionBackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: options.taskID,
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      description: 'quota child',
+      background: true,
+    });
+    const coordinator = new BackgroundJobCoordinator(board);
+    const gate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: coordinator,
+      readRuntime:
+        options.readRuntime ??
+        (async (_run, readStartedAt) => ({
+          kind: 'quiescent' as const,
+          origin: 'test',
+          readStartedAt,
+        })),
+      readTerminalEvidence: async () =>
+        options.transcript ? options.transcript() : quotaTranscript(),
+      baselineFor: () => 'baseline',
+    });
+    gates.push(gate);
+    const promptAsync = mock(async () => ({}));
+    const registry = createTestCooldownRegistry();
+    const fallbackManager =
+      options.fallbackManager ??
+      new ForegroundFallbackManager(
+        { oracle: options.chain },
+        true,
+        { directory: '/tmp' } as never,
+        1,
+        undefined,
+        registry,
+      );
+    const quota = createSyntheticQuotaCoordinator({
+      terminalGate: gate,
+      callerWaitTimeoutMs: 100,
+      hardTransportTimeoutMs: 200,
+    });
+    return {
+      board,
+      run,
+      gate,
+      coordinator,
+      fallbackManager,
+      promptAsync,
+      quota,
+      registry,
+    };
+  }
+
+  const incidentInput = (
+    taskID: string,
+    coordinator: BackgroundJobCoordinator,
+    fallbackManager: ForegroundFallbackManager,
+    promptAsync: ReturnType<typeof mock>,
+  ) => ({
+    taskID,
+    text: quotaText,
+    failedMessageID: 'asst-quota',
+    verifiedEvidence: {
+      model: 'google/antigravity-gemini-3-flash',
+      agent: 'oracle',
+      failedMessageID: 'asst-quota',
+    },
+    client: { session: { promptAsync } },
+    directory: '/tmp',
+    backgroundJobBoard: coordinator,
+    fallbackManager,
+  });
+
+  test('production board updateStatus is running-only: no terminal publication', () => {
+    const board = new ProductionBackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: 'quota-noop',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      background: true,
+    });
+    const listener = mock(() => {});
+    board.addTerminalStateListener(listener);
+    // The exact shape the removed `as any` cast used to publish.
+    (board.updateStatus as unknown as (input: unknown) => unknown)({
+      taskID: 'quota-noop',
+      expectedGeneration: run.generation,
+      state: 'error',
+      resultSummary: 'Quota exhausted; fallback chain exhausted.',
+    });
+    expect(board.get('quota-noop')).toMatchObject({
+      state: 'running',
+      terminalRevision: 0,
+    });
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  test('site 1 chain exhaustion commits error through the gate and notifies once', async () => {
+    const h = setup({
+      taskID: 'quota-site-1',
+      chain: ['google/antigravity-gemini-3-flash'],
+    });
+    const terminalStates: string[] = [];
+    const outcomes: string[] = [];
+    h.board.addTerminalStateListener((taskID) => {
+      terminalStates.push(taskID);
+    });
+    h.coordinator.addTerminalOutcomeListener((record) => {
+      outcomes.push(record.taskID);
+    });
+    const result = await h.quota.handleTaskQuotaIncident(
+      incidentInput(
+        'quota-site-1',
+        h.coordinator,
+        h.fallbackManager,
+        h.promptAsync,
+      ),
+    );
+    expect(result).toMatchObject({ handled: true, status: 'exhausted' });
+    await flushGate();
+    expect(h.board.get('quota-site-1')).toMatchObject({
+      state: 'error',
+      terminalRevision: 1,
+      resultSummary: quotaText,
+    });
+    expect(terminalStates).toEqual(['quota-site-1']);
+    expect(outcomes).toEqual(['quota-site-1']);
+    expect(h.promptAsync).not.toHaveBeenCalled();
+  });
+
+  test('site 1 claim commits when quiescent while the transcript still ends at the claimed notice', async () => {
+    let runtime: 'busy' | 'quiescent' = 'busy';
+    const h = setup({
+      taskID: 'quota-site-1-busy',
+      chain: ['google/antigravity-gemini-3-flash'],
+      readRuntime: async (_run, readStartedAt) => ({
+        kind: runtime,
+        origin: 'test',
+        readStartedAt,
+      }),
+    });
+    const terminalStates: string[] = [];
+    h.board.addTerminalStateListener((taskID) => {
+      terminalStates.push(taskID);
+    });
+    await h.quota.handleTaskQuotaIncident(
+      incidentInput(
+        'quota-site-1-busy',
+        h.coordinator,
+        h.fallbackManager,
+        h.promptAsync,
+      ),
+    );
+    await flushGate();
+    expect(h.board.get('quota-site-1-busy')).toMatchObject({
+      state: 'running',
+      terminalRevision: 0,
+    });
+    expect(terminalStates).toEqual([]);
+
+    runtime = 'quiescent';
+    await h.gate.reconcile(h.run);
+    await flushGate();
+    expect(h.board.get('quota-site-1-busy')).toMatchObject({
+      state: 'error',
+      terminalRevision: 1,
+    });
+    expect(terminalStates).toEqual(['quota-site-1-busy']);
+  });
+
+  test('site 3 continuation launch failure commits error through the gate', async () => {
+    const h = setup({
+      taskID: 'quota-site-3',
+      chain: [
+        'google/antigravity-gemini-3-flash',
+        'google/antigravity-gemini-3.7-flash',
+      ],
+    });
+    const promptAsync = mock(async () => ({
+      error: { message: 'host rejected the continuation' },
+    }));
+    const terminalStates: string[] = [];
+    h.board.addTerminalStateListener((taskID) => {
+      terminalStates.push(taskID);
+    });
+    const result = await h.quota.handleTaskQuotaIncident({
+      ...incidentInput(
+        'quota-site-3',
+        h.coordinator,
+        h.fallbackManager,
+        promptAsync,
+      ),
+      client: { session: { promptAsync } },
+    });
+    await flushGate();
+    expect(result).toMatchObject({
+      handled: true,
+      status: 'transport_failed',
+    });
+    expect(h.board.get('quota-site-3')).toMatchObject({
+      state: 'error',
+      terminalRevision: 1,
+    });
+    expect(terminalStates).toEqual(['quota-site-3']);
+  });
+
+  test('site 2 lifecycle invalidation commits error once the runtime is quiescent', async () => {
+    const fallbackManager = {
+      markModelCooldown: () => {},
+      prepareNextModel: () => ({
+        model: 'google/antigravity-gemini-3.7-flash',
+        commit: () => false,
+      }),
+    } as unknown as ForegroundFallbackManager;
+    const h = setup({
+      taskID: 'quota-site-2',
+      chain: [],
+      fallbackManager,
+    });
+    const terminalStates: string[] = [];
+    h.board.addTerminalStateListener((taskID) => {
+      terminalStates.push(taskID);
+    });
+    const result = await h.quota.handleTaskQuotaIncident(
+      incidentInput(
+        'quota-site-2',
+        h.coordinator,
+        fallbackManager,
+        h.promptAsync,
+      ),
+    );
+    expect(result).toMatchObject({ handled: true, status: 'aborted' });
+    await flushGate();
+    expect(h.board.get('quota-site-2')).toMatchObject({
+      state: 'error',
+      terminalRevision: 1,
+      resultSummary:
+        'Continuation was accepted but its lifecycle commit was invalidated.',
+    });
+    expect(terminalStates).toEqual(['quota-site-2']);
+  });
+
+  test('site 2 lifecycle invalidation does not commit while the runtime is busy', async () => {
+    const fallbackManager = {
+      markModelCooldown: () => {},
+      prepareNextModel: () => ({
+        model: 'google/antigravity-gemini-3.7-flash',
+        commit: () => false,
+      }),
+    } as unknown as ForegroundFallbackManager;
+    const h = setup({
+      taskID: 'quota-site-2-busy',
+      chain: [],
+      fallbackManager,
+      readRuntime: async (_run, readStartedAt) => ({
+        kind: 'busy',
+        origin: 'test',
+        readStartedAt,
+      }),
+    });
+    const terminalStates: string[] = [];
+    h.board.addTerminalStateListener((taskID) => {
+      terminalStates.push(taskID);
+    });
+    await h.quota.handleTaskQuotaIncident(
+      incidentInput(
+        'quota-site-2-busy',
+        h.coordinator,
+        fallbackManager,
+        h.promptAsync,
+      ),
+    );
+    await flushGate();
+    expect(h.board.get('quota-site-2-busy')).toMatchObject({
+      state: 'running',
+      terminalRevision: 0,
+    });
+    expect(terminalStates).toEqual([]);
+  });
+
+  test('site 2 stale claim is superseded by a continuation trailing turn', async () => {
+    const fallbackManager = {
+      markModelCooldown: () => {},
+      prepareNextModel: () => ({
+        model: 'google/antigravity-gemini-3.7-flash',
+        commit: () => false,
+      }),
+    } as unknown as ForegroundFallbackManager;
+    let runtime: 'busy' | 'quiescent' = 'busy';
+    let transcript: unknown = quotaTranscript();
+    const h = setup({
+      taskID: 'quota-site-2-superseded',
+      chain: [],
+      fallbackManager,
+      transcript: () => transcript,
+      readRuntime: async (_run, readStartedAt) => ({
+        kind: runtime,
+        origin: 'test',
+        readStartedAt,
+      }),
+    });
+    await h.quota.handleTaskQuotaIncident(
+      incidentInput(
+        'quota-site-2-superseded',
+        h.coordinator,
+        fallbackManager,
+        h.promptAsync,
+      ),
+    );
+    await flushGate();
+    expect(h.board.get('quota-site-2-superseded')).toMatchObject({
+      state: 'running',
+    });
+
+    // The continuation produced a real answer: the transcript now ends at a
+    // NEWer assistant turn, so the claim about the quota notice is inert.
+    transcript = {
+      data: [
+        { info: { id: 'baseline', role: 'user' }, parts: [] },
+        {
+          info: {
+            id: 'asst-continuation',
+            role: 'assistant',
+            finish: 'stop',
+            time: { completed: 2 },
+          },
+          parts: [{ type: 'text', text: 'continuation answer' }],
+        },
+      ],
+    };
+    runtime = 'quiescent';
+    await h.gate.reconcile(h.run);
+    await flushGate();
+    expect(h.board.get('quota-site-2-superseded')).toMatchObject({
+      state: 'completed',
+      resultSummary: 'continuation answer',
+    });
   });
 });

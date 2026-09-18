@@ -6,8 +6,13 @@ import type {
 } from '../../utils/background-job-board';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
-import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
+import type {
+  BackgroundJobTerminalGate,
+  RunRef,
+  TerminalEvidenceDisposition,
+} from '../../utils/background-job-terminal-gate';
 import {
+  extractTrailingAssistantTurn,
   fetchChildTranscript,
   responseError,
   stringifyError,
@@ -16,6 +21,13 @@ import { isRecord } from '../../utils/guards';
 import { createInternalAgentTextPart } from '../../utils/internal-initiator';
 import { getClient } from '../../utils/opencode-client';
 import type { SessionSelection } from '../../utils/session-selection';
+import type { ForegroundFallbackManager } from '../foreground-fallback';
+import {
+  type AntigravityMessageEvidence,
+  isAntigravitySyntheticQuotaMessage,
+  isSyntheticQuotaContinuationActiveStatus,
+  type SyntheticQuotaCoordinator,
+} from '../foreground-fallback/synthetic-quota';
 
 const DEFAULT_NOTIFICATION_RETRIES = 3;
 const DEFAULT_RETRY_DELAY_MS = 1_000;
@@ -73,6 +85,15 @@ export interface RevivedRunTracker {
   baselineFor(taskID: string, generation: number): string | undefined;
   probe(taskID: string, generation: number): Promise<boolean>;
   onTerminal(record: BackgroundJobRecord): void;
+  /** Gate evidence hook (false-completion guard): inspect the raw child
+   * transcript for a synthetic-quota notice before the gate publishes a
+   * terminal state. A dispatched continuation holds publication; an
+   * exhausted/launch-failed incident overrides the derived verdict. */
+  handleTerminalEvidence(input: {
+    run: RunRef;
+    response: unknown;
+    fallbackManager?: ForegroundFallbackManager;
+  }): Promise<TerminalEvidenceDisposition>;
   /** Fallback observation handoff: prepare before the admission await
    * so the stop gate defers terminal publication until a delivery owner
    * exists. Admit converts the preparation into a tracked run
@@ -125,6 +146,15 @@ export function createRevivedRunTracker(options: {
    * Resolved on EVERY attempt (retries re-enter the send path). When
    * absent or unresolved, behavior falls back to `orchestrator`. */
   resolveSelection?: (sessionID: string) => Promise<SessionSelection>;
+  /** Quota coordination for the gate evidence hook. The coordinator owns the
+   *  terminal publication; the tracker only classifies the trailing turn. */
+  syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
+  /** Foreground fallback chain used to dispatch the quota continuation. A
+   *  getter because the manager is constructed after the tracker in
+   *  production wiring. */
+  fallbackManager?:
+    | ForegroundFallbackManager
+    | (() => ForegroundFallbackManager | undefined);
 }): RevivedRunTracker {
   const runs = new Map<string, RevivedRun>();
   // Monotonic observation identity across registrations (fence for the
@@ -135,6 +165,9 @@ export function createRevivedRunTracker(options: {
   const retryDelayMs =
     options.notificationRetryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
   let disposed = false;
+  // Assigned before createRevivedRunTracker returns; only read from the
+  // gate evidence hook, which runs after wiring.
+  let tracker!: RevivedRunTracker;
 
   const captureBaseline = async (
     taskID: string,
@@ -661,13 +694,73 @@ export function createRevivedRunTracker(options: {
     return promoteHandoffToOwner(taskID);
   }
 
-  return {
+  /** Restore the fork's quota-classification branch at the gate evidence
+   *  boundary. Upstream's reconcilers own terminal policy; the tracker only
+   *  supplies the quota incident disposition the gate cannot derive. */
+  const handleTerminalEvidence: RevivedRunTracker['handleTerminalEvidence'] =
+    async (input) => {
+      const run = runs.get(input.run.taskID);
+      if (run?.generation !== input.run.generation || disposed)
+        return { kind: 'proceed' };
+      const turn = extractTrailingAssistantTurn(input.response);
+      if (!turn) return { kind: 'proceed' };
+      const info = turn.info;
+      const evidence: AntigravityMessageEvidence = {
+        role: info.role,
+        providerID: info.providerID,
+        modelID: info.modelID,
+        finish: info.finish ?? info.finishReason,
+        error: info.error,
+        tokens: info.tokens,
+      };
+      if (!isAntigravitySyntheticQuotaMessage(evidence, turn.text))
+        return { kind: 'proceed' };
+      const failedMessageID = typeof info.id === 'string' ? info.id : undefined;
+      if (!failedMessageID || !options.syntheticQuotaCoordinator)
+        return { kind: 'proceed' };
+      const configuredFallback =
+        typeof options.fallbackManager === 'function'
+          ? options.fallbackManager()
+          : options.fallbackManager;
+      const outcome =
+        await options.syntheticQuotaCoordinator.handleTaskQuotaIncident({
+          taskID: run.taskID,
+          text: turn.text,
+          failedMessageID,
+          verifiedEvidence: {
+            model: `${String(info.providerID)}/${String(info.modelID)}`,
+            agent: typeof info.agent === 'string' ? info.agent : undefined,
+            failedMessageID,
+          },
+          client: getClient(options.input),
+          directory: options.input.directory,
+          backgroundJobBoard: options.backgroundJobBoard,
+          fallbackManager: input.fallbackManager ?? configuredFallback,
+          revivedRunTracker: tracker,
+          pendingParentSessionId: run.parentSessionID,
+          pendingLabel: run.description,
+          pendingAgent: typeof info.agent === 'string' ? info.agent : undefined,
+        });
+      if (disposed) return { kind: 'proceed' };
+      const current = runs.get(run.taskID);
+      // Re-registration for a continuation keeps the same generation; a
+      // superseded generation must not drive this observation.
+      if (current?.generation !== run.generation) return { kind: 'proceed' };
+      if (isSyntheticQuotaContinuationActiveStatus(outcome.status))
+        return { kind: 'hold' };
+      if (outcome.handled)
+        return { kind: 'override', state: 'error', resultSummary: turn.text };
+      return { kind: 'proceed' };
+    };
+
+  tracker = {
     captureBaseline,
     register,
     isTracked,
     baselineFor,
     probe,
     onTerminal,
+    handleTerminalEvidence,
     prepareObservation,
     admitObservation,
     rejectObservation,
@@ -686,6 +779,7 @@ export function createRevivedRunTracker(options: {
       dispose();
     },
   };
+  return tracker;
 }
 
 async function awaitNotificationTransport<T>(

@@ -257,6 +257,11 @@ export function createTaskSessionManagerHook(
       isObservationPending: (taskID, generation) =>
         options.revivedRunTracker?.isObservationPending(taskID, generation) ??
         false,
+      onTerminalEvidence: (input) =>
+        options.revivedRunTracker?.handleTerminalEvidence({
+          ...input,
+          fallbackManager: options.fallbackManager,
+        }) ?? { kind: 'proceed' },
     });
 
   const rememberDeletedSession = (sessionID: string): void => {
@@ -371,7 +376,8 @@ export function createTaskSessionManagerHook(
     });
   const taskContextTracker = createTaskContextTracker();
   const syntheticQuotaCoordinator =
-    options.syntheticQuotaCoordinator ?? createSyntheticQuotaCoordinator();
+    options.syntheticQuotaCoordinator ??
+    createSyntheticQuotaCoordinator({ terminalGate });
 
   const terminalJobsInjectedByParent = new Map<string, InjectedTerminalJobs>();
   const pendingInjectedTerminalJobsByParent = new Map<

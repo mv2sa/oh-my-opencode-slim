@@ -1125,3 +1125,159 @@ describe('foreground native terminal fast path (r2 hardening)', () => {
     });
   });
 });
+
+describe('gate-backed held terminal claims', () => {
+  const quiescent = async (
+    _run: unknown,
+    readStartedAt: number,
+  ): Promise<RuntimeObservation> => ({
+    kind: 'quiescent',
+    origin: 'test',
+    readStartedAt,
+  });
+
+  test('production board updateStatus is running-only and never publishes terminal', () => {
+    const board = new BackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: 'noop_child',
+      parentSessionID: 'parent',
+      agent: 'fixer',
+      background: true,
+      now: 0,
+    });
+    const listener = mock(() => {});
+    board.addTerminalStateListener(listener);
+    (board.updateStatus as unknown as (input: unknown) => unknown)({
+      taskID: run.taskID,
+      expectedGeneration: run.generation,
+      state: 'error',
+      resultSummary: 'forged quota error',
+    });
+    expect(board.get(run.taskID)).toMatchObject({
+      state: 'running',
+      terminalRevision: 0,
+    });
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  test('claimTerminal commits error on a quiescent board and notifies exactly once', async () => {
+    const h = harness({ readRuntime: quiescent });
+    const listener = mock(() => {});
+    h.board.addTerminalStateListener(listener);
+    const result = h.gate.claimTerminal(h.run, {
+      state: 'error',
+      resultSummary: 'quota claim',
+      reason: 'test',
+      observedMessageID: 'answer',
+    });
+    expect(result.kind).toBe('deferred');
+    expect(h.board.get(h.run.taskID)?.state).toBe('running');
+    for (
+      let i = 0;
+      i < 20 && h.board.get(h.run.taskID)?.state === 'running';
+      i++
+    )
+      await tick();
+    expect(h.board.get(h.run.taskID)).toMatchObject({
+      state: 'error',
+      terminalRevision: 1,
+      resultSummary: 'quota claim',
+    });
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  test('claim commits once quiescent while the transcript still ends at the claimed turn', async () => {
+    let kind: 'busy' | 'quiescent' = 'busy';
+    const h = harness({
+      readRuntime: async (_run, readStartedAt) => ({
+        kind,
+        origin: 'test',
+        readStartedAt,
+      }),
+    });
+    h.gate.claimTerminal(h.run, {
+      state: 'error',
+      resultSummary: 'retained claim',
+      reason: 'test',
+      observedMessageID: 'answer',
+    });
+    for (let i = 0; i < 5; i += 1) await tick();
+    expect(h.board.get(h.run.taskID)).toMatchObject({ state: 'running' });
+
+    kind = 'quiescent';
+    await h.gate.reconcile(h.run);
+    await tick();
+    expect(h.board.get(h.run.taskID)).toMatchObject({
+      state: 'error',
+      resultSummary: 'retained claim',
+    });
+  });
+
+  test('a newer trailing assistant turn supersedes a stale claim', async () => {
+    let kind: 'busy' | 'quiescent' = 'busy';
+    let response: unknown = answer('quota notice');
+    const h = harness({
+      readRuntime: async (_run, readStartedAt) => ({
+        kind,
+        origin: 'test',
+        readStartedAt,
+      }),
+      readTerminalEvidence: async () => response,
+    });
+    h.gate.claimTerminal(h.run, {
+      state: 'error',
+      resultSummary: 'quota notice',
+      reason: 'test',
+      observedMessageID: 'answer',
+    });
+    for (let i = 0; i < 5; i += 1) await tick();
+    expect(h.board.get(h.run.taskID)).toMatchObject({ state: 'running' });
+
+    // The continuation produced a real answer: the transcript now ends at a
+    // NEWer assistant turn, so the claim about the quota notice is inert.
+    response = {
+      data: [
+        { info: { id: 'baseline', role: 'user' }, parts: [] },
+        {
+          info: {
+            id: 'asst-continuation',
+            role: 'assistant',
+            finish: 'stop',
+            time: { completed: 2 },
+          },
+          parts: [{ type: 'text', text: 'continuation answer' }],
+        },
+      ],
+    };
+    kind = 'quiescent';
+    await h.gate.reconcile(h.run);
+    for (let i = 0; i < 5; i += 1) await tick();
+    expect(h.board.get(h.run.taskID)).toMatchObject({
+      state: 'completed',
+      resultSummary: 'continuation answer',
+    });
+  });
+
+  test('onTerminalEvidence override replaces the derived verdict and hold defers it', async () => {
+    const overridden = harness({
+      readRuntime: quiescent,
+      onTerminalEvidence: () => ({
+        kind: 'override',
+        state: 'error',
+        resultSummary: 'overridden verdict',
+      }),
+    });
+    await overridden.gate.reconcile(overridden.run);
+    expect(overridden.board.get(overridden.run.taskID)).toMatchObject({
+      state: 'error',
+      resultSummary: 'overridden verdict',
+    });
+
+    const held = harness({
+      readRuntime: quiescent,
+      onTerminalEvidence: () => ({ kind: 'hold' }),
+    });
+    await held.gate.reconcile(held.run);
+    expect(held.board.get(held.run.taskID)?.state).toBe('running');
+  });
+});

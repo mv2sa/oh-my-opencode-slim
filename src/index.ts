@@ -634,6 +634,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         revivedRunTracker?.revisionFor(taskID, generation),
       isObservationPending: (taskID, generation) =>
         revivedRunTracker?.isObservationPending(taskID, generation) ?? false,
+      onTerminalEvidence: (input) =>
+        revivedRunTracker?.handleTerminalEvidence({
+          ...input,
+          fallbackManager: foregroundFallback,
+        }) ?? { kind: 'proceed' },
       onRunning: (record) => {
         if (record.background)
           backgroundTaskConcurrency.restoreTask(
@@ -674,13 +679,17 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     });
     sessionLifecycle = new SessionLifecycle(log);
 
-    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator();
+    const syntheticQuotaCoordinator = createSyntheticQuotaCoordinator({
+      terminalGate,
+    });
     revivedRunTracker = createRevivedRunTracker({
       input: ctx,
       backgroundJobBoard: backgroundJobCoordinator,
       terminalGate,
       backgroundJobSupervisor,
       resolveSelection: lifecycleSelectionResolver,
+      syntheticQuotaCoordinator,
+      fallbackManager: () => foregroundFallback,
       onRegister: (taskID) => markRevivedRunPending(taskID),
       onSettled: (taskID) => markRevivedRunSettled(taskID),
       contextFilesForPrompt: (taskID) => getRevivedContextFiles(taskID),

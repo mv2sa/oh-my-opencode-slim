@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { BackgroundJobBoard as ProductionBackgroundJobBoard } from '../../utils/background-job-board';
 import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import {
   type BackgroundJobTerminalGate,
   createBackgroundJobTerminalGate,
 } from '../../utils/background-job-terminal-gate';
 import { SLIM_INTERNAL_INITIATOR_MARKER } from '../../utils/internal-initiator';
+import type { ForegroundFallbackManager } from '../foreground-fallback';
+import { createSyntheticQuotaCoordinator } from '../foreground-fallback/synthetic-quota';
 import { createRevivedRunTracker } from './revived-run-tracker';
 
 const gates: BackgroundJobTerminalGate[] = [];
@@ -1119,5 +1122,145 @@ describe('revived run tracker', () => {
 
     // Stale generations never resolve a revision.
     expect(harness.tracker.revisionFor('ses_child', gen + 1)).toBeUndefined();
+  });
+});
+
+describe('gate evidence hook (synthetic quota)', () => {
+  const quotaText1 =
+    'All 1 account(s) rate-limited for gemini-3-flash. Quota resets in 1h 50m. Add more accounts with `opencode auth login` or wait and retry.';
+  const quotaTranscript = () => ({
+    data: [
+      { info: { id: 'baseline-msg', role: 'user' }, parts: [] },
+      {
+        info: {
+          id: 'asst-quota',
+          role: 'assistant',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+          finish: 'stop',
+          tokens: { input: 0, output: 33 },
+          time: { completed: 2 },
+        },
+        parts: [{ type: 'text', text: quotaText1 }],
+      },
+    ],
+  });
+
+  const continuationManager = () =>
+    ({
+      markModelCooldown: () => {},
+      prepareNextModel: () => ({
+        model: 'anthropic/claude-opus-4-5',
+        commit: () => true,
+      }),
+    }) as unknown as ForegroundFallbackManager;
+
+  const exhaustedManager = () =>
+    ({
+      markModelCooldown: () => {},
+      prepareNextModel: () => undefined,
+    }) as unknown as ForegroundFallbackManager;
+
+  function createGateHarness(fallbackManager: ForegroundFallbackManager) {
+    const board = new ProductionBackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: 'ses_child',
+      parentSessionID: 'parent',
+      agent: 'oracle',
+      description: 'quota child',
+      background: true,
+    });
+    const promptAsync = mock(async () => ({}));
+    const messages = mock(async () => quotaTranscript());
+    const input = {
+      directory: '/test',
+      client: { session: { promptAsync, messages } },
+    } as never;
+    let tracker!: ReturnType<typeof createRevivedRunTracker>;
+    const gate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      readRuntime: async (_run, readStartedAt) => ({
+        kind: 'quiescent',
+        origin: 'test',
+        readStartedAt,
+      }),
+      readTerminalEvidence: async () => quotaTranscript(),
+      baselineFor: (taskID, generation) =>
+        tracker?.baselineFor(taskID, generation),
+      observationRevisionFor: (taskID, generation) =>
+        tracker?.revisionFor(taskID, generation),
+      isObservationPending: (taskID, generation) =>
+        tracker?.isObservationPending(taskID, generation) ?? false,
+      onTerminalEvidence: (evidenceInput) =>
+        tracker.handleTerminalEvidence({
+          ...evidenceInput,
+          fallbackManager,
+        }),
+      onTerminal: (record) => tracker.onTerminal(record),
+    });
+    gates.push(gate);
+    const coordinator = createSyntheticQuotaCoordinator({
+      terminalGate: gate,
+      callerWaitTimeoutMs: 100,
+      hardTransportTimeoutMs: 200,
+    });
+    tracker = createRevivedRunTracker({
+      input,
+      backgroundJobBoard: board,
+      terminalGate: gate,
+      syntheticQuotaCoordinator: coordinator,
+      fallbackManager,
+      notificationRetryDelayMs: 0,
+    });
+    tracker.register({
+      taskID: run.taskID,
+      generation: run.generation,
+      parentSessionID: 'parent',
+      baselineMessageID: 'baseline-msg',
+      description: 'quota child',
+    });
+    return { board, run, gate, tracker, promptAsync, messages, coordinator };
+  }
+
+  test('quota transcript with a next model holds publication and launches the continuation', async () => {
+    const h = createGateHarness(continuationManager());
+    await h.gate.reconcile(h.run);
+    await flushNotify();
+
+    expect(h.board.get('ses_child')).toMatchObject({ state: 'running' });
+    expect(h.promptAsync).toHaveBeenCalledTimes(1);
+    expect(h.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      path: { id: 'ses_child' },
+      body: {
+        model: { providerID: 'anthropic', modelID: 'claude-opus-4-5' },
+      },
+    });
+    // The next observation must use the failed message as its baseline.
+    expect(h.tracker.baselineFor('ses_child', h.run.generation)).toBe(
+      'asst-quota',
+    );
+  });
+
+  test('exhausted quota transcript publishes error and notifies the parent without a task_result', async () => {
+    const h = createGateHarness(exhaustedManager());
+    await h.gate.reconcile(h.run);
+    await flushNotify();
+
+    expect(h.board.get('ses_child')).toMatchObject({
+      state: 'error',
+      resultSummary: quotaText1,
+    });
+    const parentCall = h.promptAsync.mock.calls.find(
+      ([args]) => (args as { path?: { id?: string } })?.path?.id === 'parent',
+    );
+    expect(parentCall).toBeDefined();
+    const text = (
+      parentCall?.[0] as { body?: { parts?: Array<{ text?: string }> } }
+    )?.body?.parts?.[0]?.text;
+    expect(text).toContain('state="error"');
+    expect(text).toContain('<task_error>');
+    expect(text).not.toContain('<task_result>');
+    // The quota text rides the error payload, never a completed result.
+    expect(text).toContain(quotaText1);
   });
 });

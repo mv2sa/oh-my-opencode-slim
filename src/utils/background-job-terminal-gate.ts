@@ -7,8 +7,10 @@ import type {
 import type { BackgroundJobStore } from './background-job-store';
 import {
   classifyTerminalEvidence,
+  extractTrailingAssistantTurn,
   fetchChildTranscript,
   responseError,
+  type TerminalEvidenceVerdict,
 } from './child-transcript';
 import { isRecord } from './guards';
 import { getClient } from './opencode-client';
@@ -78,10 +80,36 @@ export type GateResult =
   | { kind: 'deferred'; record: BackgroundJobRecord }
   | { kind: 'committed'; record: BackgroundJobRecord }
   | { kind: 'stale' };
+/** Terminal evidence the caller already holds; the gate must not re-derive it
+ *  from the transcript (e.g. a verified synthetic-quota notice). */
+export type HeldTerminalClaim = Readonly<{
+  state: 'error' | 'stopped';
+  resultSummary: string;
+  /** Provenance for diagnostics only; never evidence. */
+  reason: string;
+  /** The assistant message this claim was derived from (the quota notice).
+   *  A newer trailing assistant turn makes the claim stale. */
+  observedMessageID: string;
+}>;
+export type TerminalEvidenceDisposition =
+  | { kind: 'proceed' }
+  | { kind: 'hold' }
+  | { kind: 'override'; state: 'error' | 'stopped'; resultSummary: string };
 export interface BackgroundJobTerminalGate {
   capture(run: RunRef): ObservationToken | undefined;
   observe(token: ObservationToken, runtime: RuntimeObservation): GateResult;
   reconcile(run: RunRef, signal?: TerminalSignal): Promise<GateResult>;
+  /**
+   * Register a terminal claim for `run`. Publication still requires the
+   * gate's own runtime confirmation (quiescent/deleted) and honors
+   * isObservationPending — identical to commit(). The claim is retained
+   * across deferred and busy observations and honored by every later
+   * reconcile until it commits, the record leaves running, or the
+   * observation object is recreated (generation change). Registration is
+   * synchronous (no nested-reconcile deadlock); the runtime read and commit
+   * are scheduled.
+   */
+  claimTerminal(run: RunRef, claim: HeldTerminalClaim): GateResult;
   dispose(): void;
 }
 
@@ -165,6 +193,7 @@ interface Observation {
   idleCandidate?: RuntimeObservation;
   quiescentSince?: number;
   candidate?: { signal: TerminalSignal; token: ObservationToken };
+  claim?: HeldTerminalClaim;
   retries: number;
   timer?: ReturnType<typeof setTimeout>;
 }
@@ -268,6 +297,15 @@ export function createBackgroundJobTerminalGate(options: {
   isObservationPending?: (taskID: string, generation: number) => boolean;
   onRunning?: (record: BackgroundJobRecord) => void;
   onTerminal?: (record: BackgroundJobRecord) => void;
+  /** Terminal content hook: the caller may hold quota/continuation evidence
+   *  the transcript classifier cannot see. Called once per terminal-verdict
+   *  inspection, before publication; `hold` defers, `override` replaces the
+   *  derived verdict, `proceed` publishes it. A registered claim always wins. */
+  onTerminalEvidence?: (input: {
+    run: RunRef;
+    response: unknown;
+    evidence: TerminalEvidenceVerdict;
+  }) => TerminalEvidenceDisposition | Promise<TerminalEvidenceDisposition>;
   graceMs?: number;
   readTimeoutMs?: number;
   maxEvidenceRetries?: number;
@@ -436,6 +474,7 @@ export function createBackgroundJobTerminalGate(options: {
     if (value.timer) clearTimeout(value.timer);
     value.timer = undefined;
     value.candidate = undefined;
+    value.claim = undefined;
     options.onTerminal?.(record);
     return { kind: 'committed', record };
   }
@@ -830,8 +869,34 @@ export function createBackgroundJobTerminalGate(options: {
           });
       }
     }
-    if (evidence.verdict === 'completed' || evidence.verdict === 'error')
+    if (evidence.verdict === 'completed' || evidence.verdict === 'error') {
+      const disposition = options.onTerminalEvidence
+        ? await options.onTerminalEvidence({ run, response, evidence })
+        : ({ kind: 'proceed' } as const);
+      // The hook may have registered a claim (or re-registered a baseline)
+      // to the same observation; re-read it before publishing.
+      const claimValue = observation(run);
+      if (!claimValue) return { kind: 'stale' };
+      if (disposition.kind === 'hold')
+        return retry(
+          run,
+          'Synthetic quota continuation pending; task termination is unconfirmed.',
+        );
+      // A held claim is evidence about ONE turn: honor it only while the
+      // transcript read still terminates at the assistant message it was
+      // derived from. A newer trailing turn supersedes it (no clearing).
+      const claim = claimValue.claim;
+      const trailed = extractTrailingAssistantTurn(response);
+      if (
+        claim &&
+        typeof trailed?.info.id === 'string' &&
+        trailed.info.id === claim.observedMessageID
+      )
+        return commit(token, claim.state, claim.resultSummary);
+      if (disposition.kind === 'override')
+        return commit(token, disposition.state, disposition.resultSummary);
       return commit(token, evidence.verdict, evidence.text);
+    }
     // Native return is attributable only when no transcript exists. Foreground
     // still publishes when the transcript is pending; empty result uses a
     // placeholder instead of the original whitespace.
@@ -898,6 +963,23 @@ export function createBackgroundJobTerminalGate(options: {
     );
   }
 
+  function claimTerminal(run: RunRef, claim: HeldTerminalClaim): GateResult {
+    const value = observation(run);
+    const record = board.get(run.taskID);
+    if (!value || !record || record.generation !== run.generation)
+      return { kind: 'stale' };
+    if (record.state !== 'running') return { kind: 'committed', record };
+    value.claim = claim;
+    const token = capture(run);
+    if (!token) return { kind: 'stale' };
+    // Registration is synchronous: an in-flight inspection for this same
+    // observation already owns the runtime read, so only a fresh identity
+    // schedules its own. The commit is what must wait, never the caller.
+    const key = JSON.stringify([run.taskID, observationIdentity(token)]);
+    if (!inFlight.has(key)) queueMicrotask(() => void reconcile(run));
+    return { kind: 'deferred', record };
+  }
+
   function reconcile(
     run: RunRef,
     signal: TerminalSignal = { kind: 'inspect' },
@@ -937,6 +1019,7 @@ export function createBackgroundJobTerminalGate(options: {
     capture,
     observe,
     reconcile,
+    claimTerminal,
     dispose() {
       disposed = true;
       authorizedByGate.delete(gate);

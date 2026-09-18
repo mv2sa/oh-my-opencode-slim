@@ -1,4 +1,5 @@
 import type { BackgroundJobStore } from '../../utils/background-job-store';
+import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { createInternalAgentTextPart } from '../../utils/internal-initiator';
 import { parseModelReference } from '../../utils/session';
 import type { RevivedRunTracker } from '../task-session-manager/revived-run-tracker';
@@ -299,6 +300,9 @@ export function isSyntheticQuotaContinuationActiveStatus(
 export interface SyntheticQuotaCoordinatorOptions {
   callerWaitTimeoutMs?: number;
   hardTransportTimeoutMs?: number;
+  /** Gate-bound publication: quota terminals are committed only through the
+   *  gate's runtime confirmation, never a raw running-only board write. */
+  terminalGate?: BackgroundJobTerminalGate;
 }
 
 export interface SyntheticQuotaCoordinator {
@@ -356,6 +360,7 @@ export function createSyntheticQuotaCoordinator(
   const defaultHardTransportTimeoutMs =
     options?.hardTransportTimeoutMs ??
     DEFAULT_CONTINUATION_TRANSPORT_TIMEOUT_MS;
+  const terminalGate = options?.terminalGate;
 
   // taskID:generation:failedMessageID -> reservation state
   const incidentReservations = new Map<string, IncidentReservation>();
@@ -509,17 +514,22 @@ export function createSyntheticQuotaCoordinator(
       });
 
       if (!next) {
-        // Chain exhausted -> release lease and update status
+        // Chain exhausted -> release lease and publish a gate-backed terminal.
+        // The board's updateStatus is running-only now; the claim is the only
+        // path that leaves `running` and notifies terminal listeners.
         releaseReservationLease(reservation);
         reservation.status = 'exhausted';
         reservation.model = failedModel;
-        (input.backgroundJobBoard as any).updateStatus({
-          taskID: input.taskID,
-          expectedGeneration: generation,
-          state: 'error',
-          resultSummary:
-            input.text || 'Quota exhausted; fallback chain exhausted.',
-        });
+        terminalGate?.claimTerminal(
+          { taskID: input.taskID, generation },
+          {
+            state: 'error',
+            resultSummary:
+              input.text || 'Quota exhausted; fallback chain exhausted.',
+            reason: 'synthetic-quota-chain-exhausted',
+            observedMessageID: failedMessageID,
+          },
+        );
         return { handled: true, status: 'exhausted', failedMessageID };
       }
 
@@ -659,13 +669,20 @@ export function createSyntheticQuotaCoordinator(
               !latest.cancellationRequested &&
               latest.deadlineExceededAt === undefined
             ) {
-              (input.backgroundJobBoard as any).updateStatus({
-                taskID: input.taskID,
-                expectedGeneration: generation,
-                state: 'error',
-                resultSummary:
-                  'Continuation was accepted but its lifecycle commit was invalidated.',
-              });
+              // Transport was accepted but the lifecycle commit was
+              // invalidated: publish a retained gate claim. Publication
+              // still requires a quiescent runtime, so a live continuation
+              // that keeps the session busy cannot be overwritten by it.
+              terminalGate?.claimTerminal(
+                { taskID: input.taskID, generation },
+                {
+                  state: 'error',
+                  resultSummary:
+                    'Continuation was accepted but its lifecycle commit was invalidated.',
+                  reason: 'synthetic-quota-lifecycle-invalidated',
+                  observedMessageID: failedMessageID,
+                },
+              );
             }
           }
         } catch (err) {
@@ -694,12 +711,15 @@ export function createSyntheticQuotaCoordinator(
             current.deadlineExceededAt === undefined;
 
           if (isValid) {
-            (input.backgroundJobBoard as any).updateStatus({
-              taskID: input.taskID,
-              expectedGeneration: generation,
-              state: 'error',
-              resultSummary: `Continuation launch failed: ${errorText(err)}`,
-            });
+            terminalGate?.claimTerminal(
+              { taskID: input.taskID, generation },
+              {
+                state: 'error',
+                resultSummary: `Continuation launch failed: ${errorText(err)}`,
+                reason: 'synthetic-quota-launch-failed',
+                observedMessageID: failedMessageID,
+              },
+            );
           }
         }
       })();

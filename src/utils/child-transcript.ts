@@ -335,3 +335,39 @@ export function classifyAssistantTurnEvidence(
     .trim();
   return text.length > 0 ? { kind: 'ready', text } : { kind: 'textless' };
 }
+
+/** Trailing assistant turn of a v1-style `{data:[{info,parts}]}` transcript.
+ *  Mirrors classifyTerminalEvidence's trailing walk (skip structural system
+ *  tails) and returns the raw info the quota classifier needs. Shared by the
+ *  quota evidence hook and the gate's claim-supersession check so both agree
+ *  on which turn is terminal. */
+export function extractTrailingAssistantTurn(
+  response: unknown,
+): { info: Record<string, unknown>; text: string } | undefined {
+  if (!isRecord(response) || !Array.isArray(response.data)) return undefined;
+  const data = response.data;
+  let target = data.length - 1;
+  while (target >= 0) {
+    const entry = data[target];
+    const role =
+      isRecord(entry) && isRecord(entry.info) ? entry.info.role : undefined;
+    if (role !== 'system') break;
+    target -= 1;
+  }
+  const entry = data[target];
+  if (!isRecord(entry) || !isRecord(entry.info)) return undefined;
+  if (entry.info.role !== 'assistant') return undefined;
+  const text = (Array.isArray(entry.parts) ? entry.parts : [])
+    .filter(
+      (part) =>
+        isRecord(part) &&
+        part.type === 'text' &&
+        typeof part.text === 'string' &&
+        part.text.length > 0,
+    )
+    .map((part) => (part as { text: string }).text)
+    .join('\n\n')
+    .trim();
+  if (text.length === 0) return undefined;
+  return { info: entry.info, text };
+}
