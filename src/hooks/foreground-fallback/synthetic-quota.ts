@@ -1,5 +1,6 @@
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
+import { extractTrailingAssistantTurn } from '../../utils/child-transcript';
 import { createInternalAgentTextPart } from '../../utils/internal-initiator';
 import { parseModelReference } from '../../utils/session';
 import type { RevivedRunTracker } from '../task-session-manager/revived-run-tracker';
@@ -150,10 +151,13 @@ export async function verifyChildAntigravityEvidence(
         ? (response as { data: unknown[] }).data
         : [];
     if (data.length === 0) return undefined;
-    const last = data.at(-1);
-    if (!last || typeof last !== 'object') return undefined;
-    const info = (last as { info?: Record<string, unknown> }).info;
-    if (!info || typeof info !== 'object') return undefined;
+    // Walk past trailing structural/system items to the trailing ASSISTANT
+    // turn (shared with the revived-run tracker and the terminal gate). The
+    // quota notice is the assistant turn that failed; a trailing system item
+    // must not hide it and let the caller publish a false completion.
+    const turn = extractTrailingAssistantTurn(response);
+    if (!turn) return undefined;
+    const info = turn.info;
     const failedMessageID =
       typeof info.id === 'string' && info.id.trim() !== ''
         ? info.id.trim()
