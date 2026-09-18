@@ -1390,6 +1390,43 @@ describe('OutcomeStore protocol and integrity', () => {
     );
   });
 
+  test('bounds oversized user-decision fields when persisting the decision receipt', () => {
+    const root = 'root_long_decision_fields';
+    const store = new OutcomeStore({
+      storeDirectory: directory,
+      serverEpoch: 'epoch_long_decision',
+      randomId: () => root,
+      clock: () => 100,
+    });
+    const created = store.init(root, { contract: contract() });
+    expectSuccess(created);
+    openCheckpoint(store, root, 1, 'token', 'kickoff');
+    const current = store.read(root);
+    expectSuccess(current);
+    const review = reviewFor(current.data, 'USER_DECISION_REQUIRED');
+    // Fields deliberately exceed the durable schema bounds
+    // (decisionNeeded/impact: Text 512, options: ShortText 256).
+    review.userDecision = {
+      decisionNeeded: 'd'.repeat(900),
+      options: ['o'.repeat(400), 'p'.repeat(400)],
+      blocking: true,
+      impact: 'i'.repeat(900),
+    };
+    const reviewed = completeReview(
+      store,
+      root,
+      current.revision,
+      'token',
+      'USER_DECISION_REQUIRED',
+      { review },
+    );
+    const decision = reviewed.data.receipts.decisions.at(-1);
+    expect(decision?.decisionNeeded).toHaveLength(512);
+    expect(decision?.impact).toHaveLength(512);
+    expect(decision?.options[0]).toHaveLength(256);
+    expect(reviewed.data.waitCondition?.reason).toHaveLength(512);
+  });
+
   test('finalizes only satisfied contract with completed kickoff and matching final attestations', () => {
     const candidate = hash('candidate');
     const store = new OutcomeStore({

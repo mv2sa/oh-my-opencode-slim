@@ -4341,15 +4341,21 @@ function recordParsedReview(
   if (review.verdict === 'USER_DECISION_REQUIRED') {
     const decisionId = `dec_${summary.reviewId}`;
     if (review.userDecision) {
+      // Manager-supplied fields can exceed the durable schema bounds
+      // (decisionNeeded/impact: Text 512, options: ShortText 256, max 16).
+      // Bound them here so one oversized value cannot fail the whole record
+      // parse, mirroring the review-summary bound above.
       const decisionReceipt: OutcomeDecisionReceipt = {
         id: decisionId,
-        decisionNeeded: review.userDecision.decisionNeeded,
-        options: review.userDecision.options,
+        decisionNeeded: boundedText(review.userDecision.decisionNeeded, 512),
+        options: review.userDecision.options
+          .slice(0, 16)
+          .map((option) => boundedText(option, 256)),
         blocking: review.userDecision.blocking,
         createdAt: evaluatedAt,
         createdRevision: persistedRevision,
         ...(review.userDecision.impact
-          ? { impact: review.userDecision.impact }
+          ? { impact: boundedText(review.userDecision.impact, 512) }
           : {}),
       };
       record.receipts.decisions.push(decisionReceipt);
@@ -4357,7 +4363,9 @@ function recordParsedReview(
     record.waitCondition = {
       kind: 'user_decision',
       referenceId: decisionId,
-      reason: review.userDecision?.decisionNeeded ?? review.summary,
+      reason: review.userDecision
+        ? boundedText(review.userDecision.decisionNeeded, 512)
+        : boundedReviewReason,
       createdAt: evaluatedAt,
       createdRevision: persistedRevision,
     };
