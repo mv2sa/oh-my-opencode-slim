@@ -43,6 +43,39 @@ after every active session for that agent becomes idle or is deleted.
 
 ---
 
+## Persistent Model Cooldowns
+
+When a provider reports a quota or rate-limit failure, oh-my-opencode-slim
+records a durable cooldown for that model and does not select it again until the
+reported reset time (capped at 5 hours). The registry is a state file, not part
+of the plugin's JSON/JSONC config:
+
+| Path | Purpose |
+|------|---------|
+| `${XDG_CONFIG_HOME:-~/.config}/opencode/model-cooldowns.json` | Durable per-model cooldown entries |
+| `${XDG_CONFIG_HOME:-~/.config}/opencode/model-cooldowns.json.lock/` | Write lock held while the registry is updated |
+
+Two environment variables control it:
+
+| Variable | Effect |
+|----------|--------|
+| `OMOS_COOLDOWN_FILE` | Use a different registry path |
+| `OMOS_COOLDOWN_DISABLED=1` | Ignore the registry for that process (no reads, no writes) |
+
+The registry is safe to delete: entries are pruned by expiry on read, so ordinary
+quota cooldowns clear themselves. To recover from a stuck or corrupt registry:
+
+1. Stop OpenCode.
+2. Delete `model-cooldowns.json`, and also the `model-cooldowns.json.lock/`
+   directory if it exists. A process that died while holding the lock leaves it
+   behind, and every later write then fails closed until it is removed.
+3. Start OpenCode again.
+
+Alternatively, launch with `OMOS_COOLDOWN_DISABLED=1 opencode` to ignore the
+registry for a single run, or point `OMOS_COOLDOWN_FILE` at a different path.
+
+---
+
 ## Prompt Overriding
 
 Customize agent prompts without modifying source code. Create markdown files in `~/.config/opencode/oh-my-opencode-slim/`:

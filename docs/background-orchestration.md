@@ -767,7 +767,7 @@ When Antigravity auth returns quota exhaustion via HTTP 200/STOP with 0 input to
 the plugin identifies the failure via a positive gate (model `google/antigravity-*`,
 input tokens exactly 0, finish `stop`, no assistant error, and exact anchored template match).
 Rather than establishing the quota text as canonical task completion, the plugin:
-- marks a durable cooldown for the failed model matching the parsed reset interval (capped at 5 hours),
+- marks a durable cooldown for the failed model matching the parsed reset interval (capped at 5 hours; see [Persistent Model Cooldowns](configuration.md#persistent-model-cooldowns) for the registry path and recovery procedure),
 - rewrites false completion task outputs/injected completions to the byte-stable running placeholder,
 - continues execution on the affected agent's configured model ladder via non-aborting continuation prompts,
 - fences continuation transport with a bounded caller wait and mutual-exclusion message/control lease so slow transport does not block callers while preventing premature error classification or duplicate dispatches,
