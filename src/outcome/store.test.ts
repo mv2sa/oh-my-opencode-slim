@@ -1367,7 +1367,9 @@ describe('OutcomeStore protocol and integrity', () => {
     const current = store.read(root);
     expectSuccess(current);
     const review = reviewFor(current.data, 'CORRECT_DRIFT');
-    review.summary = 'x'.repeat(1024);
+    // 2039 reproduces the real Manager review length that overflowed the
+    // persisted reviewSummaries schema (max 1024) during a final checkpoint.
+    review.summary = 'x'.repeat(2039);
     const reviewed = completeReview(
       store,
       root,
@@ -1377,6 +1379,9 @@ describe('OutcomeStore protocol and integrity', () => {
       { review },
     );
     expect(reviewed.data.reviewSummaries.at(-1)?.summary).toHaveLength(1024);
+    expect(
+      reviewed.data.reviewSummaries.at(-1)?.summary.endsWith('...'),
+    ).toBe(true);
     expect(reviewed.data.kickoffGate.failureReason).toHaveLength(512);
     expect(reviewed.data.kickoffGate.failureReason?.endsWith('...')).toBe(true);
     expect(reviewed.data.actionsRequired.at(-1)?.reason).toHaveLength(512);
