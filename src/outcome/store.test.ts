@@ -1379,9 +1379,9 @@ describe('OutcomeStore protocol and integrity', () => {
       { review },
     );
     expect(reviewed.data.reviewSummaries.at(-1)?.summary).toHaveLength(1024);
-    expect(
-      reviewed.data.reviewSummaries.at(-1)?.summary.endsWith('...'),
-    ).toBe(true);
+    expect(reviewed.data.reviewSummaries.at(-1)?.summary.endsWith('...')).toBe(
+      true,
+    );
     expect(reviewed.data.kickoffGate.failureReason).toHaveLength(512);
     expect(reviewed.data.kickoffGate.failureReason?.endsWith('...')).toBe(true);
     expect(reviewed.data.actionsRequired.at(-1)?.reason).toHaveLength(512);
