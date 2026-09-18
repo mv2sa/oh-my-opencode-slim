@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'bun:test';
-import { BackgroundJobBoard } from '../utils/background-job-board';
+import { BackgroundJobBoard } from '../utils/background-job-fixture';
 import { createTaskMessageTool } from './task-message';
 
 let client: Record<string, any>;

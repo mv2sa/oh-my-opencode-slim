@@ -10,16 +10,25 @@ import {
   deriveTaskSessionLabel,
   getBackgroundJobLifecycleLedger,
   isInternalInitiatorPart,
+  log,
   parseTaskIdFromTaskOutput,
   parseTaskStateFromOutput,
   recordBackgroundJobSuppression,
 } from '../../utils';
+import {
+  type BackgroundJobTerminalGate,
+  createBackgroundJobTerminalGate,
+  readSessionInfoForObservation,
+} from '../../utils/background-job-terminal-gate';
+import { fetchChildTranscript } from '../../utils/child-transcript';
 import { isRecord as isObjectRecord } from '../../utils/guards';
+import { getClient } from '../../utils/opencode-client';
 import type { ForegroundFallbackManager } from '../foreground-fallback';
 import {
   createSyntheticQuotaCoordinator,
   type SyntheticQuotaCoordinator,
 } from '../foreground-fallback/synthetic-quota';
+import { isGenuineOperatorMessage } from '../orchestrator-wake/index';
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
@@ -51,9 +60,8 @@ import {
 export { BACKGROUND_JOB_BOARD_METADATA_KEY } from './board-injection';
 
 /**
- * Delay before recording an idle observation on a child job. The observation
- * remains provisional; terminal task output is the only path that establishes
- * completed/error/cancelled state.
+ * Delay for the parent's acknowledgement of already confirmed publications.
+ * Child evidence retries belong exclusively to the terminal gate.
  */
 const IDLE_RECONCILE_DELAY_MS = 2_000;
 
@@ -70,8 +78,8 @@ function rehydrateHistoricalRunningTasks(
     agentType: string,
     parentSessionID?: string,
   ) => string | undefined,
-): number {
-  let rehydrated = 0;
+): string[] {
+  const rehydrated: string[] = [];
   const managedOrchestratorSessionIDs = new Set<string>();
 
   for (const message of messages) {
@@ -159,7 +167,7 @@ function rehydrateHistoricalRunningTasks(
         taskID,
         getModelForAgent?.(agent, parentSessionID),
       );
-      rehydrated += 1;
+      rehydrated.push(taskID);
     }
   }
 
@@ -175,6 +183,7 @@ export function createTaskSessionManagerHook(
     readContextMinLines?: number;
     readContextMaxFiles?: number;
     backgroundJobBoard?: BackgroundJobStore;
+    terminalGate?: BackgroundJobTerminalGate;
     backgroundJobSupervisor?: BackgroundJobSupervisor;
     backgroundTaskConcurrency?: BackgroundTaskConcurrency;
     /** Shared by plugin generations for one admission runtime. */
@@ -183,6 +192,12 @@ export function createTaskSessionManagerHook(
       agentType: string,
       parentSessionID?: string,
     ) => string | undefined;
+    /** Current "provider/model" for a session. Feeds same-provider
+     *  background conversion. */
+    getSessionModel?: (sessionID: string) => string | undefined;
+    /** Opt-in provider → "foreground" map for same-provider background
+     *  conversion. */
+    sameProviderPolicy?: Record<string, 'foreground'>;
     shouldManageSession: (sessionID: string) => boolean;
     /** Register a session as orchestrator when the transform hook detects
      *  an orchestrator message but the session isn't in the agent map yet. */
@@ -220,6 +235,30 @@ export function createTaskSessionManagerHook(
   const rehydrateState = getBackgroundJobLifecycleLedger(backgroundJobBoard);
   const rehydrateTombstones = rehydrateState.tombstones;
 
+  // Transcript-backed stop gate (false-stop incident): shared by the
+  // quiescent stop-confirmation timer and the periodic runtime-status
+  // reconciler so neither can publish `stopped` while the child's
+  // transcript already holds the terminal result. Unknown reads never
+  // terminate into stopped; the #1157 guarantee lives on a valid
+  // transcript that provably holds no result for this run.
+  const terminalGate =
+    options.terminalGate ??
+    createBackgroundJobTerminalGate({
+      backgroundJobBoard,
+      input: _ctx,
+      readTerminalEvidence: async (taskID) =>
+        fetchChildTranscript(getClient(_ctx), taskID, _ctx.directory).catch(
+          () => undefined,
+        ),
+      baselineFor: (taskID, generation) =>
+        options.revivedRunTracker?.baselineFor(taskID, generation),
+      observationRevisionFor: (taskID, generation) =>
+        options.revivedRunTracker?.revisionFor(taskID, generation),
+      isObservationPending: (taskID, generation) =>
+        options.revivedRunTracker?.isObservationPending(taskID, generation) ??
+        false,
+    });
+
   const rememberDeletedSession = (sessionID: string): void => {
     const remember = (taskID: string): void => {
       recordBackgroundJobSuppression(backgroundJobBoard, taskID);
@@ -231,6 +270,98 @@ export function createTaskSessionManagerHook(
     for (const job of backgroundJobBoard.list(sessionID)) {
       remember(job.taskID);
     }
+  };
+
+  /**
+   * Existence probe for a task registered by rehydrate: persisted running
+   * tool parts carry no host-side liveness, so a session deleted while the
+   * plugin was down would otherwise resurrect as a forever-running ghost
+   * on the next transform. Fire-and-forget from the transform hook; never
+   * awaited there. Classification is strictly by the host's typed `_tag`
+   * property (never instanceof — the SDK error class identity is not
+   * stable across host builds — and never message matching).
+   *
+   * wait()-discipline: never `await ctx.session.wait` (or any host wait
+   * API) inside chat.transform — a busy child would hang the transform
+   * for its entire run. This probe uses session.get only. If a wait ever
+   * becomes necessary outside transforms, wrap it in Promise.race with a
+   * timeout and attach a no-op `.catch` to the abandoned promise (a later
+   * NotFoundError rejection must not surface as unhandled).
+   */
+  const probeRehydratedTaskSession = (taskID: string): void => {
+    void (async () => {
+      const client = getClient(_ctx);
+      // Same presence gate as readSessionOutcome: capability is probed,
+      // not assumed, and deliberately NOT gated on hostFlavor. The probe
+      // is v2-effective: the dotted `_tag === 'Session.NotFoundError'`
+      // classification only crosses the v2 plugin boundary (the host
+      // passes the raw core effect in-process). The v1 SDK wraps 4xx
+      // responses as plain `Error` with a `.cause` (or returns an
+      // `{error}` tuple when `throwOnError: false`), so on v1 the probe
+      // runs but harmlessly never tombstones — transient-error fail-open
+      // swallows the wrapped rejection. Absent method → skip silently.
+      if (typeof client.session?.get !== 'function') return;
+      // Freshness anchor: the generation of the record rehydrate just
+      // registered (captured synchronously, before the async get). A
+      // legitimate same-ID relaunch while the get is in flight takes a
+      // NEW generation and clears the tombstone — a stale NotFound must
+      // not tombstone+drop the live relaunched record.
+      const generationAtProbeStart = backgroundJobBoard.get(taskID)?.generation;
+      if (generationAtProbeStart === undefined) return;
+      const token = terminalGate.capture({
+        taskID,
+        generation: generationAtProbeStart,
+      });
+      if (!token) return;
+      try {
+        await readSessionInfoForObservation(_ctx, token);
+        await terminalGate.reconcile({
+          taskID,
+          generation: generationAtProbeStart,
+        });
+        return;
+      } catch (err) {
+        if ((err as { _tag?: string })?._tag === 'Session.NotFoundError') {
+          // Freshness guard: only clean up when the board still holds the
+          // generation the probe started against. A record replaced by a
+          // same-ID relaunch (or already dropped) is not ours to delete.
+          const current = backgroundJobBoard.get(taskID);
+          if (current?.generation !== generationAtProbeStart) {
+            log(
+              '[task-session-manager] skipped stale NotFound cleanup after same-ID relaunch',
+              {
+                taskID,
+                generationAtProbeStart,
+                currentGeneration: current?.generation,
+              },
+            );
+            return;
+          }
+          // The session no longer exists on the host. The four probe
+          // cleanup actions run as one synchronous block — supervisor
+          // FIRST: its onSessionDeleted needs the record to still exist
+          // so deadline-exceeded runs finalize their wall-clock timeout
+          // (same ordering as the event-router/coordinator deletion
+          // paths). All four are idempotent but all are required — a
+          // missing releaseTask would leak an admission slot forever.
+          // The canonical full cleanup (input waits, idle tokens,
+          // pending-call tracker, clearParent, task-context tracker,
+          // snapshots) runs via the session.deleted event path.
+          options.backgroundJobSupervisor?.onSessionDeleted(taskID);
+          recordBackgroundJobSuppression(backgroundJobBoard, taskID);
+          backgroundJobBoard.drop(taskID);
+          options.backgroundTaskConcurrency?.releaseTask(taskID);
+          log(
+            '[task-session-manager] rehydrated task no longer exists on host; tombstoned',
+            { taskID },
+          );
+          return;
+        }
+        // Transient/unknown errors fail open: the job stays registered and
+        // the normal reconciliation paths keep their chance. Swallowed —
+        // the fire-and-forget probe must never reject unhandled.
+      }
+    })();
   };
 
   const pendingCallTracker =
@@ -341,17 +472,9 @@ export function createTaskSessionManagerHook(
   let hasInputWait: (sessionID: string) => boolean = () => false;
 
   const idleReconciler = createIdleReconciler({
-    backgroundJobBoard,
+    terminalGate,
     reconcileInjectedTerminalJobs: (parentSessionID: string) =>
       reconcileInjectedTerminalJobs(injectionState, parentSessionID),
-    // Fallback could not recover a deferred 401/410; drop the deferred
-    // error and its injected-terminal tracking so the board shows the
-    // failure and follow-up reconciliation keeps consistent state.
-    onErrorTerminalize: (sessionID: string) => {
-      deferredInlineErrors.delete(sessionID);
-      terminalJobsInjectedByParent.delete(sessionID);
-      pendingInjectedTerminalJobsByParent.delete(sessionID);
-    },
     idleReconcileDelayMs:
       options.idleReconcileDelayMs ?? IDLE_RECONCILE_DELAY_MS,
     stopConfirmationGraceMs: options.stopConfirmationMs,
@@ -360,23 +483,12 @@ export function createTaskSessionManagerHook(
     hasInputWait: (s) => hasInputWait(s),
     getIdleSessionToken: (s) => getIdleSessionToken(s),
     isCurrentIdleSessionToken: (s, t) => isCurrentIdleSessionToken(s, t),
-    taskContextTracker,
-    revivedRunTracker: options.revivedRunTracker,
   });
   const runtimeStatusReconciler = createRuntimeStatusReconciler({
     input: _ctx,
     backgroundJobBoard,
     delayMs: options.runtimeStatusReconcileDelayMs,
-    stopConfirmationGraceMs: options.stopConfirmationMs,
-    getParentActivity: (parentSessionID) => {
-      const activity = parentActivity.get(parentSessionID);
-      return activity
-        ? { active: activity.active, revision: activity.revision }
-        : undefined;
-    },
-    clearParentActivityIfUnchanged,
-    isParentFallbackInProgress: options.isFallbackInProgress,
-    taskContextTracker,
+    terminalGate,
   });
 
   const idleSessionTokens = createIdleSessionTokens({
@@ -453,6 +565,7 @@ export function createTaskSessionManagerHook(
 
   const injectionState: InjectionState = {
     backgroundJobBoard,
+    terminalGate,
     maxRetainedSnapshots: options.maxRetainedSnapshots,
     strategy: options.strategy ?? 'latest',
     lifecycleLedger: rehydrateState,
@@ -541,6 +654,16 @@ export function createTaskSessionManagerHook(
         !options.shouldManageSession(sessionID) ||
         !Array.isArray(parts) ||
         parts.some(isInternalInitiatorPart) ||
+        // Shared genuine-operator gate with orchestrator-wake (single
+        // source of truth in ../orchestrator-wake/index.ts): noReply
+        // injections, identity-less v2 command-marker submits, and
+        // board/phase-tagged injections must not clear wait_for_user or
+        // invalidate idle timers. The local direct-synthetic and
+        // messageIdentity checks above stay as cheap pre-filters and the
+        // defense-in-depth identity seam (callers must still compute a
+        // messageIdentity); the shared helper owns the full genuineness
+        // verdict that neither seam reaches alone.
+        !isGenuineOperatorMessage(inputMessage, outputMessage, parts) ||
         !parts.some(
           (part) =>
             isObjectRecord(part) &&
@@ -567,6 +690,8 @@ export function createTaskSessionManagerHook(
         backgroundJobSupervisor: options.backgroundJobSupervisor,
         backgroundTaskConcurrency: options.backgroundTaskConcurrency,
         getModelForAgent: options.getModelForAgent,
+        getSessionModel: options.getSessionModel,
+        sameProviderPolicy: options.sameProviderPolicy,
         pendingCallTracker,
         taskContextTracker,
         getLifecycleEpoch: () => rehydrateState.nextEpoch,
@@ -583,11 +708,10 @@ export function createTaskSessionManagerHook(
         revivedRunTracker: options.revivedRunTracker,
         syntheticQuotaCoordinator,
         backgroundJobBoard,
+        terminalGate,
         backgroundJobSupervisor: options.backgroundJobSupervisor,
         bindConcurrencyTicket: (taskID, pending) =>
           pending.concurrencyTicket?.bind(taskID),
-        releaseConcurrencyTask: (taskID) =>
-          options.backgroundTaskConcurrency?.releaseTask(taskID),
         recordLifecycleSuppression: (taskID) =>
           recordBackgroundJobSuppression(backgroundJobBoard, taskID),
         pendingCallTracker,
@@ -614,7 +738,7 @@ export function createTaskSessionManagerHook(
       // cache. Terminal results are left untouched (they materialize once).
       stabilizeRunningTaskParts(messages);
 
-      const rehydratedCount = rehydrateHistoricalRunningTasks(
+      const rehydratedTaskIDs = rehydrateHistoricalRunningTasks(
         messages,
         backgroundJobBoard,
         options.shouldManageSession,
@@ -623,6 +747,13 @@ export function createTaskSessionManagerHook(
         options.backgroundTaskConcurrency,
         options.getModelForAgent,
       );
+      for (const taskID of rehydratedTaskIDs) {
+        probeRehydratedTaskSession(taskID);
+      }
+
+      if (rehydratedTaskIDs.length > 0) {
+        await runtimeStatusReconciler.reconcile();
+      }
 
       for (const [messageIndex, message] of messages.entries()) {
         if (!isUserMessageWithParts(message)) continue;
@@ -650,10 +781,6 @@ export function createTaskSessionManagerHook(
             partIndex,
           );
         }
-      }
-
-      if (rehydratedCount > 0) {
-        await runtimeStatusReconciler.reconcile();
       }
     },
 
@@ -753,6 +880,7 @@ export function createTaskSessionManagerHook(
         syntheticQuotaCoordinator.dispose();
         parentActivity.clear();
         runtimeStatusReconciler.dispose();
+        if (!options.terminalGate) terminalGate.dispose();
       }
       return handleEvent(input, {
         inputWaits,
@@ -761,6 +889,7 @@ export function createTaskSessionManagerHook(
         idleReconciler,
         deferredInlineErrors,
         backgroundJobBoard,
+        terminalGate,
         pendingCallTracker,
         taskContextTracker,
         terminalJobsInjectedByParent,

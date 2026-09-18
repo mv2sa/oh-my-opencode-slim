@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
 import { handleEvent } from './event-router';
+import { createBackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 
 function createDeps(board: BackgroundJobBoard, now: () => number) {
   const backgroundJobSupervisor = {
@@ -34,6 +35,10 @@ function createDeps(board: BackgroundJobBoard, now: () => number) {
     },
     deferredInlineErrors: new Set<string>(),
     backgroundJobBoard: board,
+    terminalGate: createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      now,
+    }),
     pendingCallTracker: {
       peekByParentAndAgent: mock(() => undefined),
       clearSession: mock(() => {}),
@@ -122,6 +127,7 @@ describe('task session event generation fences', () => {
     await route(deps, 'session.status', {
       sessionID: 'child-1',
       status: { type: 'busy' },
+      activityAt: clock,
     });
     expect(board.get('child-1')).toMatchObject({ lastLiveBusyAt: 201 });
   });

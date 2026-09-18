@@ -1,598 +1,298 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterEach, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../utils/background-job-board';
-import { buildPluginInput } from '../v2/client-shim';
+import {
+  createBackgroundJobTerminalGate,
+  type BackgroundJobTerminalGate,
+} from '../utils/background-job-terminal-gate';
 import { createTaskResultTool } from './task-result';
-import { createTaskStatusTool } from './task-status';
-
-let mockClient: Record<string, any>;
 
 mock.module('../utils/opencode-client', () => ({
-  getClient: () => mockClient,
+  getClient: (input: { client: unknown }) => input.client,
 }));
-
-function createTool() {
+const gates: BackgroundJobTerminalGate[] = [];
+afterEach(() => {
+  for (const gate of gates.splice(0)) gate.dispose();
+});
+function harness(tracked = true) {
   const board = new BackgroundJobBoard();
+  const run = tracked
+    ? board.registerLaunch({
+        taskID: 'ses_child1',
+        parentSessionID: 'parent-1',
+        agent: 'explorer',
+        now: 0,
+      })
+    : undefined;
   const get = mock(async () => ({ data: { parentID: 'parent-1' } }));
+  const status = mock(async () => ({ data: {} }));
   const messages = mock(async () => ({
     data: [
       {
-        info: { role: 'assistant' },
-        parts: [
-          { type: 'reasoning', text: 'private work' },
-          { type: 'text', text: 'complete findings' },
-        ],
+        info: { role: 'assistant', finish: 'stop', time: { completed: 10 } },
+        parts: [{ type: 'text', text: 'final findings' }],
       },
     ],
   }));
-  const status = mock(async () => ({ data: {} }));
-  mockClient = { session: { get, messages, status } };
-
-  const input = { directory: '/test/project' } as any;
-  const tools = createTaskResultTool({
+  const input = {
+    directory: '/tmp',
+    client: { session: { get, status, messages } },
+  } as never;
+  const gate = createBackgroundJobTerminalGate({
+    backgroundJobBoard: board,
+    input,
+    graceMs: 0,
+  });
+  gates.push(gate);
+  const tool = createTaskResultTool({
     input,
     backgroundJobBoard: board,
-  });
-  const statusTools = createTaskStatusTool({
-    input,
-    backgroundJobBoard: board,
-  });
+    terminalGate: gate,
+  }).task_result;
+  const execute = (task_id = tracked ? 'exp-1' : 'ses_child1') =>
+    tool.execute({ task_id }, {
+      sessionID: 'parent-1',
+      agent: 'orchestrator',
+    } as never);
+  async function settle(
+    state: 'completed' | 'error' | 'cancelled' | 'stopped',
+    acknowledged = false,
+  ) {
+    if (!run) throw new Error('tracked fixture required');
+    if (state === 'error')
+      messages.mockResolvedValue({
+        data: [
+          { info: { role: 'assistant', error: 'provider failed' }, parts: [] },
+        ],
+      } as never);
+    if (state === 'stopped') messages.mockResolvedValue({ data: [] });
+    if (state === 'cancelled') {
+      const lease = board.acquireCancellationLease(run.taskID, run.generation);
+      const token = gate.capture(run);
+      if (!lease || !token) throw new Error('missing cancellation authority');
+      gate.observe(token, {
+        kind: 'quiescent',
+        origin: 'cancel-verifier',
+        readStartedAt: token.readStartedAt,
+        stable: true,
+      });
+      await gate.reconcile(run, {
+        kind: 'cancel',
+        lease,
+        reason: 'user requested',
+      });
+      board.releaseLease(lease);
+    } else await gate.reconcile(run);
+    expect(board.get(run.taskID)?.state).toBe(state);
+    if (acknowledged) board.markReconciled(run.taskID);
+  }
   return {
     board,
+    get run() {
+      if (!run) throw new Error('tracked fixture required');
+      return run;
+    },
+    gate,
     get,
+    status,
     messages,
-    statusTool: statusTools.task_status,
-    tool: tools.task_result,
+    execute,
+    settle,
+    input,
   };
 }
 
-describe('task_result', () => {
-  test('returns completed task text without prompting the child', async () => {
-    const { board, tool, messages } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    board.updateStatus({ taskID: 'ses_child1', state: 'completed' });
-
-    const output = await tool.execute({ task_id: 'exp-1' }, {
-      sessionID: 'parent-1',
-      agent: 'orchestrator',
-    } as any);
-
-    expect(output).toBe('complete findings');
-    expect(messages).toHaveBeenCalledTimes(1);
-    expect(mockClient.session.prompt).toBeUndefined();
-    expect(mockClient.session.promptAsync).toBeUndefined();
-  });
-
-  test('returns only the final assistant response', async () => {
-    const { board, tool } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    board.updateStatus({ taskID: 'ses_child1', state: 'completed' });
-    mockClient.session.messages.mockResolvedValue({
-      data: [
-        {
-          info: { role: 'assistant' },
-          parts: [{ type: 'text', text: 'earlier progress' }],
-        },
-        {
-          info: { role: 'assistant' },
-          parts: [{ type: 'text', text: 'final findings' }],
-        },
-      ],
-    });
-
-    await expect(
-      tool.execute({ task_id: 'exp-1' }, {
-        sessionID: 'parent-1',
-        agent: 'fixer',
-      } as any),
-    ).resolves.toBe('final findings');
-  });
-
-  test('returns a non-error status for a still-running tracked task', async () => {
-    const { board, tool, statusTool, messages } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-
-    const output = await tool.execute({ task_id: 'exp-1' }, {
-      sessionID: 'parent-1',
-      agent: 'orchestrator',
-    } as any);
-
-    expect(output).toBe(
-      [
-        'task_id: ses_child1',
-        'state: running (unconfirmed)',
-        'message: Live task status is uncertain; no definitive running state is available.',
-        'next: retry task_result or use task_status to inspect the task',
-      ].join('\n'),
-    );
-    await expect(
-      statusTool.execute({ task_id: 'exp-1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).resolves.toContain('state: running');
-    expect(messages).not.toHaveBeenCalled();
-  });
-
-  test('preserves a live retry state for a tracked running task', async () => {
-    const { board, tool, messages } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    mockClient.session.status.mockResolvedValue({
-      data: { ses_child1: { type: 'retry' } },
-    });
-
-    const output = await tool.execute({ task_id: 'exp-1' }, {
-      sessionID: 'parent-1',
-      agent: 'orchestrator',
-    } as any);
-
-    expect(output).toContain('state: retry');
-    expect(output).toContain('next: use task_status to inspect the task');
-    expect(messages).not.toHaveBeenCalled();
-  });
-
-  test('treats a live-confirmed idle task as pending reconciliation', async () => {
-    const { board, tool, messages } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    mockClient.session.status.mockResolvedValue({
-      data: { ses_child1: { type: 'idle' } },
-    });
-
-    const output = await tool.execute({ task_id: 'exp-1' }, {
-      sessionID: 'parent-1',
-      agent: 'orchestrator',
-    } as any);
-
-    expect(output).toBe(
-      [
-        'task_id: ses_child1',
-        'state: pending',
-        'message: Task is quiescent; wait for terminal reconciliation before retrieving its result.',
-        'next: retry task_result after the terminal notification',
-      ].join('\n'),
-    );
-    expect(output).not.toContain('still running');
-    expect(messages).not.toHaveBeenCalled();
-  });
-
-  test('self-heals a stopped board record when the live child is busy', async () => {
-    const { board, tool, messages } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    const generation = board.get('ses_child1')?.generation;
-    board.markStopped(
-      'ses_child1',
-      'provisional idle observation',
-      1,
-      generation,
-    );
-    mockClient.session.status.mockResolvedValue({
-      data: { ses_child1: { type: 'busy' } },
-    });
-
-    const output = await tool.execute({ task_id: 'exp-1' }, {
-      sessionID: 'parent-1',
-      agent: 'orchestrator',
-    } as any);
-
-    expect(output).toContain('state: running');
-    expect(output).toContain('task_status');
-    expect(board.get('ses_child1')).toMatchObject({
-      state: 'running',
-      statusUncertain: false,
-    });
-    expect(messages).not.toHaveBeenCalled();
-  });
-
-  test('rejects a tracked task that ended in error', async () => {
-    const { board, tool, messages } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    board.updateStatus({
-      taskID: 'ses_child1',
-      state: 'error',
-      resultSummary: 'provider exploded',
-    });
-
-    await expect(
-      tool.execute({ task_id: 'exp-1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).rejects.toThrow('ended in error: provider exploded');
-    expect(messages).not.toHaveBeenCalled();
-  });
-
-  test('marks a terminal job used even when retrieval finds no text result', async () => {
-    const { board, tool } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-      now: 100,
-    });
-    board.updateStatus({
-      taskID: 'ses_child1',
-      state: 'error',
-      resultSummary: undefined,
-      now: 200,
-    });
-    mockClient.session.messages.mockResolvedValue({ data: [] });
-
-    await expect(
-      tool.execute({ task_id: 'exp-1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).rejects.toThrow('ended in error');
-
-    // Retrieval attempt must still count as consumption so the
-    // duplicate-spawn guard's escape hatch opens for failed terminals.
-    const job = board.get('ses_child1');
-    expect(job?.completedAt).toBe(200);
-    expect(job?.lastUsedAt).toBeGreaterThan(job?.completedAt ?? 0);
-  });
-
-  test('rejects a tracked task that was cancelled', async () => {
-    const { board, tool, messages } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    board.markCancelled('ses_child1', 'orchestrator aborted');
-
-    await expect(
-      tool.execute({ task_id: 'exp-1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).rejects.toThrow('was cancelled: orchestrator aborted');
-    expect(messages).not.toHaveBeenCalled();
-  });
-
-  test('returns a reconciled task whose terminal outcome was completed', async () => {
-    const { board, tool } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    board.updateStatus({ taskID: 'ses_child1', state: 'completed' });
-    board.markReconciled('ses_child1');
-
-    const output = await tool.execute({ task_id: 'exp-1' }, {
-      sessionID: 'parent-1',
-      agent: 'orchestrator',
-    } as any);
-
-    expect(output).toBe('complete findings');
-  });
-
-  test('does not return G2 partial output after G1 completion races a relaunch', async () => {
-    const { board, tool, messages } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    const first = board.updateStatus({
-      taskID: 'ses_child1',
-      state: 'completed',
-      resultSummary: 'G1 complete',
-    });
-    if (!first) throw new Error('G1 was not registered');
-
-    mockClient.session.status.mockImplementation(async () => {
-      board.registerLaunch({
-        taskID: 'ses_child1',
-        parentSessionID: 'parent-1',
-        agent: 'explorer',
-        description: 'G2 relaunch',
-      });
-      return { data: { ses_child1: { type: 'busy' } } };
-    });
-    mockClient.session.messages.mockResolvedValue({
-      data: [
-        {
-          info: { role: 'assistant' },
-          parts: [{ type: 'text', text: 'G2 partial output' }],
-        },
-      ],
-    });
-
-    await expect(
-      tool.execute({ task_id: 'exp-1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).rejects.toThrow('changed generation');
-    expect(board.get('ses_child1')).toMatchObject({
-      generation: first.generation + 1,
-      state: 'running',
-    });
-    expect(messages).not.toHaveBeenCalled();
-  });
-
-  test('does not return a result when G2 relaunches during result extraction', async () => {
-    const { board, tool } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    board.updateStatus({
-      taskID: 'ses_child1',
-      state: 'completed',
-      resultSummary: 'G1 complete',
-    });
-
-    mockClient.session.messages.mockImplementation(async () => {
-      board.registerLaunch({
-        taskID: 'ses_child1',
-        parentSessionID: 'parent-1',
-        agent: 'explorer',
-        description: 'G2 relaunch',
-      });
-      return {
-        data: [
-          {
-            info: { role: 'assistant' },
-            parts: [{ type: 'text', text: 'G2 partial output' }],
-          },
+test('retrieves full confirmed text without prompting or resuming', async () => {
+  const h = harness();
+  await h.settle('completed');
+  h.messages.mockClear();
+  expect(await h.execute()).toBe('final findings');
+  expect(h.messages).toHaveBeenCalledTimes(1);
+  expect(h.board.get(h.run.taskID)?.lastUsedAt).toBeGreaterThan(0);
+});
+test('only the last assistant segment is retrieved; reasoning is private', async () => {
+  const h = harness();
+  h.messages.mockResolvedValue({
+    data: [
+      {
+        info: { role: 'assistant', finish: 'stop', time: { completed: 2 } },
+        parts: [{ type: 'text', text: 'earlier' }],
+      },
+      { info: { role: 'user' }, parts: [] },
+      {
+        info: { role: 'assistant', finish: 'stop', time: { completed: 10 } },
+        parts: [
+          { type: 'reasoning', text: 'private' },
+          { type: 'text', text: 'final' },
         ],
-      };
-    });
-
-    await expect(
-      tool.execute({ task_id: 'exp-1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).rejects.toThrow('changed generation');
-    expect(board.get('ses_child1')?.state).toBe('running');
+      },
+    ],
+  } as never);
+  expect(await h.execute()).toBe('final');
+});
+test.each(['completed', 'error', 'cancelled', 'stopped'] as const)(
+  'live busy retracts REAL %s before rejection or acknowledgement',
+  async (state) => {
+    for (const acknowledged of [false, true]) {
+      const h = harness();
+      await h.settle(state, acknowledged);
+      const previous = h.board.get(h.run.taskID);
+      if (!previous) throw new Error('missing terminal fixture');
+      h.messages.mockClear();
+      h.status.mockResolvedValue({ data: { ses_child1: { type: 'busy' } } });
+      expect(await h.execute()).toContain('state: running');
+      expect(h.board.get(h.run.taskID)).toMatchObject({
+        state: 'running',
+        generation: previous.generation,
+        terminalRevision: previous.terminalRevision + 1,
+        terminalUnreconciled: false,
+        resultSummary: undefined,
+      });
+      expect(h.messages).not.toHaveBeenCalled();
+    }
+  },
+);
+test('busy timeout reopens without clearing deadline or cancellation intent', async () => {
+  const h = harness();
+  h.board.claimWallClockDeadline({ ...h.run, now: 1 });
+  const token = h.gate.capture(h.run);
+  if (!token) throw new Error('missing observation');
+  h.gate.observe(token, {
+    kind: 'deleted',
+    origin: 'test',
+    readStartedAt: token.readStartedAt,
   });
-
-  test('rejects a reconciled task whose terminal outcome was error', async () => {
-    const { board, tool, messages } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    board.updateStatus({
-      taskID: 'ses_child1',
-      state: 'error',
-      resultSummary: 'model unavailable',
-    });
-    board.markReconciled('ses_child1');
-
-    await expect(
-      tool.execute({ task_id: 'exp-1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).rejects.toThrow('ended in error: model unavailable');
-    expect(messages).not.toHaveBeenCalled();
+  expect(h.board.get(h.run.taskID)?.state).toBe('error');
+  h.status.mockResolvedValue({ data: { ses_child1: { type: 'busy' } } });
+  expect(await h.execute()).toContain('state: running');
+  expect(h.board.get(h.run.taskID)).toMatchObject({
+    state: 'running',
+    deadlineExceededAt: 1,
+    cancellationRequested: true,
+    timedOut: true,
   });
-
-  test('returns a status for an untracked child whose live session is busy', async () => {
-    const { tool, messages } = createTool();
-    mockClient.session.status.mockImplementation(async () => ({
-      data: { ses_child1: { type: 'busy' } },
-    }));
-
-    const output = await tool.execute({ task_id: 'ses_child1' }, {
-      sessionID: 'parent-1',
-      agent: 'orchestrator',
-    } as any);
-
-    expect(output).toBe(
-      [
-        'task_id: ses_child1',
-        'state: running',
-        'message: Task is still running. Wait for its terminal result.',
-        'next: retry task_result after the task finishes',
-      ].join('\n'),
+});
+test.each(['busy', 'retry'])(
+  'preserves live %s presentation without reading result',
+  async (type) => {
+    const h = harness();
+    h.status.mockResolvedValue({ data: { ses_child1: { type } } });
+    expect(await h.execute()).toContain(
+      type === 'retry' ? 'state: retry' : 'state: running',
     );
-    expect(messages).not.toHaveBeenCalled();
-
-    mockClient.session.status.mockResolvedValue({ data: {} });
-    mockClient.session.messages.mockResolvedValue({
+    expect(h.messages).not.toHaveBeenCalled();
+    expect(h.status).toHaveBeenCalledTimes(1);
+  },
+);
+test('valid idle with pending transcript is pending, not a terminal result', async () => {
+  const h = harness();
+  h.status.mockResolvedValue({ data: { ses_child1: { type: 'idle' } } });
+  h.messages.mockResolvedValue({
+    data: [{ info: { role: 'assistant' }, parts: [] }],
+  } as never);
+  expect(await h.execute()).toContain('state: pending');
+  expect(h.board.get(h.run.taskID)?.state).toBe('running');
+});
+test('unknown status remains running without reading transcript', async () => {
+  const h = harness();
+  h.status.mockRejectedValue(new Error('unavailable'));
+  expect(await h.execute()).toContain('state: running (unconfirmed)');
+  expect(h.messages).not.toHaveBeenCalled();
+});
+test.each(['error', 'cancelled', 'stopped'] as const)(
+  'quiescent %s is rejected only after checking activity',
+  async (state) => {
+    const h = harness();
+    await h.settle(state);
+    h.status.mockClear();
+    await expect(h.execute()).rejects.toThrow(
+      state === 'error'
+        ? 'ended in error'
+        : state === 'cancelled'
+          ? 'was cancelled'
+          : 'no confirmed completed result',
+    );
+    expect(h.status).toHaveBeenCalledTimes(1);
+    expect(h.board.get(h.run.taskID)?.lastUsedAt).toBeGreaterThan(0);
+  },
+);
+test('acknowledged completed result remains retrievable if current evidence matches', async () => {
+  const h = harness();
+  await h.settle('completed', true);
+  expect(await h.execute()).toBe('final findings');
+});
+test('empty pending placeholder never rescues N-1 from a retained completed publication', async () => {
+  const h = harness();
+  await h.settle('completed');
+  h.messages.mockResolvedValue({
+    data: [
+      {
+        info: { role: 'assistant', time: { completed: 10 } },
+        parts: [{ type: 'text', text: 'final findings' }],
+      },
+      { info: { role: 'assistant' }, parts: [] },
+    ],
+  } as never);
+  expect(await h.execute()).not.toContain('final findings');
+});
+test('generation change during evidence lookup never returns the old result', async () => {
+  const h = harness();
+  h.messages.mockImplementation(async () => {
+    h.board.registerLaunch({ ...h.run, now: 100 });
+    return {
       data: [
         {
-          info: { role: 'assistant', time: { completed: 100 } },
-          parts: [{ type: 'text', text: 'final findings' }],
+          info: { role: 'assistant', finish: 'stop', time: { completed: 10 } },
+          parts: [{ type: 'text', text: 'old result' }],
         },
       ],
-    });
-    await expect(
-      tool.execute({ task_id: 'ses_child1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).resolves.toBe('final findings');
+    };
   });
-
-  test('returns a status for an untracked child whose live session is retrying', async () => {
-    const { tool, messages } = createTool();
-    mockClient.session.status.mockImplementation(async () => ({
-      data: { ses_child1: { type: 'retry' } },
-    }));
-
-    const output = await tool.execute({ task_id: 'ses_child1' }, {
-      sessionID: 'parent-1',
-      agent: 'orchestrator',
-    } as any);
-
-    expect(output).toContain('state: retry');
-    expect(output).toContain('next: retry task_result after the task finishes');
-    expect(output).not.toContain('task_status');
-    expect(messages).not.toHaveBeenCalled();
+  await expect(h.execute()).rejects.toThrow('changed generation');
+});
+test('generation change during ownership lookup cannot consume a new publication', async () => {
+  const h = harness();
+  await h.settle('completed');
+  h.get.mockImplementation(async () => {
+    const lease = h.board.acquireRelaunchLease(h.run.taskID, h.run.generation);
+    if (!lease) throw new Error('missing relaunch lease');
+    h.board.registerLaunch({ ...h.run, relaunchLease: lease, now: 100 });
+    h.board.releaseLease(lease);
+    return { data: { parentID: 'parent-1' } };
   });
-
-  test('rejects an untracked idle session with no terminal evidence', async () => {
-    const { tool, messages } = createTool();
-    mockClient.session.messages.mockResolvedValue({
-      data: [
-        {
-          info: { role: 'assistant' },
-          parts: [{ type: 'text', text: 'partial findings' }],
-        },
-      ],
-    });
-
-    await expect(
-      tool.execute({ task_id: 'ses_child1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).rejects.toThrow('no terminal evidence');
-    expect(messages).toHaveBeenCalledTimes(1);
-  });
-
-  test('rejects an untracked session idle mid-exchange', async () => {
-    const { tool } = createTool();
-    mockClient.session.messages.mockResolvedValue({
-      data: [
-        {
-          info: { role: 'assistant', time: { completed: 100 } },
-          parts: [{ type: 'text', text: 'earlier answer' }],
-        },
-        {
-          info: { role: 'user' },
-          parts: [{ type: 'text', text: 'continue' }],
-        },
-      ],
-    });
-
-    await expect(
-      tool.execute({ task_id: 'ses_child1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).rejects.toThrow('no terminal evidence');
-  });
-
-  test('rejects an untracked session whose last assistant message errored', async () => {
-    const { tool } = createTool();
-    mockClient.session.messages.mockResolvedValue({
-      data: [
-        {
-          info: {
-            role: 'assistant',
-            time: { completed: 100 },
-            error: { name: 'MessageAbortedError', data: {} },
-          },
-          parts: [{ type: 'text', text: 'partial findings' }],
-        },
-      ],
-    });
-
-    await expect(
-      tool.execute({ task_id: 'ses_child1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).rejects.toThrow('no terminal evidence');
-  });
-
-  test('returns an untracked session result when terminal evidence exists', async () => {
-    const { tool, messages } = createTool();
-    mockClient.session.messages.mockResolvedValue({
-      data: [
-        {
-          info: { role: 'assistant', time: { completed: 100 } },
-          parts: [
-            { type: 'reasoning', text: 'private work' },
-            { type: 'text', text: 'final findings' },
-          ],
-        },
-      ],
-    });
-
-    const output = await tool.execute({ task_id: 'ses_child1' }, {
-      sessionID: 'parent-1',
-      agent: 'orchestrator',
-    } as any);
-
-    expect(output).toBe('final findings');
-    expect(messages).toHaveBeenCalledTimes(1);
-  });
-
-  test('returns a tracked result through the v2 client shim', async () => {
-    const { board, tool } = createTool();
-    board.registerLaunch({
-      taskID: 'ses_child1',
-      parentSessionID: 'parent-1',
-      agent: 'explorer',
-      description: 'trace bug',
-    });
-    board.updateStatus({
-      taskID: 'ses_child1',
-      state: 'completed',
-      resultSummary: 'complete findings',
-    });
-    mockClient = (buildPluginInput({} as never) as { client: never }).client;
-
-    const output = await tool.execute({ task_id: 'exp-1' }, {
-      sessionID: 'parent-1',
-      agent: 'orchestrator',
-    } as any);
-
-    expect(output).toBe('complete findings');
-  });
-
-  test('rejects a task owned by another parent session', async () => {
-    const { tool, get, messages } = createTool();
-    get.mockImplementation(async () => ({
-      data: { parentID: 'other-parent' },
-    }));
-
-    await expect(
-      tool.execute({ task_id: 'ses_child1' }, {
-        sessionID: 'parent-1',
-        agent: 'orchestrator',
-      } as any),
-    ).rejects.toThrow('does not belong to this session');
-    expect(messages).not.toHaveBeenCalled();
-  });
+  await expect(h.execute()).rejects.toThrow('changed generation');
+  expect(h.board.get(h.run.taskID)?.lastUsedAt).toBe(100);
+});
+test('ownership mismatch cannot expose a child result', async () => {
+  const h = harness(false);
+  h.get.mockResolvedValue({ data: { parentID: 'other' } });
+  await expect(h.execute()).rejects.toThrow('does not belong');
+  expect(h.messages).not.toHaveBeenCalled();
+});
+test.each(['busy', 'retry'])(
+  'untracked live %s returns status without a transcript',
+  async (type) => {
+    const h = harness(false);
+    h.status.mockResolvedValue({ data: { ses_child1: { type } } });
+    expect(await h.execute()).toContain(
+      'retry task_result after the task finishes',
+    );
+    expect(h.messages).not.toHaveBeenCalled();
+  },
+);
+test('untracked quiescent session still requires a terminal assistant segment', async () => {
+  const h = harness(false);
+  h.messages.mockResolvedValue({
+    data: [
+      {
+        info: { role: 'assistant' },
+        parts: [{ type: 'text', text: 'partial' }],
+      },
+    ],
+  } as never);
+  await expect(h.execute()).rejects.toThrow('no terminal evidence');
+});
+test('unknown alias and empty task id are rejected', async () => {
+  const h = harness();
+  await expect(h.execute('exp-99')).rejects.toThrow('Unknown task ID');
+  await expect(h.execute(' ')).rejects.toThrow('requires task_id');
 });

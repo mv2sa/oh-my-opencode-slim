@@ -4,17 +4,20 @@ import { getClient } from './opencode-client';
 
 export type RuntimeSessionStatus = 'busy' | 'retry' | 'idle';
 export const DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS = 5_000;
+const openStatusReads = new WeakMap<object, Promise<void>>();
 
 export interface RuntimeSessionStatusSnapshot {
   statuses: ReadonlyMap<string, RuntimeSessionStatus>;
   malformedSessionIDs: ReadonlySet<string>;
   error?: string;
+  /** Slot availability only: never exposes the open read's evidence. */
+  retryAfter?: Promise<void>;
 }
 
 /**
  * Reads OpenCode's single live session-status map. An absent session in a
- * valid response is unknown: the endpoint only describes currently active
- * runners and does not prove that a background task has terminated.
+ * valid response is quiescent, not terminal. The gate still requires result
+ * attribution or stable valid absence before publishing a terminal state.
  */
 export async function getRuntimeSessionStatusSnapshot(
   input: PluginInput,
@@ -25,13 +28,31 @@ export async function getRuntimeSessionStatusSnapshot(
       typeof input.client?.session?.status === 'function'
         ? input.client
         : getClient(input);
+    const openRead = openStatusReads.get(client.session);
+    if (openRead)
+      return {
+        statuses: new Map(),
+        malformedSessionIDs: new Set(),
+        error: 'Previous session-status read is still open',
+        retryAfter: openRead,
+      };
+    const request = client.session.status({
+      query: { directory: input.directory },
+    });
+    const release = () => {
+      if (openStatusReads.get(client.session) === settled)
+        openStatusReads.delete(client.session);
+    };
+    const settled = request.then(release, release);
+    openStatusReads.set(client.session, settled);
     const response = await withTimeout(
-      client.session.status({
-        query: { directory: input.directory },
-      }),
+      request,
       options.timeoutMs ?? DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS,
     );
-    if (!isRecord(response.data)) {
+    if (
+      (response.error !== undefined && response.error !== null) ||
+      !isRecord(response.data)
+    ) {
       return {
         statuses: new Map(),
         malformedSessionIDs: new Set(),

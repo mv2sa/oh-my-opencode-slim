@@ -45,6 +45,7 @@ import {
 } from '../foreground-fallback/synthetic-quota';
 import type { MessagePart, MessageWithParts } from '../types';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
+import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import type { RevivedRunTracker } from './revived-run-tracker';
 import {
   extractTaskSummary,
@@ -133,6 +134,7 @@ const HOST_MESSAGE_OCCURRENCE_PREFIX = 'host-message:';
 
 export interface InjectionState {
   backgroundJobBoard: BackgroundJobStore;
+  terminalGate: BackgroundJobTerminalGate;
   lifecycleLedger: BackgroundJobLifecycleLedger;
   maxRetainedSnapshots: number;
   strategy: 'latest' | 'checkpoint-compatible';
@@ -728,7 +730,7 @@ export async function updateFromInjectedCompletion(
     }
     return undefined;
   }
-  if (status.state !== 'completed' && status.state !== 'error') {
+  if (!isProcessableSyntheticTerminal(part.text, status)) {
     return undefined;
   }
 
@@ -838,18 +840,12 @@ export async function updateFromInjectedCompletion(
     }
   }
 
-  if (deletionEpoch !== undefined && origin === undefined) {
-    failClosedSyntheticTerminal(
-      state,
-      status,
-      occurrenceId,
-      provenanceKind,
-      existing,
-      'no message.part.updated origin was observed',
-    );
-    return undefined;
-  }
-
+  // Fence-first: a remembered (possibly stale) completion occurrence must
+  // skip CLEANLY before the deletion-epoch fail-closed branch below. A
+  // known occurrence is either a duplicate in the same lifecycle or stale
+  // history from an older generation — neither may update the current
+  // board, and neither justifies poisoning the fresh generation with
+  // markStatusUncertain when its occurrence bookkeeping is absent.
   if (
     hasRememberedInjectedCompletion(
       state,
@@ -862,11 +858,19 @@ export async function updateFromInjectedCompletion(
     return undefined;
   }
 
-  if (isFailed && isLateCancelledTaskError(existing, status.state)) {
-    part.text = formatCancelledTaskStatusOutput(
-      status.taskID,
-      state.backgroundJobBoard.getResultSummary(status.taskID),
+  if (deletionEpoch !== undefined && origin === undefined) {
+    failClosedSyntheticTerminal(
+      state,
+      status,
+      occurrenceId,
+      provenanceKind,
+      existing,
+      'no message.part.updated origin was observed',
     );
+    return undefined;
+  }
+
+  if (isFailed && isLateCancelledTaskError(existing, status.state)) {
     log('[task-session-manager] normalized late cancelled injected failure', {
       taskID: status.taskID,
       alias: existing?.alias,
@@ -898,6 +902,7 @@ export async function updateFromInjectedCompletion(
       rememberPendingInjectedTerminalJob(state, existing.parentSessionID, {
         taskID: existing.taskID,
         generation: existing.generation,
+        terminalRevision: existing.terminalRevision,
       });
     }
     return existing;
@@ -980,17 +985,43 @@ export async function updateFromInjectedCompletion(
     return undefined;
   }
 
-  const updated = updateBackgroundJobFromOutput(
-    part.text,
-    state.backgroundJobBoard,
-    state.taskContextTracker,
+  if (!existing) return undefined;
+  // Reception deduplication is separate from terminal confirmation. A replay
+  // without an observed execution owner can only request an inspection.
+  rememberProcessedInjectedCompletion(
+    state,
+    status.taskID,
+    occurrenceId,
+    provenanceKind,
+    {
+      taskID: existing.taskID,
+      generation: existing.generation,
+      lifecycleEpoch: state.getLifecycleEpoch?.() ?? 0,
+    },
   );
+  const result = await state.terminalGate.reconcile(
+    existing,
+    origin?.generationAtObservation === existing.generation
+      ? {
+          kind: 'output',
+          status,
+          origin: {
+            kind: 'synthetic',
+            occurrenceID: occurrenceId,
+            run: existing,
+            provenance: provenanceKind,
+          },
+        }
+      : { kind: 'inspect' },
+  );
+  const updated = result.kind === 'stale' ? undefined : result.record;
   if (!updated) return undefined;
 
   if (updated.terminalUnreconciled && updated.parentSessionID) {
     rememberPendingInjectedTerminalJob(state, updated.parentSessionID, {
       taskID: updated.taskID,
       generation: updated.generation,
+      terminalRevision: updated.terminalRevision,
     });
   }
 
@@ -1050,7 +1081,7 @@ export function isMissingRememberedSessionError(output: string): boolean {
 }
 
 function executionKey(execution: BackgroundJobExecution): string {
-  return `${execution.taskID}\u001f${execution.generation}`;
+  return `${execution.taskID}\u001f${execution.generation}\u001f${execution.terminalRevision}`;
 }
 
 function sameExecutionIdentity(
@@ -1081,7 +1112,11 @@ function reconcileExecutionBatch(
 ): void {
   for (const execution of executions) {
     const current = state.backgroundJobBoard.get(execution.taskID);
-    if (!current || current.generation !== execution.generation) {
+    if (
+      !current ||
+      current.generation !== execution.generation ||
+      current.terminalRevision !== execution.terminalRevision
+    ) {
       log('[task-session-manager] skipped stale terminal execution', {
         parentSessionID,
         execution,
@@ -1089,7 +1124,12 @@ function reconcileExecutionBatch(
       });
       continue;
     }
-    state.backgroundJobBoard.markReconciled(execution.taskID);
+    state.backgroundJobBoard.markReconciled(
+      execution.taskID,
+      undefined,
+      execution.generation,
+      execution.terminalRevision,
+    );
   }
 }
 
@@ -1260,8 +1300,13 @@ function injectLatestBoard(state: InjectionState, messages: unknown[]): void {
   if (!sessionID || !state.shouldManageSession(sessionID)) return;
   if (!anchor) return;
 
-  const shapeKey = promptShapeKey(realMessages(messages, state.metadataKey));
-  reconcileConsumedTerminalJobs(state, sessionID, shapeKey);
+  // Hash the real history only when a prior terminal delivery needs
+  // reconciliation or a new one is about to be registered.
+  let shapeKey: string | undefined;
+  if (state.terminalJobsInjectedByParent.has(sessionID)) {
+    shapeKey = promptShapeKey(realMessages(messages, state.metadataKey));
+    reconcileConsumedTerminalJobs(state, sessionID, shapeKey);
+  }
 
   const boardMeta =
     state.backgroundJobBoard.formatForPromptWithMetadata(sessionID);
@@ -1273,12 +1318,14 @@ function injectLatestBoard(state: InjectionState, messages: unknown[]): void {
   );
   if (!textPart || isInternalInitiatorPart(textPart)) return;
 
-  rememberInjectedTerminalJobs(
-    state,
-    sessionID,
-    boardMeta.terminalUnreconciledTaskIDs,
-    shapeKey,
-  );
+  if (boardMeta.terminalUnreconciledTaskIDs.length > 0) {
+    rememberInjectedTerminalJobs(
+      state,
+      sessionID,
+      boardMeta.terminalUnreconciledTaskIDs,
+      shapeKey ?? promptShapeKey(realMessages(messages, state.metadataKey)),
+    );
+  }
 
   // Placement rules — correctness first, then prompt-cache safety.
   //

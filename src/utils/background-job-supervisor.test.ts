@@ -1,7 +1,9 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from './background-job-board';
+import { boardFixture } from './background-job-fixture';
 import { BackgroundJobCoordinator } from './background-job-coordinator';
 import { BackgroundJobSupervisor } from './background-job-supervisor';
+import { createBackgroundJobTerminalGate } from './background-job-terminal-gate';
 
 type TimerCallback = () => void;
 
@@ -55,6 +57,10 @@ function createSupervisor(
   ) => Promise<unknown>;
   const supervisor = new BackgroundJobSupervisor({
     backgroundJobStore: coordinator,
+    terminalGate: createBackgroundJobTerminalGate({
+      backgroundJobBoard: coordinator,
+      now: timers.now,
+    }),
     wallClockTimeoutMs: overrides.timeoutMs ?? 100,
     abortGraceMs: overrides.graceMs ?? 20,
     abort,
@@ -117,7 +123,7 @@ describe('BackgroundJobSupervisor', () => {
       createSupervisor();
     const job = launch(board, true);
     supervisor.onLaunch(job);
-    const completed = coordinator.updateStatus({
+    const completed = boardFixture.updateStatus(coordinator, {
       taskID: job.taskID,
       state: 'completed',
       now: 99,
@@ -150,14 +156,12 @@ describe('BackgroundJobSupervisor', () => {
       await timers.advanceTo(120);
 
       expect(board.get(job.taskID)).toMatchObject({
-        state: 'error',
+        state: 'running',
         timedOut: true,
         statusUncertain: true,
         cancellationRequested: true,
       });
-      expect(board.getResultSummary(job.taskID)).toContain(
-        'abort was not confirmed',
-      );
+      expect(board.get(job.taskID)?.deadlineExceededAt).toBe(100);
     },
   );
 
@@ -185,12 +189,11 @@ describe('BackgroundJobSupervisor', () => {
     const job = launch(board, true);
     supervisor.onLaunch(job);
     await timers.advanceTo(100);
-    const beforeBusy = board.get(job.taskID);
     coordinator.markRunningFromLiveSession(job.taskID, 101);
 
     expect(board.get(job.taskID)).toMatchObject({
       state: 'running',
-      lastLiveBusyAt: beforeBusy?.lastLiveBusyAt,
+      lastLiveBusyAt: 101,
       deadlineExceededAt: 100,
     });
     expect(
@@ -198,10 +201,10 @@ describe('BackgroundJobSupervisor', () => {
     ).toBeUndefined();
     await timers.advanceTo(120);
     expect(abort).toHaveBeenCalledTimes(1);
-    expect(board.get(job.taskID)?.state).toBe('error');
+    expect(board.get(job.taskID)?.state).toBe('running');
   });
 
-  test('error and cancelled during grace settle the same timed-out terminal', async () => {
+  test('error and cancellation labels during grace are not terminal authority', async () => {
     for (const state of ['error', 'cancelled'] as const) {
       const { board, coordinator, supervisor, timers } = createSupervisor();
       const job = launch(board, true);
@@ -216,12 +219,12 @@ describe('BackgroundJobSupervisor', () => {
       });
 
       expect(settled).toMatchObject({
-        state: 'error',
+        state: 'running',
         timedOut: true,
         statusUncertain: false,
         deadlineExceededAt: 100,
       });
-      expect(timers.pending()).toBe(0);
+      expect(timers.pending()).toBe(1);
     }
   });
 

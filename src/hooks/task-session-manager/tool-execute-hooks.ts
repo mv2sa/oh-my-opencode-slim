@@ -14,12 +14,13 @@ import type {
 import {
   deriveFullObjective,
   deriveTaskSessionLabel,
-  guardCompletedStatusText,
+  maskTaskOutputStructure,
   parseTaskIdFromTaskOutput,
   parseTaskLaunchOutput,
   parseTaskStatusOutput,
   renderRunningTaskPlaceholder,
 } from '../../utils';
+import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
 import { SESSION_ID_PATTERN } from '../../utils/session';
@@ -32,6 +33,7 @@ import {
 import { isMissingRememberedSessionError } from './board-injection';
 import type { PendingTaskCall } from './pending-call-tracker';
 import type { RevivedRunTracker } from './revived-run-tracker';
+import { convertSameProviderBackgroundTask } from './same-provider-policy';
 import { normalizeLateCancelledTaskOutput } from './status-utils';
 import { extractReadFiles } from './task-context-tracker';
 
@@ -43,34 +45,63 @@ interface TaskArgs {
   background?: unknown;
 }
 
-const earlyRegistrationGenerations = new WeakMap<PendingTaskCall, number>();
+interface ResumeRefusalJob {
+  taskID: string;
+  alias: string;
+  agent: string;
+  state: string;
+  terminalUnreconciled: boolean;
+}
+
 function normalizeObjectiveKey(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-/**
- * session.created writes earlyRegisteredTaskID through the pending-call
- * object. Capture the generation at that boundary so a delayed native result
- * cannot reuse the current record after a same-ID relaunch.
- */
-function installEarlyRegistrationGenerationFence(
-  pending: PendingTaskCall,
-  backgroundJobBoard: BackgroundJobStore,
-): void {
-  let earlyRegisteredTaskID = pending.earlyRegisteredTaskID;
-  Object.defineProperty(pending, 'earlyRegisteredTaskID', {
-    configurable: true,
-    enumerable: true,
-    get: () => earlyRegisteredTaskID,
-    set: (taskID: string | undefined) => {
-      earlyRegisteredTaskID = taskID;
-      if (!taskID) return;
-      const generation = backgroundJobBoard.get(taskID)?.generation;
-      if (generation !== undefined) {
-        earlyRegistrationGenerations.set(pending, generation);
-      }
-    },
+function refuseExplicitTaskId(
+  requested: string,
+  message: string,
+  details?: Record<string, unknown>,
+): never {
+  log('[task-session-manager] refused explicit task_id', {
+    task_id: requested,
+    ...details,
   });
+  throw new Error(message);
+}
+
+function refuseKnownTaskResume(
+  requested: string,
+  job: ResumeRefusalJob,
+  agentType: string,
+): never {
+  const label = `${job.alias} / ${job.taskID}`;
+  if (job.agent !== agentType) {
+    refuseExplicitTaskId(
+      requested,
+      `${label}: agent is ${job.agent}, not ${agentType}. task() cannot resume this session. No new session was created.`,
+      { state: job.state, agent: job.agent, requestedAgent: agentType },
+    );
+  }
+  if (job.state === 'stopped') {
+    const ack = job.terminalUnreconciled ? 'unreconciled' : 'acknowledged';
+    refuseExplicitTaskId(
+      requested,
+      `${label}: stopped, ${ack}; task() cannot resume this session. Use task_revive with a new prompt. No new session was created.`,
+      { state: job.state, acknowledged: !job.terminalUnreconciled },
+    );
+  }
+  if (job.terminalUnreconciled) {
+    refuseExplicitTaskId(
+      requested,
+      `${label}: ${job.state}, unreconciled; task() cannot resume until acknowledgement. Use task_revive now, or wait for ack then task(). No new session was created.`,
+      { state: job.state, terminalUnreconciled: true },
+    );
+  }
+  refuseExplicitTaskId(
+    requested,
+    `${label}: ${job.state}; task() cannot resume this session. Use task_revive with a new prompt. No new session was created.`,
+    { state: job.state },
+  );
 }
 
 export async function handleToolExecuteBefore(
@@ -82,7 +113,12 @@ export async function handleToolExecuteBefore(
     backgroundJobBoard: BackgroundJobStore;
     pendingCallTracker: {
       add(call: PendingTaskCall): void;
-      take(callID?: string, sessionID?: string): PendingTaskCall | undefined;
+      take(
+        callID?: string,
+        sessionID?: string,
+        ownerBoard?: BackgroundJobStore,
+        options?: { recordConsumed?: boolean },
+      ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
       pendingCallId(sessionID?: string, callID?: string): string;
     };
@@ -93,6 +129,10 @@ export async function handleToolExecuteBefore(
       agentType: string,
       parentSessionID?: string,
     ) => string | undefined;
+    /** Current "provider/model" for a session (parent metadata store). */
+    getSessionModel?: (sessionID: string) => string | undefined;
+    /** Opt-in provider → "foreground" map for same-provider conversion. */
+    sameProviderPolicy?: Record<string, 'foreground'>;
     getLifecycleEpoch?: () => number;
   },
 ): Promise<void> {
@@ -118,13 +158,39 @@ export async function handleToolExecuteBefore(
     args.subagent_type.trim() === ''
   ) {
     if (typeof args.task_id === 'string' && args.task_id.trim() !== '') {
-      delete args.task_id;
+      const requested = args.task_id.trim();
+      refuseExplicitTaskId(
+        requested,
+        `Task ${requested}: task() requires a valid subagent_type with an explicit task_id. The task_id was not dropped; no new session was created.`,
+      );
     }
     return;
   }
 
   const agentType = args.subagent_type.trim();
-  const background = args.background === true;
+  let background = args.background === true;
+  if (background) {
+    const conversion = convertSameProviderBackgroundTask({
+      agentType,
+      parentSessionID: input.sessionID,
+      args,
+      policy: deps.sameProviderPolicy,
+      getParentModel: (id) => deps.getSessionModel?.(id),
+      getChildModel: (agent, parent) => deps.getModelForAgent?.(agent, parent),
+    });
+    if (conversion.converted) {
+      background = false;
+      log(
+        '[task-session-manager] same-provider background task converted to foreground',
+        {
+          parentProvider: conversion.parentProvider,
+          childProvider: conversion.childProvider,
+          agentType,
+          parentSessionID: input.sessionID,
+        },
+      );
+    }
+  }
 
   const label = deriveTaskSessionLabel({
     description:
@@ -150,7 +216,6 @@ export async function handleToolExecuteBefore(
       typeof args.description === 'string' ? args.description : undefined,
     prompt: typeof args.prompt === 'string' ? args.prompt : undefined,
   });
-  installEarlyRegistrationGenerationFence(pendingCall, deps.backgroundJobBoard);
   if (typeof args.task_id === 'string' && args.task_id.trim() !== '') {
     const requested = args.task_id.trim();
     const remembered =
@@ -177,11 +242,12 @@ export async function handleToolExecuteBefore(
       }
 
       if (knownManagedTask) {
-        delete args.task_id;
-      } else if (SESSION_ID_PATTERN.test(requested)) {
-        pendingCall.resumedTaskId = requested;
+        refuseKnownTaskResume(requested, knownManagedTask, agentType);
       } else {
-        delete args.task_id;
+        refuseExplicitTaskId(
+          requested,
+          `Unknown task ID or alias: ${requested}. task() did not drop the id and did not create another session.`,
+        );
       }
     } else {
       const relaunchLease = deps.backgroundJobBoard.acquireRelaunchLease(
@@ -253,7 +319,14 @@ export async function handleToolExecuteBefore(
       }
     }
   } catch (error) {
-    const tracked = deps.pendingCallTracker.take(pendingCall.callId);
+    const tracked = deps.pendingCallTracker.take(
+      pendingCall.callId,
+      undefined,
+      undefined,
+      {
+        recordConsumed: false,
+      },
+    );
     if (tracked) deps.pendingCallTracker.release?.(tracked);
     else pendingCall.concurrencyTicket?.releaseIfUnbound();
     throw error;
@@ -277,11 +350,26 @@ export async function handleToolExecuteAfter(
   deps: {
     directory: string;
     backgroundJobBoard: BackgroundJobStore;
+    terminalGate: BackgroundJobTerminalGate;
     pendingCallTracker: {
       take(
         callID?: string,
         sessionID?: string,
         ownerBoard?: BackgroundJobStore,
+        options?: { recordConsumed?: boolean },
+      ): PendingTaskCall | undefined;
+      takeByTaskID(
+        sessionID: string,
+        taskID: string,
+        ownerBoard?: BackgroundJobStore,
+      ): PendingTaskCall | undefined;
+      takeUnresolvedFirstMatch(
+        sessionID: string,
+        selection?: {
+          identityTaskID?: string;
+          agentType?: string;
+          ownerBoard?: BackgroundJobStore;
+        },
       ): PendingTaskCall | undefined;
       release?(call: PendingTaskCall): void;
     };
@@ -297,7 +385,6 @@ export async function handleToolExecuteAfter(
     revivedRunTracker?: RevivedRunTracker;
     syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
     bindConcurrencyTicket?: (taskID: string, pending: PendingTaskCall) => void;
-    releaseConcurrencyTask?: (taskID: string) => void;
     /** Record direct task cleanup even when the store is a thin facade. */
     recordLifecycleSuppression?: (taskID: string) => void;
     /** Clear a deletion guard when a new native task output proves a run exists. */
@@ -329,13 +416,67 @@ export async function handleToolExecuteAfter(
     typeof input.callID === 'string' && input.callID.trim() !== ''
       ? input.callID
       : undefined;
-  const pending = deps.pendingCallTracker.take(
+  let pending = deps.pendingCallTracker.take(
     exactCallID,
     exactCallID ? undefined : input.sessionID,
     deps.backgroundJobBoard,
   );
   const exactCallConfirmed =
     exactCallID !== undefined && pending?.callId === exactCallID;
+  let identityTaskID: string | undefined;
+  if (!pending && typeof output.output === 'string') {
+    // No tool call ID (or unknown one): resolve identity via the task
+    // ID parsed from this call's own output, matched against the
+    // pending the early registration claimed for that child. This
+    // avoids guessing by insertion order among parallel calls.
+    identityTaskID = parseTaskIdFromTaskOutput(output.output);
+    if (identityTaskID && input.sessionID) {
+      pending = deps.pendingCallTracker.takeByTaskID(
+        input.sessionID,
+        identityTaskID,
+        deps.backgroundJobBoard,
+      );
+      if (pending) {
+        log(
+          '[task-session-manager] resolved task output identity via early-registered task ID',
+          { taskID: identityTaskID, callID: pending.callId },
+        );
+      }
+    }
+  }
+  if (!pending && !exactCallID && identityTaskID && input.sessionID) {
+    // Both identity sources missed: a parallel no-callID burst where
+    // no early registration claimed the parsed task ID. Returning
+    // here would strand a pending — its concurrency ticket never
+    // releases, and sole-survivor takes refuse forever while it
+    // remains (parent poisoning). The task ID parsed from this call's
+    // own output is authoritative, so drain the oldest eligible
+    // pending through the guarded first-match fallback and let the
+    // normal try/finally path release the ticket and process output.
+    const childRecord = deps.backgroundJobBoard.get(identityTaskID);
+    const childAgent =
+      childRecord && childRecord.parentSessionID === input.sessionID
+        ? childRecord.agent
+        : undefined;
+    pending = deps.pendingCallTracker.takeUnresolvedFirstMatch(
+      input.sessionID,
+      {
+        identityTaskID,
+        agentType: childAgent,
+        ownerBoard: deps.backgroundJobBoard,
+      },
+    );
+    if (pending) {
+      log(
+        '[task-session-manager] unresolvable no-ID take; consuming first-match pending (drain fallback)',
+        {
+          taskID: identityTaskID,
+          callID: pending.callId,
+          consumedAgent: pending.agentType,
+        },
+      );
+    }
+  }
   log('[task-session-manager] tool.execute.after task', {
     callID: input.callID,
     sessionID: input.sessionID,
@@ -353,10 +494,9 @@ export async function handleToolExecuteAfter(
     if (typeof output.output !== 'string') return;
     if (pending.earlyRegistrationRejected) {
       log(
-        '[task-session-manager] ignored task output after fenced early registration',
+        '[task-session-manager] task output previously fenced; re-evaluating registration against board state',
         { callID: pending.callId },
       );
-      return;
     }
 
     const launch = parseTaskLaunchOutput(output.output);
@@ -400,7 +540,6 @@ export async function handleToolExecuteAfter(
       deps.clearRehydrateTombstone?.(status.taskID);
       normalizeLateCancelledTaskOutput(output, deps.backgroundJobBoard);
       if (exactCallConfirmed) deps.backgroundJobSupervisor?.onLaunch(record);
-
       if (
         status.state === 'completed' &&
         status.result &&
@@ -432,22 +571,21 @@ export async function handleToolExecuteAfter(
         }
       }
 
-      const guarded = guardCompletedStatusText(
-        status.state,
-        status.result,
-        record.resultSummary,
-      );
-      const updated = deps.backgroundJobBoard.updateStatus({
-        taskID: status.taskID,
-        state: guarded.state,
-        expectedGeneration: record.generation,
-        timedOut: status.timedOut,
-        resultSummary: guarded.resultSummary,
-        lastStatusError: guarded.lastStatusError,
+      await deps.terminalGate.reconcile(record, {
+        kind: 'output',
+        status,
+        origin: {
+          kind: 'native',
+          run: record,
+          callID: pending.callId,
+          callIDConfirmed: exactCallConfirmed,
+        },
       });
-      if (updated?.state !== 'running') {
-        deps.releaseConcurrencyTask?.(status.taskID);
-      }
+      // The synchronous terminal listener owns release and context settlement.
+      // The returned publication may already have been withdrawn while awaiting.
+      const current = deps.backgroundJobBoard.get(status.taskID);
+      const updated =
+        current?.generation === record.generation ? current : undefined;
       log('[task-session-manager] foreground task status registered', {
         taskID: status.taskID,
         alias: updated?.alias ?? record.alias,
@@ -455,17 +593,28 @@ export async function handleToolExecuteAfter(
         agent: pending.agentType,
         state: updated?.state ?? record.state,
       });
-      deps.taskContextTracker.pendingManagedTaskIds.delete(status.taskID);
-      deps.backgroundJobBoard.addContext(
-        status.taskID,
-        deps.taskContextTracker.contextFilesForPrompt(status.taskID),
-      );
-      deps.taskContextTracker.prune(deps.backgroundJobBoard);
       return;
     }
 
     const taskId = parseTaskIdFromTaskOutput(output.output);
     if (!taskId) {
+      // Host-output-drift detector: the task tool's terminal output no
+      // longer carries a parsable task id. The preview shows what the
+      // host actually returned so format drift is diagnosable from the
+      // plugin log (board-injection has its own textPreview for
+      // synthetic parts — this one covers the native tool result path).
+      // Structure-preserving VALUE masking (maskTaskOutputStructure):
+      // parse-miss content is untrusted-by-format, so tag/field names
+      // survive for drift diagnosis but every value is fully hidden as
+      // [masked] — description fields carry orchestrator/user-authored
+      // text. The full string is masked BEFORE slicing (a straddling
+      // secret cannot leak a raw prefix); the logger-level redaction
+      // remains the backstop for every other log site.
+      log('[task-session-manager] task output without a task id', {
+        callID: pending.callId,
+        sessionID: input.sessionID,
+        outputPreview: maskTaskOutputStructure(output.output).slice(0, 140),
+      });
       if (
         pending.resumedTaskId &&
         isMissingRememberedSessionError(output.output)
@@ -530,9 +679,7 @@ function registerTaskOutputLaunch(
   if (resumed && pending.resumedTaskId !== taskID) return undefined;
 
   const existing = deps.backgroundJobBoard.get(taskID);
-  const earlyRegistrationGeneration =
-    pending.earlyRegistration?.generation ??
-    earlyRegistrationGenerations.get(pending);
+  const earlyRegistrationGeneration = pending.earlyRegistration?.generation;
   if (
     pending.earlyRegisteredTaskID === taskID &&
     earlyRegistrationGeneration !== undefined &&
@@ -560,15 +707,47 @@ function registerTaskOutputLaunch(
     );
     return undefined;
   }
-  if (pending.earlyRegisteredTaskID && !existing) return undefined;
+  if (
+    pending.earlyRegisteredTaskID &&
+    pending.earlyRegisteredTaskID !== taskID &&
+    !existing
+  ) {
+    // The pending was cross-marked by another child's session.created
+    // (parallel same-agent launches). The taskID parsed from THIS call's
+    // own output is authoritative — register it instead of dropping.
+    log(
+      '[task-session-manager] registering authoritative task ID despite cross-marked pending',
+      {
+        taskID,
+        crossMarkedTaskID: pending.earlyRegisteredTaskID,
+        callID: pending.callId,
+      },
+    );
+  }
+
+  if (pending.identityUnresolved) {
+    log(
+      '[task-session-manager] registered authoritative task ID with generic metadata (identity unresolved)',
+      { taskID, callID: pending.callId },
+    );
+  }
 
   try {
     return deps.backgroundJobBoard.registerLaunch({
       taskID,
       parentSessionID: pending.parentSessionId,
       agent: pending.agentType,
-      description: pending.label,
-      objective: pending.fullObjective ?? pending.label,
+      // Identity was unresolved (no-ID drain or window-shifted take):
+      // the label/objective may belong to a sibling call, so never
+      // paint them. Existing placeholder records keep their honest
+      // description; fresh records fall back to registerLaunch's
+      // generic default.
+      ...(pending.identityUnresolved
+        ? {}
+        : {
+            description: pending.label,
+            objective: pending.fullObjective ?? pending.label,
+          }),
       background: exactCallConfirmed && pending.background,
       preserveRun:
         pending.earlyRegisteredTaskID === taskID ||

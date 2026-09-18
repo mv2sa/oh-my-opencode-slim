@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { parseTaskStatusOutput } from '../utils';
-import { BackgroundJobBoard } from '../utils/background-job-board';
+import { BackgroundJobBoard } from '../utils/background-job-fixture';
 import { createCancelTaskTool } from './cancel-task';
 
 let mockClient: Record<string, unknown>;
@@ -13,6 +13,9 @@ function createTool(overrides?: {
   abort?: () => Promise<unknown>;
   status?: () => Promise<unknown>;
   shouldManageSession?: (sessionID: string) => boolean;
+  verifyAbortMs?: number;
+  abortRetryIntervalMs?: number;
+  stableStoppedMs?: number;
 }) {
   const board = new BackgroundJobBoard();
   const abort = mock(overrides?.abort ?? (async () => ({})));
@@ -27,9 +30,9 @@ function createTool(overrides?: {
     input: { directory: '/test/project' } as any,
     backgroundJobBoard: board,
     shouldManageSession: overrides?.shouldManageSession ?? (() => true),
-    verifyAbortMs: 10,
-    abortRetryIntervalMs: 0,
-    stableStoppedMs: 0,
+    verifyAbortMs: overrides?.verifyAbortMs ?? 10,
+    abortRetryIntervalMs: overrides?.abortRetryIntervalMs ?? 0,
+    stableStoppedMs: overrides?.stableStoppedMs ?? 0,
   });
   return { board, abort, status, deleteSession, taskCancel: tools.task_cancel };
 }
@@ -63,6 +66,157 @@ describe('task_cancel tool', () => {
     expect(board.get('ses_1')).toMatchObject({
       state: 'cancelled',
       terminalUnreconciled: true,
+    });
+  });
+
+  test('verifies quiescence via host session info when the status map is unavailable (v2)', async () => {
+    // v2 hosts expose no session.status map; the old verify loop polled a
+    // source that can never answer 'idle' and always threw "did not stay
+    // stopped" — even after a confirmed abort. Verification must fall back
+    // to the host session info (terminal outcome / fresh idle timestamp).
+    const board = new BackgroundJobBoard();
+    const abort = mock(async () => ({}));
+    const getSession = mock(async () => ({
+      data: { outcome: 'interrupted', time: { idle: Date.now() } },
+    }));
+    mockClient = {
+      session: { abort, get: getSession, delete: mock(async () => ({})) },
+    };
+    const tools = createCancelTaskTool({
+      input: { directory: '/test/project' } as any,
+      backgroundJobBoard: board,
+      shouldManageSession: () => true,
+      verifyAbortMs: 10,
+      abortRetryIntervalMs: 0,
+      stableStoppedMs: 0,
+    });
+    board.registerLaunch({
+      taskID: 'ses_1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+    });
+
+    const output = await tools.task_cancel.execute(
+      { task_id: 'ses_1', reason: 'obsolete' },
+      context,
+    );
+
+    expect(abort).toHaveBeenCalledWith({ path: { id: 'ses_1' } });
+    expect(getSession).toHaveBeenCalled();
+    expect(parseTaskStatusOutput(String(output))).toMatchObject({
+      taskID: 'ses_1',
+      state: 'cancelled',
+    });
+  });
+
+  test('an unrecognized outcome string needs idle evidence to confirm cancellation (v2)', async () => {
+    // P2 review on #1161: only the known terminal outcomes (succeeded/
+    // failed/interrupted) confirm quiescence on their own. A malformed or
+    // future nonterminal value must fall through to the idle-timestamp
+    // evidence instead of blindly confirming the cancel.
+    const run = async (idleAt: number | undefined) => {
+      const board = new BackgroundJobBoard();
+      const abort = mock(async () => ({}));
+      const getSession = mock(async () => ({
+        data: { outcome: 'some-new-nonterminal-value', time: { idle: idleAt } },
+      }));
+      mockClient = {
+        session: { abort, get: getSession, delete: mock(async () => ({})) },
+      };
+      const tools = createCancelTaskTool({
+        input: { directory: '/test/project' } as any,
+        backgroundJobBoard: board,
+        shouldManageSession: () => true,
+        verifyAbortMs: 10,
+        abortRetryIntervalMs: 0,
+        stableStoppedMs: 0,
+      });
+      board.registerLaunch({
+        taskID: 'ses_1',
+        parentSessionID: 'parent-1',
+        agent: 'explorer',
+      });
+      return tools.task_cancel.execute(
+        { task_id: 'ses_1', reason: 'obsolete' },
+        context,
+      );
+    };
+
+    // Fresh idle timestamp (at/after abort) → confirmed via idle evidence.
+    const confirmed = await run(Date.now() + 5_000);
+    expect(parseTaskStatusOutput(String(confirmed))).toMatchObject({
+      taskID: 'ses_1',
+      state: 'cancelled',
+    });
+
+    // Stale idle timestamp → cannot verify → the cancel surfaces the
+    // uncertain-running result instead of confirming.
+    const unverified = await run(Date.now() - 60_000);
+    expect(parseTaskStatusOutput(String(unverified))).toMatchObject({
+      taskID: 'ses_1',
+      state: 'running',
+    });
+  });
+
+  test('a valid status map without an entry confirms quiescence after abort (activity-map contract)', async () => {
+    // False-stop incident follow-up: the host's status map REMOVES a
+    // session's entry when it goes idle, so "map received correctly, no
+    // entry for this session" is quiescence evidence — the old verify
+    // loop threw "did not stay stopped: unknown" on it.
+    const { board, taskCancel } = createTool({
+      status: async () => ({ data: {} }), // valid map, no ses_1 entry
+    });
+    board.registerLaunch({
+      taskID: 'ses_1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+    });
+
+    const output = await taskCancel.execute(
+      { task_id: 'ses_1', reason: 'obsolete' },
+      context,
+    );
+
+    expect(parseTaskStatusOutput(String(output))).toMatchObject({
+      taskID: 'ses_1',
+      state: 'cancelled',
+    });
+  });
+
+  test('busy between absences restarts the quiescence stability window', async () => {
+    // Deterministic reset proof: alternating
+    // absence/busy lookups never let the stability window mature —
+    // without the reset, the stale quiet timestamp from the FIRST
+    // absence would confirm once verifyAbortMs elapses. With the reset,
+    // every busy observation restarts the window and the cancel ends
+    // uncertain-running instead of falsely cancelled.
+    let lookups = 0;
+    const { board, taskCancel } = createTool({
+      verifyAbortMs: 150,
+      abortRetryIntervalMs: 0,
+      stableStoppedMs: 60,
+      status: async () => {
+        lookups += 1;
+        return lookups % 2 === 0
+          ? { data: { ses_1: { type: 'busy' } } }
+          : { data: {} };
+      },
+    });
+    board.registerLaunch({
+      taskID: 'ses_1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+    });
+
+    const output = await taskCancel.execute(
+      { task_id: 'ses_1', reason: 'obsolete' },
+      context,
+    );
+
+    expect(String(output)).toContain('state: running');
+    expect(board.get('ses_1')).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
     });
   });
 

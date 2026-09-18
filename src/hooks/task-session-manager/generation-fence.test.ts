@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'bun:test';
-import { BackgroundJobBoard } from '../../utils';
+import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import { createTaskSessionManagerHook } from './index';
 
 const PARENT_SESSION_ID = 'parent-generation-fence';

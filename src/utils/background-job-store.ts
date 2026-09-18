@@ -4,10 +4,19 @@ import type {
   BackgroundJobPromptMetadata,
   BackgroundJobRecord,
   BackgroundJobStatusInput,
+  BackgroundJobTerminalInput,
   ContextFile,
   WallClockTimeoutClaimInput,
-  WallClockTimeoutFinalizeInput,
 } from './background-job-board';
+import type {
+  BackgroundJobTerminalGate,
+  TerminalCommitToken,
+} from './background-job-terminal-gate';
+import {
+  clearSuppression as clearSuppressionPersisted,
+  persistedBackgroundJobState,
+  recordSuppression as recordSuppressionPersisted,
+} from './background-job-persistence';
 
 export type BackgroundJobSyntheticTerminalOccurrencePhase =
   | 'observed'
@@ -73,6 +82,30 @@ function backingStore(store: BackgroundJobStore): object {
   return store as object;
 }
 
+/**
+ * Seed a freshly created ledger from backend-loaded persistence state.
+ * No-op without a configured storage backend (v1 / hosts without the
+ * domain) — fresh ledgers then stay exactly as process-local as before.
+ */
+function seedFromPersistence(ledger: BackgroundJobLifecycleLedger): void {
+  const snapshot = persistedBackgroundJobState();
+  if (snapshot.tombstones.size === 0 && snapshot.deletionEpochs.size === 0) {
+    return;
+  }
+  for (const [taskID, record] of snapshot.tombstones) {
+    ledger.tombstones.add(taskID);
+    ledger.deletionEpochs.set(taskID, record.epoch);
+  }
+  for (const [taskID, epoch] of snapshot.deletionEpochs) {
+    if (!ledger.deletionEpochs.has(taskID)) {
+      ledger.deletionEpochs.set(taskID, epoch);
+    }
+  }
+  if (snapshot.nextEpoch > ledger.nextEpoch) {
+    ledger.nextEpoch = snapshot.nextEpoch;
+  }
+}
+
 export function getBackgroundJobLifecycleLedger(
   store: BackgroundJobStore,
 ): BackgroundJobLifecycleLedger {
@@ -90,11 +123,15 @@ export function getBackgroundJobLifecycleLedger(
     processedInjectedCompletionOrder: [],
     nextEpoch: 0,
   };
+  seedFromPersistence(ledger);
   lifecycleLedgers.set(key, ledger);
   return ledger;
 }
 
-/** Record a task drop/eviction as a rehydrate and late-output tombstone. */
+/** Record a task drop/eviction as a rehydrate and late-output tombstone.
+ * Write-through: the persisted tombstone (and its deletion epoch) is
+ * updated together with the in-memory ledger so the two can never
+ * diverge across a restart. */
 export function recordBackgroundJobSuppression(
   store: BackgroundJobStore,
   taskID: string,
@@ -102,15 +139,22 @@ export function recordBackgroundJobSuppression(
   const ledger = getBackgroundJobLifecycleLedger(store);
   if (ledger.tombstones.has(taskID)) return;
   ledger.tombstones.add(taskID);
-  ledger.deletionEpochs.set(taskID, ++ledger.nextEpoch);
+  const epoch = ++ledger.nextEpoch;
+  ledger.deletionEpochs.set(taskID, epoch);
+  recordSuppressionPersisted(taskID, epoch);
 }
 
-/** Clear only the active rehydrate tombstone for a proven new launch. */
+/** Clear only the active rehydrate tombstone for a proven new launch.
+ * Write-through: clearing on relaunch is load-bearing — a task deleted
+ * then legitimately relaunched must NOT be ghost-skipped after a
+ * restart. The deletion epoch intentionally survives (generation
+ * fencing), matching the in-memory ledger semantics. */
 export function clearBackgroundJobSuppression(
   store: BackgroundJobStore,
   taskID: string,
 ): void {
   getBackgroundJobLifecycleLedger(store).tombstones.delete(taskID);
+  clearSuppressionPersisted(taskID);
 }
 
 /**
@@ -137,30 +181,26 @@ export interface BackgroundJobStore {
   acquireTerminalNotificationLease(
     taskID: string,
     generation: number,
+    terminalRevision?: number,
   ): BackgroundJobLease | undefined;
   validateLease(lease: BackgroundJobLease): boolean;
   releaseLease(lease: BackgroundJobLease): boolean;
   updateStatus(
-    input: BackgroundJobStatusInput,
+    input: BackgroundJobStatusInput & { state: 'running' },
   ): BackgroundJobRecord | undefined;
-  updateFromStatusOutput(output: string): BackgroundJobRecord | undefined;
+  commitTerminal(
+    input: BackgroundJobTerminalInput,
+    token: TerminalCommitToken,
+  ): BackgroundJobRecord | undefined;
+  bindTerminalGate(gate: BackgroundJobTerminalGate): void;
   claimWallClockDeadline(
     input: WallClockTimeoutClaimInput,
-  ): BackgroundJobRecord | undefined;
-  finalizeWallClockTimeout(
-    input: WallClockTimeoutFinalizeInput,
   ): BackgroundJobRecord | undefined;
   markRunningFromLiveSession(
     taskID: string,
     now?: number,
     expectedGeneration?: number,
-  ): BackgroundJobRecord | undefined;
-  markStopped(
-    taskID: string,
-    resultSummary: string,
-    observedAt?: number,
-    expectedGeneration?: number,
-    now?: number,
+    observedTerminalRevision?: number,
   ): BackgroundJobRecord | undefined;
   noteStopConfirmation(
     taskID: string,
@@ -181,16 +221,11 @@ export interface BackgroundJobStore {
    * Acknowledge the terminal notification delivered to the parent session.
    * This is a prompt-lifecycle acknowledgement, not filesystem reconciliation.
    */
-  markReconciled(taskID: string, now?: number): BackgroundJobRecord | undefined;
-  markCancelled(
+  markReconciled(
     taskID: string,
-    reason?: string,
     now?: number,
-    options?: {
-      force?: boolean;
-      expectedGeneration?: number;
-      cancellationLease?: BackgroundJobLease;
-    },
+    expectedGeneration?: number,
+    expectedRevision?: number,
   ): BackgroundJobRecord | undefined;
   clearParent(parentSessionID: string): void;
   drop(taskID: string): void;
@@ -225,6 +260,8 @@ export interface BackgroundJobStore {
   ): BackgroundJobRecord | undefined;
   taskIDs(): Set<string>;
   list(parentSessionID?: string): BackgroundJobRecord[];
+  /** Cheap global check for any running job: single pass, no copy or sort. */
+  hasRunningJobs(): boolean;
   hasRunning(parentSessionID: string): boolean;
   hasTerminalUnreconciled(parentSessionID: string): boolean;
   hasConvergenceSignals(taskID: string, threshold?: number): boolean;

@@ -207,11 +207,19 @@ describe('install skill synchronization error mapping', () => {
     originalConsoleLog = console.log;
     logSpy = mock(() => {});
     console.log = logSpy;
+    Object.defineProperty(process.stdin, 'isTTY', {
+      configurable: true,
+      value: false,
+    });
   });
 
   afterEach(() => {
     enableInstallMocks = false;
     console.log = originalConsoleLog;
+    Object.defineProperty(process.stdin, 'isTTY', {
+      configurable: true,
+      value: ORIGINAL_STDIN_IS_TTY,
+    });
   });
 
   test('maps __lock__ to lock acquisition failure', async () => {

@@ -27,7 +27,7 @@
  */
 import { describe, expect, mock, test } from 'bun:test';
 import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from '../../config/constants';
-import { BackgroundJobBoard } from '../../utils';
+import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import {
   BACKGROUND_JOB_BOARD_METADATA_KEY,
   createTaskSessionManagerHook,

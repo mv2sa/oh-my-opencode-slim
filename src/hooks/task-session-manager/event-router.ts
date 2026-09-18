@@ -25,6 +25,36 @@ import type { RevivedRunTracker } from './revived-run-tracker';
 
 type BackgroundJobRecord = NonNullable<ReturnType<BackgroundJobStore['get']>>;
 
+/**
+ * Extract a human-readable message from a serialized session error.
+ *
+ * The core publishes session errors through NamedError.toObject(), whose
+ * wire shape is `{ name: string; data: ... }` — the message lives in
+ * `data.message` (APIError, ProviderAuthError, ...), not at the top
+ * level. Reading only `error.message` yields undefined for every
+ * serialized NamedError and the board fell back to the generic
+ * "Session error" even when the detail existed two levels down (#1200
+ * diagnostics). Plain `{ message }` shapes are still honored for
+ * non-NamedError payloads.
+ */
+function structuredErrorMessage(error: unknown): string | undefined {
+  if (!isRecordLike(error)) return undefined;
+  const data = error.data;
+  if (isRecordLike(data)) {
+    const inner = data.message;
+    // Whitespace-only strings must not bypass the generic fallback
+    // (an empty board summary is worse than "Session error").
+    if (typeof inner === 'string' && inner.trim().length > 0) return inner;
+  }
+  const direct = error.message;
+  if (typeof direct === 'string' && direct.trim().length > 0) return direct;
+  return undefined;
+}
+
+function isRecordLike(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
 interface SessionEventGenerationFence {
   generation: number;
   /** A new generation must see a live activity fence before lifecycle events. */
@@ -205,6 +235,7 @@ export async function handleEvent(
           id?: string;
           parentID?: string;
           agent?: string;
+          title?: string;
           generation?: number;
           activityAt?: number;
           timestamp?: number;
@@ -258,11 +289,7 @@ export async function handleEvent(
         sessionID: string,
         idleObservedAt: number,
         observedGeneration: number,
-      ): void;
-      scheduleErrorTerminalize(
-        sessionID: string,
-        idleObservedAt: number,
-        observedGeneration: number,
+        error?: string,
       ): void;
       clearIdleTimers(sessionID: string): void;
       clearAllTimers(): string[];
@@ -270,10 +297,12 @@ export async function handleEvent(
     /** Sessions with a deferred inline 401/410 awaiting fallback outcome. */
     deferredInlineErrors: Set<string>;
     backgroundJobBoard: BackgroundJobStore;
+    terminalGate: import('../../utils/background-job-terminal-gate').BackgroundJobTerminalGate;
     pendingCallTracker: {
       peekByParentAndAgent(
         parentSessionID: string,
         agentHint?: string,
+        title?: string,
       ): PendingTaskCall | undefined;
       clearSession(sessionID: string): void;
       clearAll?(): void;
@@ -336,12 +365,17 @@ export async function handleEvent(
       const pending = deps.pendingCallTracker.peekByParentAndAgent(
         info.parentID,
         info.agent,
+        typeof info.title === 'string' ? info.title : undefined,
       );
       if (pending && !pending.resumedTaskId && !pending.earlyRegisteredTaskID) {
         if (deps.backgroundJobBoard.get(info.id)) {
-          pending.earlyRegistrationRejected = true;
+          // The child is already registered — its own tool.execute.after
+          // won the race. Fencing the peeked pending here punished an
+          // unrelated call and caused its later output to be dropped
+          // (incident 2026-09-12); the existing board record already
+          // prevents double registration.
           log(
-            '[task-session-manager] refused early registration for an existing task ID',
+            '[task-session-manager] skipped early registration for an already-registered task ID',
             { taskID: info.id, parentSessionID: info.parentID },
           );
         } else {
@@ -385,6 +419,45 @@ export async function handleEvent(
               },
             );
           }
+        }
+      }
+
+      if (!pending && !deps.backgroundJobBoard.get(info.id)) {
+        // No pending call can be attributed to this child (ambiguous
+        // parallel launches, or the owning pending was consumed).
+        // Register a placeholder so task_status/task_result always
+        // resolve it; the matching tool.execute.after corrects the
+        // description via registerLaunch's existing-record update path
+        // when it fires.
+        const agent =
+          typeof info.agent === 'string' && info.agent ? info.agent : 'unknown';
+        try {
+          const record = deps.backgroundJobBoard.registerLaunch({
+            taskID: info.id,
+            parentSessionID: info.parentID,
+            agent,
+            description: `unattributed ${agent} task`,
+            objective: `unattributed ${agent} task`,
+            background: false,
+          });
+          log(
+            '[task-session-manager] placeholder board registration for unattributed child session',
+            {
+              taskID: record.taskID,
+              alias: record.alias,
+              parentSessionID: info.parentID,
+              agent,
+            },
+          );
+        } catch (error) {
+          log(
+            '[task-session-manager] refused placeholder registration for child session',
+            {
+              taskID: info.id,
+              parentSessionID: info.parentID,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
         }
       }
     }
@@ -433,18 +506,35 @@ export async function handleEvent(
       : undefined;
     if (observation?.stale || observation?.activityFenceOnly) return;
     const job = observation?.job;
-    log('[task-session-manager] idle/status idle observed', {
-      sessionID: sessionId,
-      managesSession: sessionId
-        ? deps.options.shouldManageSession(sessionId)
-        : false,
-      terminalJobsPending: sessionId
-        ? (deps.terminalJobsInjectedByParent.get(sessionId)?.executions.size ??
-            0) +
-          (deps.pendingInjectedTerminalJobsByParent.get(sessionId)?.size ?? 0)
-        : 0,
-      runningJobForSession: job?.state === 'running' || false,
-    });
+    const runningJobForSession = job?.state === 'running' || false;
+    // Warn elevation: a tracked managed child (session.created-observed,
+    // not yet settled by its terminal output) reporting idle while the
+    // board holds no running record for it is the host/board drift
+    // signature — without the warn prefix these hid inside the routine
+    // idle log line. The logger is single-level text, so the severity
+    // rides the `[task-session-manager] WARN:` prefix (same convention
+    // as the `[plugin] WARN:` lines in src/index.ts).
+    const trackedManagedChildWithoutJob =
+      sessionId !== undefined &&
+      !runningJobForSession &&
+      deps.taskContextTracker.pendingManagedTaskIds.has(sessionId);
+    log(
+      trackedManagedChildWithoutJob
+        ? '[task-session-manager] WARN: idle observed for tracked managed child with no running board record'
+        : '[task-session-manager] idle/status idle observed',
+      {
+        sessionID: sessionId,
+        managesSession: sessionId
+          ? deps.options.shouldManageSession(sessionId)
+          : false,
+        terminalJobsPending: sessionId
+          ? (deps.terminalJobsInjectedByParent.get(sessionId)?.executions
+              .size ?? 0) +
+            (deps.pendingInjectedTerminalJobsByParent.get(sessionId)?.size ?? 0)
+          : 0,
+        runningJobForSession,
+      },
+    );
     if (sessionId && deps.options.shouldManageSession(sessionId)) {
       deps.idleReconciler.scheduleIdleReconciliation(sessionId);
     }
@@ -458,10 +548,11 @@ export async function handleEvent(
         // A persistent 401/410 was deferred for fallback recovery but the
         // session ended without one: terminalize as error instead of the
         // false completion the child-idle path would record.
-        deps.idleReconciler.scheduleErrorTerminalize(
+        deps.idleReconciler.scheduleChildIdleReconciliation(
           sessionId,
           observedAt,
           job.generation,
+          'Session error after failed model fallback (auth/model unavailable)',
         );
       } else {
         deps.idleReconciler.scheduleChildIdleReconciliation(
@@ -537,15 +628,10 @@ export async function handleEvent(
           ) {
             return;
           }
-          const updated = deps.backgroundJobBoard.updateStatus({
-            taskID: sessionId,
-            state: 'error',
-            expectedGeneration: observation?.generation,
-            resultSummary:
-              (props?.error as { message?: string } | undefined)?.message ??
-              'Session error',
+          await deps.terminalGate.reconcile(job, {
+            kind: 'session-error',
+            message: structuredErrorMessage(props?.error) ?? 'Session error',
           });
-          if (updated) deps.revivedRunTracker?.onTerminal(updated);
         }
       } else if (isInlineFailoverError(props.error)) {
         // Recovery possible: defer. The idle backstop terminalizes this
@@ -577,15 +663,10 @@ export async function handleEvent(
         ) {
           return;
         }
-        const updated = deps.backgroundJobBoard.updateStatus({
-          taskID: sessionId,
-          state: 'error',
-          expectedGeneration: observation?.generation,
-          resultSummary:
-            (props?.error as { message?: string } | undefined)?.message ??
-            'Session error',
+        await deps.terminalGate.reconcile(job, {
+          kind: 'session-error',
+          message: structuredErrorMessage(props?.error) ?? 'Session error',
         });
-        if (updated) deps.revivedRunTracker?.onTerminal(updated);
       }
     }
 
@@ -598,7 +679,7 @@ export async function handleEvent(
     const statusType = (
       input.event.properties as { status?: { type?: string } } | undefined
     )?.status?.type;
-    if (statusType !== 'busy') {
+    if (statusType !== 'busy' && statusType !== 'retry') {
       if (sessionId) deps.idleSessionTokens.invalidate(sessionId);
       return;
     }
@@ -636,12 +717,25 @@ export async function handleEvent(
     const before = sessionId
       ? (observation?.job ?? deps.backgroundJobBoard.get(sessionId))
       : undefined;
+    const token = before ? deps.terminalGate.capture(before) : undefined;
+    const eventAt = eventActivityAt(input, Number.NaN);
+    if (before && token) {
+      const result = deps.terminalGate.observe(token, {
+        kind: statusType,
+        origin: 'session.status-event',
+        readStartedAt: token.readStartedAt,
+        observedAt: Number.isFinite(eventAt) ? eventAt : undefined,
+      });
+      // Deferred without recorded activity means the gate needs a contrast.
+      // A stale identity never gets upgraded into a request for the current run.
+      if (
+        result.kind === 'deferred' &&
+        result.record.activityRevision === before.activityRevision
+      )
+        await deps.terminalGate.reconcile(before);
+    }
     const updated = sessionId
-      ? deps.backgroundJobBoard.markRunningFromLiveSession(
-          sessionId,
-          observedAt,
-          observation?.generation,
-        )
+      ? deps.backgroundJobBoard.get(sessionId)
       : undefined;
     if (before?.cancellationRequested) {
       log('[task-session-manager] busy observed after cancel request', {

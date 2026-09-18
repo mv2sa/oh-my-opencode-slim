@@ -3,6 +3,8 @@
  * in-flight ownership. Shared across independently created hook instances in
  * the same JS process via globalThis + Symbol.for.
  */
+
+import { getGlobalStore } from '../../utils/global-store';
 import type { ContinuationModelSelection } from '../task-session-manager/continuation-model-selection';
 
 export type WakeProgressState = {
@@ -42,24 +44,21 @@ type WakeGateStore = {
   outcomeIdleWoken: Set<string>;
 };
 
-const STORE_KEY = Symbol.for('oh-my-opencode-slim.orchestrator-wake-gate');
+const STORE_KEY = 'oh-my-opencode-slim.orchestrator-wake-gate';
 const MAX_TRACKED_SESSIONS = 256;
 
 function getStore(): WakeGateStore {
-  const globalWithStore = globalThis as typeof globalThis & {
-    [STORE_KEY]?: WakeGateStore;
-  };
-  globalWithStore[STORE_KEY] ??= {
+  const store = getGlobalStore<WakeGateStore>(STORE_KEY, () => ({
     progress: new Map(),
     inFlight: new Map(),
     releaseWaiters: new Map(),
     order: [],
     restartRecovery: new Map(),
     outcomeIdleWoken: new Set(),
-  };
-  globalWithStore[STORE_KEY].restartRecovery ??= new Map();
-  globalWithStore[STORE_KEY].outcomeIdleWoken ??= new Set();
-  return globalWithStore[STORE_KEY];
+  }));
+  store.restartRecovery ??= new Map();
+  store.outcomeIdleWoken ??= new Set();
+  return store;
 }
 
 function touchOrder(sessionID: string): void {
@@ -208,7 +207,6 @@ export function commitWakeReservation(
   const progress = getWakeProgress(sessionID);
   if (progress.unchangedWakeCount >= 2 || progress.idlePrompted) return false;
   flight.wakeCommitted = true;
-  progress.idlePrompted = true;
   progress.unchangedWakeCount += 1;
   progress.expectingWakeBusy = true;
   if (progress.unchangedWakeCount >= 2) {
@@ -380,7 +378,11 @@ export function commitOutcomeIdleWake(
   sessionID: string,
   owner: symbol,
 ): boolean {
-  return commitWakeReservation(sessionID, owner);
+  const progress = getWakeProgress(sessionID);
+  if (progress.idlePrompted) return false;
+  if (!commitWakeReservation(sessionID, owner)) return false;
+  progress.idlePrompted = true;
+  return true;
 }
 
 export function canAttemptRestartRecovery(sessionID: string): boolean {

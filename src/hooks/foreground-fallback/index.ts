@@ -18,6 +18,8 @@
  */
 
 import type { PluginInput } from '@opencode-ai/plugin';
+import { responseError } from '../../utils/child-transcript';
+import { isRecord } from '../../utils/guards';
 import { createInternalAgentTextPart } from '../../utils/internal-initiator';
 import { log } from '../../utils/logger';
 import { getClient } from '../../utils/opencode-client';
@@ -249,14 +251,6 @@ export function isFailoverError(error: unknown): boolean {
   return hasFailoverReason;
 }
 
-/**
- * Checks whether an error is a transient/retryable error (rate-limit,
- * 403/Forbidden, etc.) that should trigger model fallback.
- */
-export function isRetryableError(error: unknown): boolean {
-  return isFailoverError(error);
-}
-
 const INLINE_STATUS_CODES = new Set([401, 410]);
 
 /**
@@ -313,6 +307,16 @@ const FALLBACK_IN_PROGRESS_KEY = Symbol.for(
   'oh-my-opencode-slim.foreground-fallback.in-progress',
 );
 
+/** Error name stamped by the v2 client shim's promptAsync when the host
+ * provides no session.switchModel while the replay declared
+ * `modelSwitch: 'required'`. Duck-typed by name (mirroring the hostFlavor
+ * convention) so this v1 hook stays decoupled from the v2 adapter module. */
+const V2_SWITCH_MODEL_UNAVAILABLE_ERROR = 'V2SwitchModelUnavailableError';
+
+function isSwitchModelUnavailableError(err: unknown): err is Error {
+  return err instanceof Error && err.name === V2_SWITCH_MODEL_UNAVAILABLE_ERROR;
+}
+
 function getProcessFallbacksInProgress(): Set<string> {
   const globalWithStore = globalThis as typeof globalThis & {
     [FALLBACK_IN_PROGRESS_KEY]?: Set<string>;
@@ -360,9 +364,22 @@ export class ForegroundFallbackManager {
    *  when the model has changed, allowing the cascade to continue when a
    *  new fallback model also fails within the dedup window. */
   private readonly lastTriggerModel = new Map<string, string>();
-  /** sessionID → consecutive 429 count for the current model.
+  /** sessionID -> consecutive 429 count for the current model.
    *  Reset on model swap or session deletion. */
   private readonly sessionRetries = new Map<string, number>();
+  /** sessionID -> pending initial delay timeout handle.
+   *  Cleared on recovery or session deletion. */
+  private readonly pendingInitialDelay = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+  /** sessionID -> timestamp of last fallback attempt.
+   *  Used to enforce retryDelayMs between consecutive attempts. */
+  private readonly lastFallbackTime = new Map<string, number>();
+  /** Delay before first fallback; gives intercepting plugins time to recover. */
+  private readonly initialRetryDelayMs: number;
+  /** Delay between consecutive fallback attempts. */
+  private readonly retryDelayMs: number;
   /** sessionID → chain-exhaustion stage:
    *   0 = not exhausted; 1 = chain exhausted once, reset to sticky fallback
    *   (one retry chance); 2 = exhausted again, aborted — stop intervening.
@@ -379,6 +396,37 @@ export class ForegroundFallbackManager {
   /** Identifies task-owned sessions whose synthetic quota recovery is managed
    *  by the task-session-manager rather than the foreground event path. */
   private readonly isTaskSession: TaskSessionPredicate | undefined;
+  /** sessionID + transcript baseline + the board generation captured
+   *  BEFORE the admission await, notified when a fallback re-prompt was
+   *  admitted for a background child. The host's native task notifier is
+   *  bound to the original background job and does not re-arm for the
+   *  re-prompted execution, so without this transfer nobody observes the
+   *  substituted run's transcript — the quiescent stop-confirmation then
+   *  publishes a false `stopped` even though the fallback's final answer
+   *  is already persisted (false-stop incident). The pre-await generation
+   *  fences relaunches: a generation change during the admission must not
+   *  enroll the new run under the stale attempt's baseline. */
+  private readonly backgroundFallbackHandoff?: {
+    prepare: (
+      sessionID: string,
+      preparedGeneration: number | undefined,
+      baselineMessageID: string | undefined,
+    ) => boolean;
+    admit: (sessionID: string, preparedGeneration: number | undefined) => void;
+    reject: (sessionID: string, preparedGeneration: number | undefined) => void;
+    settleUnresolved: (
+      sessionID: string,
+      preparedGeneration: number | undefined,
+    ) => void;
+  };
+  /** Synchronous board read returning the tracked generation for a
+   *  confirmed BACKGROUND child only — undefined for foreground or
+   *  unmanaged sessions (that undefined means "handoff not
+   *  applicable", never a wildcard). Captured before ANY await in the
+   *  fallback preparation. */
+  private readonly readBackgroundGeneration?: (
+    sessionID: string,
+  ) => number | undefined;
 
   /** Exposed for task-session-manager: prevents idle reconciliation
    *  while a fallback abort/re-prompt is in flight for this session. */
@@ -607,63 +655,146 @@ export class ForegroundFallbackManager {
     /** Consecutive 429s tolerated on the same model before swap/abort. */
     private readonly maxRetries: number = 3,
     coordinator?: SessionLifecycle,
-    cooldownRegistryOrOnSessionModelChanged:
+    onSessionModelChangedOrCooldownRegistry?:
+      | SessionModelChangedCallback
+      | CooldownRegistry,
+    initialRetryDelayMsOrCooldownRegistryOrModelVariants?:
+      | number
       | CooldownRegistry
-      | SessionModelChangedCallback = getCooldownRegistry(),
-    cooldownRegistryOrModelVariants?: CooldownRegistry | ModelVariants,
-    modelVariantsOrIsTaskSession?: ModelVariants | TaskSessionPredicate,
-    isTaskSessionOrOnSessionModelChanged?:
+      | ModelVariants,
+    retryDelayMsOrModelVariantsOrIsTaskSession?:
+      | number
+      | ModelVariants
+      | TaskSessionPredicate,
+    backgroundFallbackHandoffOrTaskSessionPredicateOrCallback?:
+      | {
+          prepare: (
+            sessionID: string,
+            preparedGeneration: number | undefined,
+            baselineMessageID: string | undefined,
+          ) => boolean;
+          admit: (
+            sessionID: string,
+            preparedGeneration: number | undefined,
+          ) => void;
+          reject: (
+            sessionID: string,
+            preparedGeneration: number | undefined,
+          ) => void;
+          settleUnresolved: (
+            sessionID: string,
+            preparedGeneration: number | undefined,
+          ) => void;
+        }
       | TaskSessionPredicate
       | SessionModelChangedCallback,
+    readBackgroundGeneration?: (sessionID: string) => number | undefined,
+    cooldownRegistryParam?: CooldownRegistry,
+    modelVariantsParam?: ModelVariants,
+    isTaskSessionParam?: TaskSessionPredicate,
   ) {
-    // Keep both constructor shapes valid across the merge: upstream supplies
-    // the admission callback in slot 6, while the fork already used that slot
-    // for its cooldown registry. The merged production path then supplies the
-    // fork's registry, variants, and task-session predicate after the callback.
+    let initialRetryDelayMs = 0;
+    let retryDelayMs = 500;
+    let backgroundFallbackHandoff:
+      | {
+          prepare: (
+            sessionID: string,
+            preparedGeneration: number | undefined,
+            baselineMessageID: string | undefined,
+          ) => boolean;
+          admit: (
+            sessionID: string,
+            preparedGeneration: number | undefined,
+          ) => void;
+          reject: (
+            sessionID: string,
+            preparedGeneration: number | undefined,
+          ) => void;
+          settleUnresolved: (
+            sessionID: string,
+            preparedGeneration: number | undefined,
+          ) => void;
+        }
+      | undefined;
+    let readBgGen: ((sessionID: string) => number | undefined) | undefined =
+      readBackgroundGeneration;
     let cooldownRegistry = getCooldownRegistry();
     let modelVariants: ModelVariants = {};
     let taskSessionPredicate: TaskSessionPredicate | undefined;
     let onSessionModelChanged: SessionModelChangedCallback | undefined;
 
-    if (typeof cooldownRegistryOrOnSessionModelChanged === 'function') {
-      onSessionModelChanged = cooldownRegistryOrOnSessionModelChanged;
-      if (isCooldownRegistry(cooldownRegistryOrModelVariants)) {
-        cooldownRegistry = cooldownRegistryOrModelVariants;
-        if (typeof modelVariantsOrIsTaskSession === 'function') {
-          taskSessionPredicate = modelVariantsOrIsTaskSession;
-        } else {
-          modelVariants = modelVariantsOrIsTaskSession ?? {};
-          taskSessionPredicate = isTaskSessionOrOnSessionModelChanged as
-            | TaskSessionPredicate
-            | undefined;
-        }
-      } else {
-        modelVariants = cooldownRegistryOrModelVariants ?? {};
-        taskSessionPredicate =
-          typeof modelVariantsOrIsTaskSession === 'function'
-            ? modelVariantsOrIsTaskSession
-            : (isTaskSessionOrOnSessionModelChanged as
-                | TaskSessionPredicate
-                | undefined);
-      }
-    } else {
-      cooldownRegistry = cooldownRegistryOrOnSessionModelChanged;
-      if (!isCooldownRegistry(cooldownRegistryOrModelVariants)) {
-        modelVariants = cooldownRegistryOrModelVariants ?? {};
-      }
-      taskSessionPredicate =
-        typeof modelVariantsOrIsTaskSession === 'function'
-          ? modelVariantsOrIsTaskSession
-          : undefined;
-      onSessionModelChanged = isTaskSessionOrOnSessionModelChanged as
-        | SessionModelChangedCallback
-        | undefined;
+    if (typeof onSessionModelChangedOrCooldownRegistry === 'function') {
+      onSessionModelChanged = onSessionModelChangedOrCooldownRegistry;
+    } else if (isCooldownRegistry(onSessionModelChangedOrCooldownRegistry)) {
+      cooldownRegistry = onSessionModelChangedOrCooldownRegistry;
     }
 
+    if (
+      typeof initialRetryDelayMsOrCooldownRegistryOrModelVariants === 'number'
+    ) {
+      initialRetryDelayMs = initialRetryDelayMsOrCooldownRegistryOrModelVariants;
+    } else if (
+      isCooldownRegistry(initialRetryDelayMsOrCooldownRegistryOrModelVariants)
+    ) {
+      cooldownRegistry = initialRetryDelayMsOrCooldownRegistryOrModelVariants;
+    } else if (
+      initialRetryDelayMsOrCooldownRegistryOrModelVariants &&
+      typeof initialRetryDelayMsOrCooldownRegistryOrModelVariants === 'object'
+    ) {
+      modelVariants =
+        initialRetryDelayMsOrCooldownRegistryOrModelVariants as ModelVariants;
+    }
+
+    if (typeof retryDelayMsOrModelVariantsOrIsTaskSession === 'number') {
+      retryDelayMs = retryDelayMsOrModelVariantsOrIsTaskSession;
+    } else if (
+      typeof retryDelayMsOrModelVariantsOrIsTaskSession === 'function'
+    ) {
+      taskSessionPredicate =
+        retryDelayMsOrModelVariantsOrIsTaskSession as TaskSessionPredicate;
+    } else if (
+      retryDelayMsOrModelVariantsOrIsTaskSession &&
+      typeof retryDelayMsOrModelVariantsOrIsTaskSession === 'object'
+    ) {
+      modelVariants =
+        retryDelayMsOrModelVariantsOrIsTaskSession as ModelVariants;
+    }
+
+    if (backgroundFallbackHandoffOrTaskSessionPredicateOrCallback) {
+      if (
+        typeof backgroundFallbackHandoffOrTaskSessionPredicateOrCallback ===
+        'function'
+      ) {
+        taskSessionPredicate =
+          backgroundFallbackHandoffOrTaskSessionPredicateOrCallback as TaskSessionPredicate;
+      } else if (
+        typeof (
+          backgroundFallbackHandoffOrTaskSessionPredicateOrCallback as any
+        ).prepare === 'function'
+      ) {
+        backgroundFallbackHandoff =
+          backgroundFallbackHandoffOrTaskSessionPredicateOrCallback as any;
+      }
+    }
+
+    if (cooldownRegistryParam) {
+      cooldownRegistry = cooldownRegistryParam;
+    }
+    if (modelVariantsParam) {
+      modelVariants = modelVariantsParam;
+    }
+    if (isTaskSessionParam) {
+      taskSessionPredicate = isTaskSessionParam;
+    }
+
+    this.initialRetryDelayMs = initialRetryDelayMs;
+    this.retryDelayMs = retryDelayMs;
     this.cooldownRegistry = cooldownRegistry;
     this.modelVariants = modelVariants;
     this.isTaskSession = taskSessionPredicate;
     this.onSessionModelChanged = onSessionModelChanged;
+    this.backgroundFallbackHandoff = backgroundFallbackHandoff;
+    this.readBackgroundGeneration = readBgGen;
     if (coordinator) {
       coordinator.onSessionDeleted((id) => {
         this.sessionModel.delete(id);
@@ -679,6 +810,13 @@ export class ForegroundFallbackManager {
         this.lastTriggerModel.delete(id);
         this.sessionRetries.delete(id);
         this.chainExhaustion.delete(id);
+        this.lastFallbackTime.delete(id);
+        // Cancel any pending initial delay
+        const pendingDelay = this.pendingInitialDelay.get(id);
+        if (pendingDelay) {
+          clearTimeout(pendingDelay);
+          this.pendingInitialDelay.delete(id);
+        }
       });
     }
   }
@@ -855,6 +993,13 @@ export class ForegroundFallbackManager {
           // Only a completed, successful assistant response proves recovery.
           this.sessionRetries.delete(sessionID);
           this.chainExhaustion.delete(sessionID);
+          this.lastFallbackTime.delete(sessionID);
+          // Cancel any pending initial delay on recovery
+          const pendingDelay = this.pendingInitialDelay.get(sessionID);
+          if (pendingDelay) {
+            clearTimeout(pendingDelay);
+            this.pendingInitialDelay.delete(sessionID);
+          }
         }
         break;
       }
@@ -919,7 +1064,7 @@ export class ForegroundFallbackManager {
           }
           // Otherwise (attempt === 1, or model didn't change, or outside
           // dedup window): process as genuine retry for current model.
-          if (this.shouldTriggerFallback(sessionID)) {
+          if (this.shouldTriggerFallback(sessionID, true)) {
             // Failover may have been detected from status.message (e.g.
             // 'AI_APICallError: Gone') with no separate error property;
             // forward that message so 401/410 inline errors suppress the
@@ -994,9 +1139,37 @@ export class ForegroundFallbackManager {
 
   /** Intervene immediately on first occurrence (tried === 0), otherwise
    *  delegate to retry budget. Used by all three event paths. */
-  private shouldTriggerFallback(sessionID: string): boolean {
+  private shouldTriggerFallback(
+    sessionID: string,
+    needsAbort = false,
+  ): boolean {
     const tried = this.sessionRetries.get(sessionID) ?? 0;
-    if (tried === 0) return true;
+    if (tried === 0) {
+      if (this.initialRetryDelayMs > 0) {
+        // Don't set sessionRetries here - it would let subsequent errors
+        // consume the retry budget before the delay elapses.
+        log('[foreground-fallback] delaying initial fallback', {
+          sessionID,
+          delayMs: this.initialRetryDelayMs,
+          needsAbort,
+        });
+        // Cancel any existing pending delay for this session
+        const existing = this.pendingInitialDelay.get(sessionID);
+        if (existing) clearTimeout(existing);
+        const handle = setTimeout(() => {
+          this.pendingInitialDelay.delete(sessionID);
+          // Call tryFallbackWithAbort for session.status retry path
+          if (needsAbort) {
+            void this.tryFallbackWithAbort(sessionID);
+          } else {
+            void this.tryFallback(sessionID);
+          }
+        }, this.initialRetryDelayMs);
+        this.pendingInitialDelay.set(sessionID, handle);
+        return false;
+      }
+      return true;
+    }
     return this.consumeRetryBudget(sessionID);
   }
 
@@ -1043,7 +1216,7 @@ export class ForegroundFallbackManager {
   private async tryFallback(sessionID: string, error?: unknown): Promise<void> {
     if (!sessionID) return;
     if (this.inProgress.has(sessionID)) return;
-    // No chain → no fallback. Skip before dedup so we don't stamp lastTrigger
+    // No chain -> no fallback. Skip before dedup so we don't stamp lastTrigger
     // for sessions we will never re-prompt (e.g. councillor via CouncilManager).
     if (!this.hasFallbackChain(sessionID)) return;
 
@@ -1052,9 +1225,27 @@ export class ForegroundFallbackManager {
     // model's failure is a separate incident and the cascade should continue.
     if (this.isDeduped(sessionID)) return;
 
+    // Set inProgress before delay to prevent concurrent fallback attempts
     this.inProgress.add(sessionID);
     try {
+      // Delay between consecutive fallback attempts (except for the initial trigger
+      // which uses initialRetryDelayMs in shouldTriggerFallback).
+      const lastFallback = this.lastFallbackTime.get(sessionID);
+      if (lastFallback && this.retryDelayMs > 0) {
+        const elapsed = Date.now() - lastFallback;
+        if (elapsed < this.retryDelayMs) {
+          const delay = this.retryDelayMs - elapsed;
+          log('[foreground-fallback] delaying retry fallback', {
+            sessionID,
+            delayMs: delay,
+            elapsed,
+          });
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
+
       await this.execFallback(sessionID, error);
+      this.lastFallbackTime.set(sessionID, Date.now());
     } finally {
       this.inProgress.delete(sessionID);
     }
@@ -1287,8 +1478,15 @@ export class ForegroundFallbackManager {
         }
       }
       tried.add(nextModel);
-      // Reset retry count on model switch — the new model starts fresh.
+      // Reset retry count on model switch - the new model starts fresh.
       this.sessionRetries.delete(sessionID);
+      this.lastFallbackTime.delete(sessionID);
+      // Cancel any pending initial delay on model switch
+      const pendingDelay = this.pendingInitialDelay.get(sessionID);
+      if (pendingDelay) {
+        clearTimeout(pendingDelay);
+        this.pendingInitialDelay.delete(sessionID);
+      }
 
       const ref = parseModelReference(nextModel);
       if (!ref) {
@@ -1300,6 +1498,14 @@ export class ForegroundFallbackManager {
       }
 
       // Retrieve the last user message to re-submit with the fallback model.
+      // Fence captured BEFORE any await in the preparation: a board
+      // relaunch during the transcript read or the admission await must
+      // not enroll the new generation under this (stale) attempt's
+      // baseline. undefined = not a tracked background child
+      // (foreground/untracked) → the handoff is a no-op, never a
+      // wildcard.
+      const preparedGeneration = this.readBackgroundGeneration?.(sessionID);
+
       const result = await session.messages({
         path: { id: sessionID },
       });
@@ -1325,12 +1531,28 @@ export class ForegroundFallbackManager {
         log('[foreground-fallback] promptAsync unavailable', { sessionID });
         return;
       }
+      // Loose alias: the v2 client shim accepts extra top-level args
+      // (`modelSwitch`) the way orchestrator-wake passes `delivery`.
+      // Bound: the SDK's promptAsync reads `this._client`, so calling the
+      // extracted function unbound throws `undefined is not an object
+      // (evaluating 'this._client')` on the real client (same binding the
+      // revived-run tracker already applies).
+      const promptAsync = sessionClient.promptAsync.bind(sessionClient) as (
+        args: Record<string, unknown> & { modelSwitch?: 'required' },
+      ) => Promise<unknown>;
 
       const replayParts = partsFromReplayMessage(lastUser) as Array<{
         type: 'text';
         text: string;
       }>;
 
+      // v2-only flag (consumed by the client shim): the replay's model is
+      // the fallback TARGET, so a v2 host without session.switchModel must
+      // reject the replay (typed error) instead of silently replaying on
+      // the model that just failed. v1 call bytes stay untouched.
+      const isV2Host =
+        (this.input as PluginInput & { hostFlavor?: string }).hostFlavor ===
+        'v2';
       const promptBody = {
         path: { id: sessionID },
         body: {
@@ -1346,21 +1568,131 @@ export class ForegroundFallbackManager {
             : {}),
           ...(agentName ? { agent: agentName } : {}),
         },
+        ...(isV2Host ? { modelSwitch: 'required' as const } : {}),
       };
 
+      let promptResult: unknown;
+      // Arm the observation handoff BEFORE the admission await: while
+      // promptAsync is pending the stop gate defers terminal
+      // publication — the re-prompted result may already be persisted
+      // but has no delivery owner yet. Baseline = trailing message WITH
+      // a string id from the transcript read that produced the replay,
+      // so the substituted run's answer is always post-baseline.
+      const baselineMessageID = [...messages]
+        .reverse()
+        .find(
+          (m) =>
+            isRecord(m) &&
+            typeof (m as { info?: { id?: unknown } }).info?.id === 'string',
+        ) as { info: { id: string } } | undefined;
+      const handoffArmed =
+        this.backgroundFallbackHandoff?.prepare(
+          sessionID,
+          preparedGeneration,
+          baselineMessageID?.info?.id,
+        ) ?? false;
+      // Distinguish "not applicable" (foreground or unmanaged session —
+      // preparedGeneration undefined, the fallback proceeds) from "was
+      // a confirmed background child whose preparation lost validity"
+      // (generation changed during the transcript read): the replay
+      // prompt and baseline are stale for an execution that no longer
+      // exists — do NOT send them.
+      if (preparedGeneration !== undefined && !handoffArmed) {
+        log(
+          '[foreground-fallback] background child superseded during preparation; replay aborted',
+          { sessionID, preparedGeneration },
+        );
+        return;
+      }
+      const withdrawHandoff = (): void => {
+        if (handoffArmed) {
+          this.backgroundFallbackHandoff?.reject(sessionID, preparedGeneration);
+        }
+      };
+      const settleUnresolvedHandoff = (): void => {
+        if (handoffArmed) {
+          this.backgroundFallbackHandoff?.settleUnresolved(
+            sessionID,
+            preparedGeneration,
+          );
+        }
+      };
       try {
-        await sessionClient.promptAsync(promptBody);
-      } catch (_promptErr) {
+        promptResult = await promptAsync(promptBody);
+      } catch (promptErr) {
+        if (isSwitchModelUnavailableError(promptErr)) {
+          // Explicit typed refusal: the host cannot switch models at
+          // all, so aborting and retrying cannot help (same missing
+          // capability on every attempt). Nothing was admitted.
+          withdrawHandoff();
+          throw promptErr;
+        }
         log('[foreground-fallback] promptAsync on busy session, aborting', {
           sessionID,
         });
-        await abortSessionWithTimeout(getClient(this.input), sessionID);
+        try {
+          await abortSessionWithTimeout(getClient(this.input), sessionID);
+        } catch (abortErr) {
+          // Unknown outcome: the abort transport failed — the admission
+          // state cannot be proven either way, so the prepared ownership
+          // CONVERTS into a tracked run instead of being dropped.
+          settleUnresolvedHandoff();
+          throw abortErr;
+        }
         await new Promise((r) => setTimeout(r, REPROMPT_DELAY_MS));
-        await sessionClient.promptAsync(promptBody);
+        try {
+          promptResult = await promptAsync(promptBody);
+        } catch (retryErr) {
+          // Transport failed without a response: the host may still
+          // have accepted the replay — convert, never drop.
+          settleUnresolvedHandoff();
+          throw retryErr;
+        }
       }
 
-      this.sessionModel.set(sessionID, nextModel);
-      this.onSessionModelChanged?.(sessionID, nextModel);
+      // SDK envelopes can resolve (not reject) with `{ error }` — an
+      // unresolved admission must not be treated as an accepted switch:
+      // state migration and observation transfer only happen after the
+      // same error-envelope contract the other SDK call sites apply.
+      if (isRecord(promptResult) && responseError(promptResult) !== undefined) {
+        log(
+          '[foreground-fallback] fallback re-prompt rejected by host error envelope',
+          {
+            sessionID,
+            agentName,
+            intended: nextModel,
+          },
+        );
+        withdrawHandoff();
+        return;
+      }
+
+      // v2 shim: `switched: false` means the replay WAS DELIVERED on
+      // the current model — the work is admitted, so the observation
+      // handoff is kept (delivery needs an owner); only the model-switch
+      // CLAIM is suppressed (sessionModel feeds chain descent and
+      // onSessionModelChanged migrates provider accounting; both would
+      // lie). Prompt admission and switch confirmation are two
+      // different facts.
+      const deliveredWithoutSwitch =
+        isRecord(promptResult) && promptResult.switched === false;
+      if (deliveredWithoutSwitch) {
+        log(
+          '[foreground-fallback] fallback prompt delivered on the current model (model switch failed)',
+          { sessionID, agentName, from: currentModel, intended: nextModel },
+        );
+      } else {
+        this.sessionModel.set(sessionID, nextModel);
+        this.onSessionModelChanged?.(sessionID, nextModel);
+      }
+      // Admission accepted (with or without the switch): convert the
+      // prepared handoff into a tracked run (register + immediate
+      // probe) so the substituted run's result is observed and
+      // delivered to the parent.
+      if (handoffArmed) {
+        this.backgroundFallbackHandoff?.admit(sessionID, preparedGeneration);
+      }
+      if (deliveredWithoutSwitch) return;
       log('[foreground-fallback] switched to fallback model', {
         sessionID,
         agentName,

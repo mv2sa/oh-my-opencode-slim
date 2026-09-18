@@ -25,7 +25,8 @@
  */
 import { describe, expect, mock, test } from 'bun:test';
 import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from '../../config/constants';
-import { BackgroundJobBoard, createInternalAgentTextPart } from '../../utils';
+import { createInternalAgentTextPart } from '../../utils';
+import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import { createTaskSessionManagerHook } from './index';
 
 const SESSION = 'ses_08f6be16dffednbwYD8dNDIfOI';

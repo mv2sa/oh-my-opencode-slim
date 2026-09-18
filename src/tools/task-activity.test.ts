@@ -1,9 +1,11 @@
 import { describe, expect, test } from 'bun:test';
+import { BackgroundJobBoard } from '../utils/background-job-board';
 import {
   applyActivityEvent,
   resolveEventSessionID,
   TaskActivityTracker,
 } from './task-activity';
+import { summarizeTaskStatus } from './task-policy';
 
 describe('resolveEventSessionID', () => {
   test('keys message.updated by info.sessionID, not the message id', () => {
@@ -59,13 +61,20 @@ describe('resolveEventSessionID', () => {
 });
 
 describe('TaskActivityTracker event integration', () => {
-  test('message.updated activity refreshes the child session key, never the message id', () => {
+  test('completed message.updated refreshes the child session key, never the message id', () => {
     const tracker = new TaskActivityTracker();
     applyActivityEvent(
       tracker,
       {
         type: 'message.updated',
-        properties: { info: { id: 'msg_1', sessionID: 'ses_child1' } },
+        properties: {
+          info: {
+            id: 'msg_1',
+            sessionID: 'ses_child1',
+            role: 'assistant',
+            time: { completed: 1_000 },
+          },
+        },
       },
       1_000,
     );
@@ -73,7 +82,29 @@ describe('TaskActivityTracker event integration', () => {
     expect(tracker.lastActivityAt('msg_1')).toBeUndefined();
   });
 
-  test('busy session.status, retry status, and step-finish all refresh activity', () => {
+  test('streaming message.updated trickles do not refresh activity', () => {
+    const tracker = new TaskActivityTracker();
+    applyActivityEvent(
+      tracker,
+      {
+        type: 'session.status',
+        properties: { info: { id: 'ses_child1' }, status: { type: 'busy' } },
+      },
+      1_000,
+    );
+    // Streaming text with no completed marker: not progress.
+    applyActivityEvent(
+      tracker,
+      {
+        type: 'message.updated',
+        properties: { info: { id: 'msg_2', sessionID: 'ses_child1' } },
+      },
+      2_000,
+    );
+    expect(tracker.lastActivityAt('ses_child1')).toBe(1_000);
+  });
+
+  test('step-finish-progress: completed message.updated and step-finish refresh activity', () => {
     const tracker = new TaskActivityTracker();
     applyActivityEvent(
       tracker,
@@ -89,7 +120,14 @@ describe('TaskActivityTracker event integration', () => {
       tracker,
       {
         type: 'message.updated',
-        properties: { info: { id: 'msg_2', sessionID: 'ses_child1' } },
+        properties: {
+          info: {
+            id: 'msg_2',
+            sessionID: 'ses_child1',
+            role: 'assistant',
+            time: { completed: 2_000 },
+          },
+        },
       },
       2_000,
     );
@@ -143,5 +181,98 @@ describe('TaskActivityTracker event integration', () => {
       3_000,
     );
     expect(tracker.lastActivityAt('ses_child1')).toBeUndefined();
+  });
+});
+
+describe('trickle-no-progress advisory consequence', () => {
+  test('sustained single-request streaming >120s with no completion reads possibly_stuck (advisory only, no auto-abort)', () => {
+    // Accepted consequence of the trickle-no-progress rule: a child that
+    // streams one request for minutes without a completed marker or a
+    // step-finish keeps its last progress timestamp, so a live-confirmed
+    // busy read past the 120s threshold reports possibly_stuck. The flag
+    // is advisory — this test pins that no terminal state is produced and
+    // a later completion resets the clock.
+    const tracker = new TaskActivityTracker();
+    const board = new BackgroundJobBoard();
+    const job = board.registerLaunch({
+      taskID: 'ses_stream',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      description: 'long streaming run',
+      background: true,
+      now: 0,
+    });
+    applyActivityEvent(
+      tracker,
+      {
+        type: 'session.status',
+        properties: { info: { id: 'ses_stream' }, status: { type: 'busy' } },
+      },
+      0,
+    );
+    // 119s of pure trickle: no completed marker, no step-finish.
+    for (let t = 1_000; t <= 119_000; t += 10_000) {
+      applyActivityEvent(
+        tracker,
+        {
+          type: 'message.updated',
+          properties: { info: { id: `msg_${t}`, sessionID: 'ses_stream' } },
+        },
+        t,
+      );
+    }
+    expect(tracker.lastActivityAt('ses_stream')).toBe(0);
+    const before = summarizeTaskStatus(
+      job,
+      { ok: true, status: 'busy' },
+      tracker.lastActivityAt('ses_stream'),
+      119_000,
+    );
+    expect(before.possiblyStuck).toBe(false);
+
+    // Past 120s with still no completion: advisory flag fires, board state
+    // stays running, no terminal is published, no deadline is claimed.
+    applyActivityEvent(
+      tracker,
+      {
+        type: 'message.updated',
+        properties: { info: { id: 'msg_121', sessionID: 'ses_stream' } },
+      },
+      121_000,
+    );
+    expect(tracker.lastActivityAt('ses_stream')).toBe(0);
+    const stuck = summarizeTaskStatus(
+      board.get('ses_stream') ?? job,
+      { ok: true, status: 'busy' },
+      tracker.lastActivityAt('ses_stream'),
+      121_000,
+    );
+    expect(stuck.possiblyStuck).toBe(true);
+    expect(board.get('ses_stream')?.state).toBe('running');
+    expect(board.get('ses_stream')?.deadlineExceededAt).toBeUndefined();
+
+    // A completed request resets the clock: flag clears.
+    applyActivityEvent(
+      tracker,
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'msg_done',
+            sessionID: 'ses_stream',
+            role: 'assistant',
+            time: { completed: 122_000 },
+          },
+        },
+      },
+      122_000,
+    );
+    const recovered = summarizeTaskStatus(
+      board.get('ses_stream') ?? job,
+      { ok: true, status: 'busy' },
+      tracker.lastActivityAt('ses_stream'),
+      122_000,
+    );
+    expect(recovered.possiblyStuck).toBe(false);
   });
 });

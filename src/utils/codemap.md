@@ -17,7 +17,7 @@ Centralized utilities and shared abstractions used across the oh-my-opencode-sli
 
 ### Core Abstractions
 
-- **BackgroundJobBoard** (`background-job-board.ts`): Singleton registry and lifecycle manager for background tasks spawned by sub-agents. Implements a reusable session pool pattern with automatic cleanup and reconciliation hooks. Tracks task state (running, stopped, completed, error, cancelled), maintains context files, and provides prompt-ready summaries for agent coordination. `stopped` records an ended runtime session without fabricated task success and is never reusable. Explicit child idle starts a configurable stop-confirmation clock only when the parent is not positively busy/retrying; missing status is uncertainty-only. `clearStopConfirmation` resets that clock without fabricating child activity. After a confirmed stop has been acknowledged, stale busy cannot reopen the job.
+- **BackgroundJobBoard** (`background-job-board.ts`): Singleton registry and lifecycle manager for background tasks spawned by sub-agents. Implements a reusable session pool pattern with automatic cleanup and reconciliation hooks. Tracks task state (running, stopped, completed, error, cancelled), maintains context files, and provides prompt-ready summaries for agent coordination. `stopped` records an ended runtime session without fabricated task success and is never reusable through `task()`; recovery is `task_revive`, and acknowledged stopped jobs appear under Retained / Recovery. Idle/absent observations start a 5s stop-confirmation grace (`stopConfirmationStartedAt`); live busy resets it. After a confirmed stop has been acknowledged, stale busy cannot reopen the job.
 
 - **BackgroundJobStore** (`background-job-store.ts`): Atomic state-store contract (terminal transitions, leases, wall-clock deadline claims) implemented by the board; the single terminal-publication boundary.
 
@@ -42,6 +42,8 @@ Centralized utilities and shared abstractions used across the oh-my-opencode-sli
 - **Task Utilities** (`task.ts`): XML-inspired task output parsing for extracting task IDs, states, and results from tool output strings. Used for resumption and status tracking.
 
 - **Type Guards** (`guards.ts`): Simple type checking utilities (`isRecord`) for runtime validation.
+
+- **Global Store** (`global-store.ts`): `getGlobalStore(key, init)` — process-local lazy singleton on `globalThis` via the `Symbol.for` registry; shared store pattern for the orchestrator-wake and user-wait gates.
 
 - **Environment Utilities** (`env.ts`): Environment variable parsing and plugin disable flag checking.
 
@@ -151,6 +153,7 @@ re-exported).
 | `env.ts` | Environment variable utilities |
 | `escape-html.ts` | HTML escaping helper |
 | `frontmatter.ts` | Frontmatter parsing for interview documents |
+| `global-store.ts` | Process-local lazy singleton store on `globalThis` (`getGlobalStore`) |
 | `guards.ts` | Type guard utilities |
 | `internal-initiator.ts` | Internal agent message marker system |
 | `logger.ts` | File-based logging with rotation |
