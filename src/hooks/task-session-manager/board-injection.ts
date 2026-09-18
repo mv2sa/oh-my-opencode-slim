@@ -47,11 +47,7 @@ import {
 import type { MessagePart, MessageWithParts } from '../types';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import type { RevivedRunTracker } from './revived-run-tracker';
-import {
-  extractTaskSummary,
-  formatCancelledTaskStatusOutput,
-  isLateCancelledTaskError,
-} from './status-utils';
+import { extractTaskSummary, isLateCancelledTaskError } from './status-utils';
 
 // ── Constants ──────────────────────────────────────────────────────────
 

@@ -23,7 +23,6 @@ import {
 import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
-import { SESSION_ID_PATTERN } from '../../utils/session';
 import type { ForegroundFallbackManager } from '../foreground-fallback';
 import {
   isAntigravitySyntheticQuotaText,
