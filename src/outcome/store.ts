@@ -4306,7 +4306,7 @@ function recordParsedReview(
     ...(review.candidateFingerprint
       ? { candidateFingerprint: review.candidateFingerprint }
       : {}),
-    summary: review.summary,
+    summary: boundedText(review.summary, 1024),
     evaluatedAt,
   };
   record.reviewSummaries.push(summary);
