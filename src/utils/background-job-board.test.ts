@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
-import { BackgroundJobBoard } from './background-job-fixture';
 import { BackgroundJobBoard as ProductionBoard } from './background-job-board';
+import { BackgroundJobBoard } from './background-job-fixture';
 
 describe('BackgroundJobBoard', () => {
   test('registers background launches as running jobs with aliases', () => {

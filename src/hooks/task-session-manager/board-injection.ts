@@ -26,6 +26,7 @@ import {
   parseTaskStatusOutput,
   renderRunningTaskPlaceholder,
 } from '../../utils';
+import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { isRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
 import {
@@ -45,13 +46,11 @@ import {
 } from '../foreground-fallback/synthetic-quota';
 import type { MessagePart, MessageWithParts } from '../types';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
-import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import type { RevivedRunTracker } from './revived-run-tracker';
 import {
   extractTaskSummary,
   formatCancelledTaskStatusOutput,
   isLateCancelledTaskError,
-  updateBackgroundJobFromOutput,
 } from './status-utils';
 
 // ── Constants ──────────────────────────────────────────────────────────

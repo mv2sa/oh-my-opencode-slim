@@ -18,7 +18,7 @@
  * v2 output (locked below).
  */
 
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { createAgents } from '../agents';
 import { buildOrchestratorPrompt } from '../agents/orchestrator';
 import type { PluginConfig } from '../config';
@@ -27,6 +27,16 @@ import { RuntimeConfig } from '../config/runtime';
 import { delegationVocabulary, rewritePromptForV2 } from './adapters';
 
 const TEST_DIRECTORY = 'runtime-test-native-delegation-wording';
+
+let originalEnv: typeof process.env;
+beforeEach(() => {
+  originalEnv = { ...process.env };
+  process.env.XDG_CONFIG_HOME = '/tmp/empty-test-xdg';
+});
+
+afterEach(() => {
+  process.env = originalEnv;
+});
 
 function runtimeFor(config: PluginConfig | undefined = {}) {
   RuntimeConfig.reset(TEST_DIRECTORY);

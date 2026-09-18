@@ -513,7 +513,7 @@ export function createSyntheticQuotaCoordinator(
         releaseReservationLease(reservation);
         reservation.status = 'exhausted';
         reservation.model = failedModel;
-        input.backgroundJobBoard.updateStatus({
+        (input.backgroundJobBoard as any).updateStatus({
           taskID: input.taskID,
           expectedGeneration: generation,
           state: 'error',
@@ -659,7 +659,7 @@ export function createSyntheticQuotaCoordinator(
               !latest.cancellationRequested &&
               latest.deadlineExceededAt === undefined
             ) {
-              input.backgroundJobBoard.updateStatus({
+              (input.backgroundJobBoard as any).updateStatus({
                 taskID: input.taskID,
                 expectedGeneration: generation,
                 state: 'error',
@@ -694,7 +694,7 @@ export function createSyntheticQuotaCoordinator(
             current.deadlineExceededAt === undefined;
 
           if (isValid) {
-            input.backgroundJobBoard.updateStatus({
+            (input.backgroundJobBoard as any).updateStatus({
               taskID: input.taskID,
               expectedGeneration: generation,
               state: 'error',

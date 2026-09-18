@@ -1,8 +1,8 @@
 import { afterEach, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../utils/background-job-board';
 import {
-  createBackgroundJobTerminalGate,
   type BackgroundJobTerminalGate,
+  createBackgroundJobTerminalGate,
 } from '../utils/background-job-terminal-gate';
 import { createTaskResultTool } from './task-result';
 

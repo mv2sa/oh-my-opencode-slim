@@ -5,8 +5,8 @@ import {
 } from '@opencode-ai/plugin';
 import type { BackgroundJobStore } from '../utils/background-job-store';
 import {
-  createBackgroundJobTerminalGate,
   type BackgroundJobTerminalGate,
+  createBackgroundJobTerminalGate,
   runtimeObservationFromSnapshot,
 } from '../utils/background-job-terminal-gate';
 import {
@@ -17,8 +17,8 @@ import { getClient } from '../utils/opencode-client';
 import { SESSION_ID_PATTERN } from '../utils/session';
 import {
   getRuntimeSessionStatusSnapshot,
-  runtimeSessionStatus,
   type RuntimeSessionStatusSnapshot,
+  runtimeSessionStatus,
 } from '../utils/session-runtime-status';
 
 interface TaskResultToolOptions {

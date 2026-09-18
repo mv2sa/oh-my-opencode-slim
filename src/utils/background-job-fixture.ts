@@ -6,8 +6,8 @@ import type {
   BackgroundJobStatusInput,
   BackgroundJobTerminalInput,
 } from './background-job-board';
-import type { BackgroundJobStore } from './background-job-store';
 import { BackgroundJobBoard as ProductionBoard } from './background-job-board';
+import type { BackgroundJobStore } from './background-job-store';
 
 function commit(
   board: BackgroundJobStore,

@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from './background-job-board';
-import { boardFixture } from './background-job-fixture';
 import { BackgroundJobCoordinator } from './background-job-coordinator';
+import { boardFixture } from './background-job-fixture';
 import { BackgroundJobSupervisor } from './background-job-supervisor';
 import { createBackgroundJobTerminalGate } from './background-job-terminal-gate';
 

@@ -74,9 +74,12 @@ Use this tool to establish durable outcome contracts (begin, or begin after acce
         .any()
         .optional()
         .describe('Complete OutcomeContract object for begin action'),
-      amendment: OutcomeHandoffAmendmentRequestSchema.optional().describe(
-        'Exact amendment identity, genesis/prior head, obligation digest, new instructions/check/candidate, reason and external user/evidence references; obtain identity/digests/receipt IDs from status.handoff. Orchestrator must explicitly check semantic consent. Set completionAuthorized=true only if consent also covers separate explicit completion using this exact evidence pair before another restart.',
-      ),
+      amendment: z
+        .any()
+        .optional()
+        .describe(
+          'Exact amendment identity, genesis/prior head, obligation digest, new instructions/check/candidate, reason and external user/evidence references; obtain identity/digests/receipt IDs from status.handoff. Orchestrator must explicitly check semantic consent. Set completionAuthorized=true only if consent also covers separate explicit completion using this exact evidence pair before another restart.',
+        ),
       generation: z
         .number()
         .int()
@@ -264,10 +267,10 @@ Use this tool to establish durable outcome contracts (begin, or begin after acce
         case 'amend_external_handoff': {
           if (!args.amendment)
             throw new Error('amend_external_handoff requires amendment');
-          const res = controller.amendExternalHandoff(
-            sessionID,
+          const amendment = OutcomeHandoffAmendmentRequestSchema.parse(
             args.amendment,
           );
+          const res = controller.amendExternalHandoff(sessionID, amendment);
           if (!res.success)
             throw new Error(`amend_external_handoff failed: ${res.error}`);
           return JSON.stringify(res.data, null, 2);

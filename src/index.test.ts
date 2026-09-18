@@ -634,7 +634,9 @@ describe('Outcome Controller plugin integration', () => {
               id: 'msg_assistant_default',
               time: { completed: Date.now() },
             },
-            parts: [{ type: 'text', text: 'Outcome Manager completed review.' }],
+            parts: [
+              { type: 'text', text: 'Outcome Manager completed review.' },
+            ],
           },
         ],
       };

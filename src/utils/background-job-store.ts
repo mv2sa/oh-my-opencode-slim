@@ -8,15 +8,15 @@ import type {
   ContextFile,
   WallClockTimeoutClaimInput,
 } from './background-job-board';
-import type {
-  BackgroundJobTerminalGate,
-  TerminalCommitToken,
-} from './background-job-terminal-gate';
 import {
   clearSuppression as clearSuppressionPersisted,
   persistedBackgroundJobState,
   recordSuppression as recordSuppressionPersisted,
 } from './background-job-persistence';
+import type {
+  BackgroundJobTerminalGate,
+  TerminalCommitToken,
+} from './background-job-terminal-gate';
 
 export type BackgroundJobSyntheticTerminalOccurrencePhase =
   | 'observed'

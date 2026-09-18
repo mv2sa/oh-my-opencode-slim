@@ -477,8 +477,6 @@ export function createTaskSessionManagerHook(
       reconcileInjectedTerminalJobs(injectionState, parentSessionID),
     idleReconcileDelayMs:
       options.idleReconcileDelayMs ?? IDLE_RECONCILE_DELAY_MS,
-    stopConfirmationGraceMs: options.stopConfirmationMs,
-    isParentActivityBlocking,
     isFallbackInProgress: options.isFallbackInProgress,
     hasInputWait: (s) => hasInputWait(s),
     getIdleSessionToken: (s) => getIdleSessionToken(s),
@@ -712,6 +710,8 @@ export function createTaskSessionManagerHook(
         backgroundJobSupervisor: options.backgroundJobSupervisor,
         bindConcurrencyTicket: (taskID, pending) =>
           pending.concurrencyTicket?.bind(taskID),
+        releaseConcurrencyTask: (taskID) =>
+          options.backgroundTaskConcurrency?.releaseTask(taskID),
         recordLifecycleSuppression: (taskID) =>
           recordBackgroundJobSuppression(backgroundJobBoard, taskID),
         pendingCallTracker,

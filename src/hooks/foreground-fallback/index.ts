@@ -716,7 +716,7 @@ export class ForegroundFallbackManager {
           ) => void;
         }
       | undefined;
-    let readBgGen: ((sessionID: string) => number | undefined) | undefined =
+    const readBgGen: ((sessionID: string) => number | undefined) | undefined =
       readBackgroundGeneration;
     let cooldownRegistry = getCooldownRegistry();
     let modelVariants: ModelVariants = {};
@@ -732,7 +732,8 @@ export class ForegroundFallbackManager {
     if (
       typeof initialRetryDelayMsOrCooldownRegistryOrModelVariants === 'number'
     ) {
-      initialRetryDelayMs = initialRetryDelayMsOrCooldownRegistryOrModelVariants;
+      initialRetryDelayMs =
+        initialRetryDelayMsOrCooldownRegistryOrModelVariants;
     } else if (
       isCooldownRegistry(initialRetryDelayMsOrCooldownRegistryOrModelVariants)
     ) {

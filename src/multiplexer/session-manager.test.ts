@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { BackgroundJobBoard } from '../utils/background-job-fixture';
 import { BackgroundJobCoordinator } from '../utils/background-job-coordinator';
+import { BackgroundJobBoard } from '../utils/background-job-fixture';
 import { CmuxSessionStore } from './cmux/session-state';
 import {
   MultiplexerSessionManager,

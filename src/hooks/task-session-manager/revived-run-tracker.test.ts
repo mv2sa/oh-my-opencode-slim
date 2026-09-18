@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils/background-job-fixture';
+import {
+  type BackgroundJobTerminalGate,
+  createBackgroundJobTerminalGate,
+} from '../../utils/background-job-terminal-gate';
 import { SLIM_INTERNAL_INITIATOR_MARKER } from '../../utils/internal-initiator';
 import { createRevivedRunTracker } from './revived-run-tracker';
-import {
-  createBackgroundJobTerminalGate,
-  type BackgroundJobTerminalGate,
-} from '../../utils/background-job-terminal-gate';
+
 const gates: BackgroundJobTerminalGate[] = [];
 
 function createHarness(

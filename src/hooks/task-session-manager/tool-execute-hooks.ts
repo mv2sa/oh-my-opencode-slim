@@ -385,6 +385,7 @@ export async function handleToolExecuteAfter(
     revivedRunTracker?: RevivedRunTracker;
     syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
     bindConcurrencyTicket?: (taskID: string, pending: PendingTaskCall) => void;
+    releaseConcurrencyTask?: (taskID: string) => void;
     /** Record direct task cleanup even when the store is a thin facade. */
     recordLifecycleSuppression?: (taskID: string) => void;
     /** Clear a deletion guard when a new native task output proves a run exists. */

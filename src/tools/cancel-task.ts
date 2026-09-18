@@ -6,8 +6,8 @@ import {
 import type { BackgroundJobLease } from '../utils/background-job-board';
 import type { BackgroundJobStore } from '../utils/background-job-store';
 import {
-  createBackgroundJobTerminalGate,
   type BackgroundJobTerminalGate,
+  createBackgroundJobTerminalGate,
   type ObservationToken,
 } from '../utils/background-job-terminal-gate';
 import { responseError, stringifyError } from '../utils/child-transcript';

@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
-import { handleEvent } from './event-router';
 import { createBackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
+import { handleEvent } from './event-router';
 
 function createDeps(board: BackgroundJobBoard, now: () => number) {
   const backgroundJobSupervisor = {

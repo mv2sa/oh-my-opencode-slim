@@ -5,8 +5,8 @@ import * as runtimeFactories from './hooks/task-session-manager/runtime-status-r
 import { OhMyOpenCodeLite as plugin } from './index';
 import type { BackgroundJobRecord } from './utils/background-job-board';
 import type { BackgroundJobCoordinator } from './utils/background-job-coordinator';
-import { BackgroundTaskConcurrency } from './utils/background-task-concurrency';
 import * as gateFactories from './utils/background-job-terminal-gate';
+import { BackgroundTaskConcurrency } from './utils/background-task-concurrency';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {

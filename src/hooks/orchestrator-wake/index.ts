@@ -22,11 +22,14 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { OutcomeController } from '../../outcome/controller';
 import { canonicalDigest } from '../../outcome/controller-schema';
-import { createInternalAgentTextPart, isInternalInitiatorPart } from '../../utils';
+import {
+  createInternalAgentTextPart,
+  isInternalInitiatorPart,
+} from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
-import { externalMessage } from '../external-message';
 import type { SessionSelection } from '../../utils/session-selection';
+import { externalMessage } from '../external-message';
 import type { SessionLifecycle } from '../session-lifecycle';
 import {
   type ContinuationModelSelection,
@@ -2199,7 +2202,12 @@ export function createOrchestratorWakeScheduler(
 
   function observeChatMessage(input: unknown, output: unknown): void {
     const external = externalMessage(input, output);
-    if (!external || (options.shouldManageSession && !options.shouldManageSession(external.sessionID))) return;
+    if (
+      !external ||
+      (options.shouldManageSession &&
+        !options.shouldManageSession(external.sessionID))
+    )
+      return;
     if (
       !external.parts.some(
         (part) =>
@@ -2340,7 +2348,10 @@ export function createOrchestratorWakeScheduler(
     const sessionID = extractSessionID(input.event);
     if (!sessionID) return;
     if (options.shouldManageSession(sessionID)) admitWakeSession(sessionID);
-    observeWakeEvent(sessionID, input.event);
+    observeWakeEvent(
+      sessionID,
+      input.event as Parameters<typeof observeWakeEvent>[1],
+    );
 
     if (type === 'session.updated') {
       if (canObserveSelection(sessionID)) {
@@ -2435,7 +2446,9 @@ export function createOrchestratorWakeScheduler(
       if (canObserveSelection(sessionID)) {
         // Errors / retry are external lifecycle — rearm.
         clearExpectingWakeBusy(sessionID);
-        const shouldRearm = options.shouldManageSession?.(sessionID) ? false : true;
+        const shouldRearm = options.shouldManageSession?.(sessionID)
+          ? false
+          : true;
         endIdleSpell(sessionID, shouldRearm);
       }
     }

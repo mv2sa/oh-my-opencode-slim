@@ -2,12 +2,13 @@ import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 import { createRevivedRunTracker } from '../hooks/task-session-manager/revived-run-tracker';
 import { BackgroundJobBoard } from '../utils/background-job-fixture';
+import {
+  type BackgroundJobTerminalGate,
+  createBackgroundJobTerminalGate,
+} from '../utils/background-job-terminal-gate';
 import { createCancelTaskTool } from './cancel-task';
 import { createTaskReviveTool } from './task-revive';
-import {
-  createBackgroundJobTerminalGate,
-  type BackgroundJobTerminalGate,
-} from '../utils/background-job-terminal-gate';
+
 const gates: BackgroundJobTerminalGate[] = [];
 
 let mockClient: Record<string, unknown>;

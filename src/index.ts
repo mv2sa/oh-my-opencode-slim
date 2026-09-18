@@ -51,10 +51,6 @@ import { createSyntheticQuotaCoordinator } from './hooks/foreground-fallback/syn
 import { processImageAttachments } from './hooks/image-hook';
 import { createBackgroundFallbackHandoff } from './hooks/task-session-manager/fallback-observation-transfer';
 import { createRevivedRunTracker } from './hooks/task-session-manager/revived-run-tracker';
-import {
-  createBackgroundJobTerminalGate,
-  type BackgroundJobTerminalGate,
-} from './utils/background-job-terminal-gate';
 import type { ToolLoopGuardHook } from './hooks/tool-loop-guard/hook';
 import { isMessageWithParts, type MessageWithParts } from './hooks/types';
 import { handleTaskSessionEvent } from './index-event';
@@ -106,6 +102,10 @@ import {
 } from './utils';
 import type { ContextFile } from './utils/background-job-board';
 import type { BackgroundJobStore } from './utils/background-job-store';
+import {
+  type BackgroundJobTerminalGate,
+  createBackgroundJobTerminalGate,
+} from './utils/background-job-terminal-gate';
 import { isPluginDisabledByEnv } from './utils/env';
 import { isInternalInitiatorPart } from './utils/internal-initiator';
 import { probeJSDOM } from './utils/jsdom';

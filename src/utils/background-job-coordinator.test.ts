@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
-import { BackgroundJobBoard, boardFixture } from './background-job-fixture';
 import { BackgroundJobCoordinator } from './background-job-coordinator';
+import { BackgroundJobBoard, boardFixture } from './background-job-fixture';
 
 function createMockBoard(isRunning = false) {
   return {

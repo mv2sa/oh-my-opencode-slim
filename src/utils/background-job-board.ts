@@ -14,12 +14,12 @@ import {
   clearBackgroundJobSuppression,
   recordBackgroundJobSuppression,
 } from './background-job-store';
-import { log } from './logger';
 import {
-  consumeTerminalCommitToken,
   type BackgroundJobTerminalGate,
+  consumeTerminalCommitToken,
   type TerminalCommitToken,
 } from './background-job-terminal-gate';
+import { log } from './logger';
 import type { TaskOutputState } from './task';
 
 export interface ContextFile {

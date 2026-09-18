@@ -286,7 +286,7 @@ After spawning all independent background tasks and any remaining non-overlappin
   or an explicit requirement demands it.
 - For non-trivial work, call \`outcome_control(action: 'begin', contract: ...)\` to establish a durable outcome contract.
 - Begin and authenticate kickoff review before taking non-kickoff checkpoints (user decisions, exceptions, or final verification).
-- Checkpoint dispatch: dispatch Outcome Manager via \`task(subagent_type='outcome-manager', ...)\` forwarding the exact volatile review packet and dispatch marker provided by the Controller.
+- Checkpoint dispatch: dispatch Outcome Manager via \`${vocab.tool}(${vocab.agentParam}='outcome-manager', ...)\` forwarding the exact volatile review packet and dispatch marker provided by the Controller.
 - Reconcile review results with \`outcome_control(action: 'reconcile_review', ...)\` and inspect authoritative outcome status.
 - Bounded kickoff retry: if kickoff review authentication fails, retry kickoff at most once when Controller exposes retry availability (\`kickoffGate.attempts < maxAttempts\`).
 - Obey exhausted kickoff attempts or legacy retrospective errors (\`legacy_late_missing\`, exhausted kickoff gate) as terminal uncertifiable states — do not loop or attempt further review dispatches.

@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from 'bun:test';
+import { mkdtempSync } from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -8,6 +9,12 @@ import { BackgroundTaskConcurrency } from '../../utils/background-task-concurren
 import { createTaskSessionManagerHook } from './index';
 import { createPendingCallTracker } from './pending-call-tracker';
 
+// Route getClient back to _ctx.client so the mock ctx client is what the
+// terminal gate sees (same pattern as index.test.ts and rehydrate-probe.test.ts).
+mock.module('../../utils/opencode-client', () => ({
+  getClient: (input: { client: unknown }) => input?.client as never,
+}));
+
 const PARENT = 'parent-1';
 
 function createHook(
@@ -16,20 +23,27 @@ function createHook(
     backgroundTaskConcurrency?: BackgroundTaskConcurrency;
     pendingCallTracker?: ReturnType<typeof createPendingCallTracker>;
   } = {},
+  directory = mkdtempSync(path.join(os.tmpdir(), 'pairing-')),
 ) {
   board.addTerminalStateListener((taskID) =>
     extra.backgroundTaskConcurrency?.releaseTask(taskID),
   );
   return createTaskSessionManagerHook(
     {
-      client: { session: { status: mock(async () => ({ data: {} })) } },
-      directory: '/tmp',
-      worktree: '/tmp',
+      client: {
+        session: {
+          status: mock(async () => ({ data: {} })),
+        },
+      },
+      directory,
+      worktree: directory,
     } as never,
     {
       maxSessionsPerAgent: 2,
       backgroundJobBoard: board,
       shouldManageSession: () => true,
+      stopConfirmationMs: 0,
+      idleReconcileDelayMs: 0,
       ...extra,
     },
   );
