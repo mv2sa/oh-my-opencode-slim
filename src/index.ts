@@ -928,6 +928,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     orchestratorWakeScheduler = createOrchestratorWakeScheduler(ctx, {
       config: runtime.backgroundJobs.orchestratorWake,
+      outcomeManagementEnabled,
       shouldManageSession: (sessionID) =>
         sessionMetadata.getAgent(sessionID) === 'orchestrator',
       registerSessionAsOrchestrator: (sessionID) => {
@@ -1167,6 +1168,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   const toolThreshold = minimumExpectedToolCount(
     runtime.disabledTools,
     runtime.webfetch.enabled !== false,
+    outcomeManagementEnabled,
   );
   if (
     agentCount < HEALTH_CHECK.minAgents ||

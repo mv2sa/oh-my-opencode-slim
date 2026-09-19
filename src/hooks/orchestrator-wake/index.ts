@@ -67,8 +67,22 @@ export const ORCHESTRATOR_WAKE_TEXT =
 export const ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT =
   '<system-reminder>\nA background job stopped without a terminal result. Consult the Background Job Board, recover or reroute the work as needed, and do not wait for that job as if it were still running. Do not respond to this reminder.\n</system-reminder>';
 
+/**
+ * Restart-recovery reminder. The inspection hints must name only tools that are
+ * actually registered: with outcome management disabled `outcome_control` does
+ * not exist, so naming it would send the agent after a missing tool.
+ */
+export function orchestratorRestartRecoveryText(
+  outcomeManagementEnabled = true,
+): string {
+  const stateSources = outcomeManagementEnabled
+    ? 'outcome_control, task_status, or git/filesystem checks'
+    : 'task_status or git/filesystem checks';
+  return `<system-reminder>\nThe previous OpenCode process was restarted while a foreground tool was running. That operation was interrupted and must not be blindly re-executed. Inspect authoritative local and background state (via ${stateSources}) to determine whether the operation completed or needs targeted recovery before proceeding. Do not respond to this reminder.\n</system-reminder>`;
+}
+
 export const ORCHESTRATOR_RESTART_RECOVERY_TEXT =
-  '<system-reminder>\nThe previous OpenCode process was restarted while a foreground tool was running. That operation was interrupted and must not be blindly re-executed. Inspect authoritative local and background state (via outcome_control, task_status, or git/filesystem checks) to determine whether the operation completed or needs targeted recovery before proceeding. Do not respond to this reminder.\n</system-reminder>';
+  orchestratorRestartRecoveryText(true);
 
 /** All automatic prompt attempts, including transport errors, share this cap. */
 /**
@@ -287,6 +301,9 @@ export type OrchestratorWakeOptions = {
    * session to a non-orchestrator agent — the wake continues in the
    * CURRENT selection instead of forcing `orchestrator`. */
   hasPendingDelegatedWork?: (sessionID: string) => boolean;
+  /** Whether the outcome-management layer is wired. Restart-recovery hints must
+   * name only registered tools, and `outcome_control` is absent when disabled. */
+  outcomeManagementEnabled?: boolean;
   /** Test seam: override interval without changing config validation. */
   intervalMs?: number;
   outcomeController?: OutcomeController;
@@ -1216,7 +1233,11 @@ export function createOrchestratorWakeScheduler(
             agent: 'orchestrator',
             ...(modelSelection ? { model: modelSelection.model } : {}),
             parts: [
-              createInternalAgentTextPart(ORCHESTRATOR_RESTART_RECOVERY_TEXT),
+              createInternalAgentTextPart(
+                orchestratorRestartRecoveryText(
+                  options.outcomeManagementEnabled !== false,
+                ),
+              ),
             ],
           },
           throwOnError: true,

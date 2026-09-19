@@ -9,6 +9,10 @@ describe('plugin health thresholds', () => {
       9,
     );
     expect(minimumExpectedToolCount(['outcome_control'])).toBe(9);
+    // Outcome layer disabled: `outcome_control` is never registered.
+    expect(minimumExpectedToolCount([], true, false)).toBe(9);
+    // ...and an explicit disable must not subtract a second time.
+    expect(minimumExpectedToolCount(['outcome_control'], true, false)).toBe(9);
     expect(minimumExpectedToolCount(['unknown_tool'])).toBe(10);
     expect(minimumExpectedToolCount([], false)).toBe(9);
     expect(minimumExpectedToolCount(['wait_for_user'], false)).toBe(8);
