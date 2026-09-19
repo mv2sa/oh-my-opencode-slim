@@ -2208,6 +2208,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
                 true,
                 true,
                 hostFlavor,
+                runtime.outcomeManagement.enabled,
               );
         // Dedup by the EFFECTIVE prompt, not by default-prompt markers:
         // a custom replacement without `<Role>` previously slipped past
