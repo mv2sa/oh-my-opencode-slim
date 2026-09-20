@@ -13,6 +13,7 @@ import {
   type TerminalEvidenceVerdict,
 } from './child-transcript';
 import { isRecord } from './guards';
+import { log } from './logger';
 import { getClient } from './opencode-client';
 import {
   getRuntimeSessionStatusSnapshot,
@@ -31,6 +32,11 @@ export const STOPPED_WITHOUT_TERMINAL_RESULT =
   'Background session stopped before a terminal task result was received.';
 export const EVIDENCE_UNAVAILABLE_DIAGNOSTIC =
   'Terminal evidence could not be read after repeated attempts; task termination is unconfirmed (observation unavailable).';
+const UNATTRIBUTABLE_HOST_OUTCOME =
+  'Host outcome is not attributable to this run/attempt; task termination is unconfirmed.';
+
+/** Origin of the terminal evidence behind a publication. Log field only. */
+type TerminalAttribution = 'host-outcome' | 'transcript' | 'event';
 
 export type RunRef = { taskID: string; generation: number };
 export type ObservationToken = Readonly<
@@ -38,6 +44,7 @@ export type ObservationToken = Readonly<
     activityRevision: number;
     terminalRevision: number;
     attemptRevision: number | undefined;
+    attemptStartedAt: number | undefined;
     baselineMessageID: string | undefined;
     episode: number;
     readStartedAt: number;
@@ -220,15 +227,79 @@ function isForegroundNativeTerminal(
   );
 }
 
-function hostOutcome(response: unknown): string | undefined {
+function validHostTime(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/** Host `session.outcome` literals the gate treats as attributable
+ * terminal outcomes. Intentionally a SUPERSET of the host schema's
+ * emitted literals (packages/schema session.ts `Info.outcome`): the
+ * extra `'cancelled'` is the plugin's stop-family fail-safe so a
+ * cancel-shaped row never publishes as an error. Host literals MUST
+ * stay a subset — pinned against the cloned host schema by
+ * src/terminal-gate.integration.test.ts (runbook §6 drift contract);
+ * anything outside this set routes to the unrecognized-outcome
+ * rejection, never a publication. */
+export const ACCEPTED_HOST_OUTCOMES: readonly string[] = [
+  'succeeded',
+  'failed',
+  'interrupted',
+  'cancelled',
+];
+
+function attributableHostOutcome(
+  response: unknown,
+  bounds: {
+    lowerBound: number;
+    readCompletedAt: number;
+    clockComparable: boolean;
+  },
+): { outcome: string; idleAt: number } | undefined {
   if (!isRecord(response) || responseError(response) !== undefined)
     return undefined;
-  const info = isRecord(response.data) ? response.data : response;
+  const info = 'data' in response ? response.data : response;
+  if (!isRecord(info)) return;
   const outcome = info.outcome;
-  return typeof outcome === 'string' &&
-    ['succeeded', 'failed', 'interrupted', 'cancelled'].includes(outcome)
-    ? outcome
-    : undefined;
+  const idleAt = isRecord(info.time) ? info.time.idle : undefined;
+  if (
+    !bounds.clockComparable ||
+    !validHostTime(idleAt) ||
+    !validHostTime(bounds.lowerBound) ||
+    !validHostTime(bounds.readCompletedAt) ||
+    typeof outcome !== 'string' ||
+    !ACCEPTED_HOST_OUTCOMES.includes(outcome) ||
+    !(bounds.lowerBound < idleAt && idleAt <= bounds.readCompletedAt)
+  )
+    return;
+  return { outcome, idleAt };
+}
+
+/** Log-only mirror of attributableHostOutcome's rejection cascade. The
+ * check order mirrors the binding decision so the logged reason always
+ * matches why the outcome was rejected; it never gates behavior. */
+function hostOutcomeRejectionReason(
+  response: unknown,
+  bounds: {
+    lowerBound: number;
+    readCompletedAt: number;
+    clockComparable: boolean;
+  },
+): string {
+  if (!isRecord(response)) return 'response-unreadable';
+  if (responseError(response) !== undefined) return 'host-error';
+  const info = 'data' in response ? response.data : response;
+  if (!isRecord(info)) return 'malformed-info';
+  const outcome = info.outcome;
+  const idleAt = isRecord(info.time) ? info.time.idle : undefined;
+  if (!bounds.clockComparable) return 'clock-not-comparable';
+  if (!validHostTime(idleAt)) return 'invalid-idle-time';
+  if (!validHostTime(bounds.lowerBound)) return 'invalid-window-lower';
+  if (!validHostTime(bounds.readCompletedAt)) return 'invalid-read-completion';
+  if (typeof outcome !== 'string') return 'outcome-missing';
+  if (!ACCEPTED_HOST_OUTCOMES.includes(outcome))
+    return `unrecognized-outcome:${String(outcome)}`;
+  if (!(bounds.lowerBound < idleAt)) return 'idle-not-after-window-lower';
+  return 'idle-after-read-completion';
 }
 
 function observationIdentity(token: ObservationToken): string {
@@ -237,6 +308,7 @@ function observationIdentity(token: ObservationToken): string {
     token.activityRevision,
     token.terminalRevision,
     token.attemptRevision,
+    token.attemptStartedAt,
     token.baselineMessageID,
     token.episode,
   ]);
@@ -290,6 +362,12 @@ export function createBackgroundJobTerminalGate(options: {
   readRuntime?: (run: RunRef, startedAt: number) => Promise<RuntimeObservation>;
   readTerminalEvidence?: (taskID: string) => Promise<unknown>;
   baselineFor?: (taskID: string, generation: number) => string | undefined;
+  attemptStartedAtFor?: (
+    taskID: string,
+    generation: number,
+  ) => number | undefined;
+  /** Explicit integration contract; never inferred from host flavor/capabilities. */
+  hostOutcomeClock?: 'shared-unix-ms';
   observationRevisionFor?: (
     taskID: string,
     generation: number,
@@ -368,6 +446,10 @@ export function createBackgroundJobTerminalGate(options: {
         run.generation,
       ),
       baselineMessageID: options.baselineFor?.(run.taskID, run.generation),
+      attemptStartedAt: options.attemptStartedAtFor?.(
+        run.taskID,
+        run.generation,
+      ),
       episode: value.episode,
       readStartedAt: now(),
     });
@@ -383,6 +465,8 @@ export function createBackgroundJobTerminalGate(options: {
       value.activityRevision === token.activityRevision &&
       board.get(token.taskID)?.terminalRevision === token.terminalRevision &&
       value.episode === token.episode &&
+      options.attemptStartedAtFor?.(token.taskID, token.generation) ===
+        token.attemptStartedAt &&
       options.baselineFor?.(token.taskID, token.generation) ===
         token.baselineMessageID &&
       options.observationRevisionFor?.(token.taskID, token.generation) ===
@@ -411,11 +495,27 @@ export function createBackgroundJobTerminalGate(options: {
         () => {
           value.timer = undefined;
           if (observation(run) !== value) return;
-          void reconcile(run);
+          // Background reconciliation is fail-soft: a failure must be
+          // logged and swallowed, never escape as an unhandled rejection.
+          void reconcile(run).catch((err) => {
+            log('[terminal-gate] scheduled reconcile failed', String(err));
+          });
         },
         Math.max(1, graceMs),
       );
       value.timer.unref?.();
+    }
+    if (diagnostic === EVIDENCE_UNAVAILABLE_DIAGNOSTIC) {
+      // Give-up branch: the evidence retry budget is exhausted and no
+      // further reconcile is scheduled. Observation only.
+      log('[terminal-gate] terminal evidence unavailable', {
+        taskID: run.taskID,
+        generation: run.generation,
+        state: board.get(run.taskID)?.state,
+        attempt: value.retries,
+        verdict: 'gave-up',
+        reason: diagnostic,
+      });
     }
     return deferred(run, diagnostic);
   }
@@ -425,6 +525,7 @@ export function createBackgroundJobTerminalGate(options: {
     state: 'completed' | 'error' | 'cancelled' | 'stopped',
     text: string,
     lease?: BackgroundJobLease,
+    attribution: TerminalAttribution = 'event',
   ): GateResult {
     const value = observation(token);
     const before = board.get(token.taskID);
@@ -476,6 +577,13 @@ export function createBackgroundJobTerminalGate(options: {
     value.candidate = undefined;
     value.claim = undefined;
     options.onTerminal?.(record);
+    log('[terminal-gate] terminal published', {
+      taskID: token.taskID,
+      generation: token.generation,
+      state,
+      attribution,
+      parentSessionID: record.parentSessionID,
+    });
     return { kind: 'committed', record };
   }
 
@@ -603,21 +711,27 @@ export function createBackgroundJobTerminalGate(options: {
     }
     const pending = { token, readSettled };
     value.pendingRuntimeContrast = pending;
-    void readSettled.then(async () => {
-      if (!current(pending.token)) return;
-      const key = JSON.stringify([
-        pending.token.taskID,
-        observationIdentity(pending.token),
-      ]);
-      // The slot can be released before the deferred inspection's finally.
-      // Wait for that existing flight, so reconcile cannot just rejoin it.
-      await inFlight.get(key);
-      if (value.pendingRuntimeContrast !== pending || !current(pending.token))
-        return;
-      value.pendingRuntimeContrast = undefined;
-      value.pendingRuntime = false;
-      await reconcile(pending.token);
-    });
+    void readSettled
+      .then(async () => {
+        if (!current(pending.token)) return;
+        const key = JSON.stringify([
+          pending.token.taskID,
+          observationIdentity(pending.token),
+        ]);
+        // The slot can be released before the deferred inspection's finally.
+        // Wait for that existing flight, so reconcile cannot just rejoin it.
+        await inFlight.get(key);
+        if (value.pendingRuntimeContrast !== pending || !current(pending.token))
+          return;
+        value.pendingRuntimeContrast = undefined;
+        value.pendingRuntime = false;
+        await reconcile(pending.token);
+      })
+      .catch((err) => {
+        // Background reconciliation is fail-soft: a failure must be
+        // logged and swallowed, never escape as an unhandled rejection.
+        log('[terminal-gate] runtime-contrast reconcile failed', String(err));
+      });
     return deferred(token, diagnostic);
   }
 
@@ -648,6 +762,59 @@ export function createBackgroundJobTerminalGate(options: {
       kind: 'ready',
       value: await raceEvidenceDeadline(entry.underlying, timeoutMs),
     };
+  }
+
+  function outcomeFromRead(
+    response: unknown,
+    token: ObservationToken,
+    attempt: number,
+  ) {
+    const job = board.get(token.taskID);
+    if (!job) return;
+    const boundaries = [
+      job.runStartedAt,
+      token.attemptStartedAt ?? job.runStartedAt,
+      job.lastLiveBusyAt ?? job.runStartedAt,
+    ];
+    const lowerBound = boundaries.every(validHostTime)
+      ? Math.max(...boundaries)
+      : NaN;
+    const readCompletedAt = now();
+    const bounds = {
+      lowerBound,
+      readCompletedAt,
+      clockComparable: options.hostOutcomeClock === 'shared-unix-ms',
+    };
+    const attribution = attributableHostOutcome(response, bounds);
+    // Observation only: the read window, the outcome value seen, and the
+    // attribution verdict (with a reason on rejection) land in the log so
+    // a gate that never publishes stays diagnosable from the plugin log.
+    const envelope = isRecord(response)
+      ? 'data' in response
+        ? response.data
+        : response
+      : undefined;
+    const outcomeRead =
+      isRecord(envelope) && typeof envelope.outcome === 'string'
+        ? envelope.outcome
+        : undefined;
+    log('[terminal-gate] host-outcome attribution', {
+      taskID: token.taskID,
+      generation: token.generation,
+      state: job.state,
+      attribution: 'host-outcome',
+      attempt,
+      readStartedAt: token.readStartedAt,
+      readCompletedAt,
+      outcome: attribution ? attribution.outcome : outcomeRead,
+      windowLower: lowerBound,
+      windowUpper: readCompletedAt,
+      verdict: attribution ? 'accepted' : 'rejected',
+      reason: attribution
+        ? undefined
+        : hostOutcomeRejectionReason(response, bounds),
+    });
+    return attribution;
   }
 
   async function inspect(run: RunRef): Promise<GateResult> {
@@ -702,19 +869,34 @@ export function createBackgroundJobTerminalGate(options: {
         const input = options.input;
         const observation = token;
         if (typeof client?.session?.get === 'function') {
-          const response = await read(`outcome:${run.taskID}`, token, () =>
-            readSessionInfoForObservation(input, observation),
-          );
+          const response = await read(`outcome:${run.taskID}`, token, () => {
+            // The closure runs exactly when a fresh underlying host read
+            // starts (joins/blocked attempts do not re-run it).
+            log('[terminal-gate] host-outcome read initiated', {
+              taskID: run.taskID,
+              generation: run.generation,
+              state: board.get(run.taskID)?.state,
+              attribution: 'host-outcome',
+              attempt: value.retries,
+              readStartedAt: observation.readStartedAt,
+            });
+            return readSessionInfoForObservation(input, observation);
+          });
           if (!current(token)) return { kind: 'stale' };
           if (response.kind === 'blocked')
             return requestRuntimeContrastAfterRead(token, response.retryAfter);
-          const outcome = hostOutcome(response.value);
-          if (outcome) {
+          const attributable = outcomeFromRead(
+            response.value,
+            token,
+            value.retries,
+          );
+          if (attributable) {
             observe(token, {
               kind: 'quiescent',
               origin: 'host-outcome',
               readStartedAt: token.readStartedAt,
-              terminalOutcome: outcome,
+              observedAt: attributable.idleAt,
+              terminalOutcome: attributable.outcome,
             });
           } else if (
             !value.runtime ||
@@ -724,6 +906,7 @@ export function createBackgroundJobTerminalGate(options: {
               kind: 'unknown',
               origin: 'host-outcome',
               readStartedAt: token.readStartedAt,
+              diagnostic: UNATTRIBUTABLE_HOST_OUTCOME,
             });
           }
           // As with session.status, our own unknown observation advances the
@@ -775,7 +958,8 @@ export function createBackgroundJobTerminalGate(options: {
         run,
         value.retries > (options.maxEvidenceRetries ?? 3)
           ? EVIDENCE_UNAVAILABLE_DIAGNOSTIC
-          : 'Runtime observation unavailable; task termination is unconfirmed.',
+          : (runtime?.diagnostic ??
+              'Runtime observation unavailable; task termination is unconfirmed.'),
       );
     }
     if (options.isObservationPending?.(run.taskID, run.generation))
@@ -810,6 +994,14 @@ export function createBackgroundJobTerminalGate(options: {
     }
     if (signal?.kind === 'session-error')
       return commit(token, 'error', signal.message);
+    // Capability absence, not a pending read: fetchChildTranscript
+    // resolves undefined ONLY when the host exposes no session.messages
+    // endpoint. A host that HAS the source keeps its pending/textless
+    // retry semantics — a timed-out or failed read there is transient
+    // and must never masquerade as source absence.
+    const transcriptSourceAbsent =
+      options.input !== undefined &&
+      typeof getClient(options.input)?.session?.messages !== 'function';
     const transcriptRead = await read(`transcript:${run.taskID}`, token, () =>
       options.readTerminalEvidence
         ? options.readTerminalEvidence(run.taskID)
@@ -831,6 +1023,7 @@ export function createBackgroundJobTerminalGate(options: {
         'Fallback handoff pending; task termination is unconfirmed.',
       );
     let terminalOutcome = runtime?.terminalOutcome;
+    let outcomeDiagnostic: string | undefined;
     let evidence = classifyTerminalEvidence(response, {
       baselineMessageID: token.baselineMessageID,
       runStartedAt: job.runStartedAt,
@@ -846,8 +1039,20 @@ export function createBackgroundJobTerminalGate(options: {
       const input = options.input;
       const observation = token;
       if (typeof client?.session?.get === 'function') {
-        const outcomeResponse = await read(`outcome:${run.taskID}`, token, () =>
-          readSessionInfoForObservation(input, observation),
+        const outcomeResponse = await read(
+          `outcome:${run.taskID}`,
+          token,
+          () => {
+            log('[terminal-gate] host-outcome read initiated', {
+              taskID: run.taskID,
+              generation: run.generation,
+              state: board.get(run.taskID)?.state,
+              attribution: 'host-outcome',
+              attempt: value.retries,
+              readStartedAt: observation.readStartedAt,
+            });
+            return readSessionInfoForObservation(input, observation);
+          },
         );
         if (!current(token)) return { kind: 'stale' };
         if (outcomeResponse.kind === 'blocked')
@@ -860,7 +1065,12 @@ export function createBackgroundJobTerminalGate(options: {
             run,
             'Fallback handoff pending; task termination is unconfirmed.',
           );
-        terminalOutcome = hostOutcome(outcomeResponse.value);
+        terminalOutcome = outcomeFromRead(
+          outcomeResponse.value,
+          token,
+          value.retries,
+        )?.outcome;
+        if (!terminalOutcome) outcomeDiagnostic = UNATTRIBUTABLE_HOST_OUTCOME;
         if (terminalOutcome === 'succeeded')
           evidence = classifyTerminalEvidence(response, {
             baselineMessageID: token.baselineMessageID,
@@ -895,7 +1105,13 @@ export function createBackgroundJobTerminalGate(options: {
         return commit(token, claim.state, claim.resultSummary);
       if (disposition.kind === 'override')
         return commit(token, disposition.state, disposition.resultSummary);
-      return commit(token, evidence.verdict, evidence.text);
+      return commit(
+        token,
+        evidence.verdict,
+        evidence.text,
+        undefined,
+        'transcript',
+      );
     }
     // Native return is attributable only when no transcript exists. Foreground
     // still publishes when the transcript is pending; empty result uses a
@@ -931,17 +1147,57 @@ export function createBackgroundJobTerminalGate(options: {
       );
     }
     const stable = now() - (value.quiescentSince ?? now()) >= graceMs;
-    if (
-      terminalOutcome &&
-      ['failed', 'interrupted', 'cancelled'].includes(terminalOutcome)
-    )
+    // Stop-family host outcomes are not failures: the host stopped the
+    // run (user interrupt/abort) without a plugin-verified cancel
+    // lease — the same stop policy as the absent-evidence branch below.
+    // Surfacing them as 'error' would report a user-stopped task as a
+    // false failure.
+    if (terminalOutcome === 'interrupted' || terminalOutcome === 'cancelled')
+      return commit(
+        token,
+        'stopped',
+        `Host reported outcome: ${terminalOutcome}.`,
+        undefined,
+        'host-outcome',
+      );
+    if (terminalOutcome === 'failed')
       return commit(
         token,
         'error',
+        'Host reported outcome: failed.',
+        undefined,
+        'host-outcome',
+      );
+    // A host that exposes no transcript source can never produce
+    // transcript evidence — the 'transcript source unavailable' retry
+    // verdict is a dead end, not a pending read. With the #1225 window
+    // already attributing the outcome to this run, a succeeded outcome
+    // publishes through the same host-outcome commit path as the error
+    // family. Guards: the transcript source must be genuinely absent
+    // (a present-but-unfinalized transcript keeps waiting exactly as
+    // before), and only the window-attributed terminalOutcome reaches
+    // here — an unattributable success publishes nothing.
+    if (
+      terminalOutcome === 'succeeded' &&
+      transcriptSourceAbsent &&
+      evidence.verdict === 'retry' &&
+      evidence.reason === 'transcript source unavailable'
+    )
+      return commit(
+        token,
+        'completed',
         `Host reported outcome: ${terminalOutcome}.`,
+        undefined,
+        'host-outcome',
       );
     if (evidence.verdict === 'absent' && stable)
-      return commit(token, 'stopped', STOPPED_WITHOUT_TERMINAL_RESULT);
+      return commit(
+        token,
+        'stopped',
+        STOPPED_WITHOUT_TERMINAL_RESULT,
+        undefined,
+        'transcript',
+      );
     value.retries += 1;
     if (
       terminalOutcome === 'succeeded' &&
@@ -950,16 +1206,23 @@ export function createBackgroundJobTerminalGate(options: {
       evidence.reason === 'textless' &&
       value.retries > (options.maxEvidenceRetries ?? 3)
     )
-      return commit(token, 'error', COMPLETED_WITHOUT_TEXT_DIAGNOSTIC);
+      return commit(
+        token,
+        'error',
+        COMPLETED_WITHOUT_TEXT_DIAGNOSTIC,
+        undefined,
+        'host-outcome',
+      );
     // A parsed completed label is not independent termination evidence.
     // Even an empty assistant placeholder remains unknown indefinitely.
     return retry(
       run,
       value.retries > (options.maxEvidenceRetries ?? 3)
         ? EVIDENCE_UNAVAILABLE_DIAGNOSTIC
-        : evidence.verdict === 'retry' && evidence.reason === 'textless'
-          ? COMPLETED_WITHOUT_TEXT_DIAGNOSTIC
-          : 'Runtime session is idle; task termination is unconfirmed.',
+        : (outcomeDiagnostic ??
+            (evidence.verdict === 'retry' && evidence.reason === 'textless'
+              ? COMPLETED_WITHOUT_TEXT_DIAGNOSTIC
+              : 'Runtime session is idle; task termination is unconfirmed.')),
     );
   }
 

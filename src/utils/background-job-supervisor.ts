@@ -1,6 +1,7 @@
 import type { BackgroundJobRecord } from './background-job-board';
 import type { BackgroundJobStore } from './background-job-store';
 import type { BackgroundJobTerminalGate } from './background-job-terminal-gate';
+import { log } from './logger';
 
 type TimerHandle = ReturnType<typeof setTimeout>;
 
@@ -178,10 +179,16 @@ export class BackgroundJobSupervisor {
       generation,
       this.now(),
     );
-    void this.options.terminalGate.reconcile(
-      { taskID, generation },
-      { kind: 'deadline' },
-    );
+    // Background reconciliation is fail-soft: a failure must be logged
+    // and swallowed, never escape as an unhandled rejection.
+    void this.options.terminalGate
+      .reconcile({ taskID, generation }, { kind: 'deadline' })
+      .catch((err) => {
+        log(
+          '[background-job-supervisor] deadline reconcile failed',
+          String(err),
+        );
+      });
   }
 
   private clear(taskID: string): void {

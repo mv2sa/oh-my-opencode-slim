@@ -120,14 +120,17 @@ export interface DelegationVocabulary {
   /** Name of the tool's agent-selector parameter: `agent` on v2,
    * `subagent_type` on v1. */
   agentParam: string;
+  /** Name of the delegation tool's optional model parameter, when the
+   * host's subagent tool supports one (OpenCode v2.0.5+). */
+  modelParam: string | undefined;
 }
 
 export function delegationVocabulary(
   hostFlavor: string | undefined,
 ): DelegationVocabulary {
   return hostFlavor === 'v2'
-    ? { tool: 'subagent', agentParam: 'agent' }
-    : { tool: 'task', agentParam: 'subagent_type' };
+    ? { tool: 'subagent', agentParam: 'agent', modelParam: 'model' }
+    : { tool: 'task', agentParam: 'subagent_type', modelParam: undefined };
 }
 
 /** Adapt a v1 tool definition ({description, args, execute}) to a v2 tool. */
@@ -153,7 +156,7 @@ export function adaptTool(
     // model-visible tool definitions. Without this flag the tool registers
     // cleanly but is confined to the `execute` tool's JS runtime — session
     // tool catalogs then yield `Unknown tool: <name>`. Additive field;
-    // older hosts ignore it.
+    // hosts that don't recognize the field ignore it.
     options: { codemode: false },
     execute: async (input: unknown, context: unknown) => {
       if (!execute) return { output: {} };

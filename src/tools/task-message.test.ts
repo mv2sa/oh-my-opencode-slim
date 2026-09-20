@@ -1,13 +1,16 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { ToolContext } from '@opencode-ai/plugin';
-import { BackgroundJobBoard as ProductionBackgroundJobBoard } from '../utils/background-job-board';
+import { BackgroundJobBoard as ProductionBoard } from '../utils/background-job-board';
 import { BackgroundJobBoard } from '../utils/background-job-fixture';
 import type { BackgroundJobStore } from '../utils/background-job-store';
 import { createBackgroundJobTerminalGate } from '../utils/background-job-terminal-gate';
 import { createTaskMessageTool } from './task-message';
 
+const ProductionBackgroundJobBoard = ProductionBoard;
+
 let client: Record<string, any>;
 mock.module('../utils/opencode-client', () => ({ getClient: () => client }));
+afterEach(() => mock.restore());
 
 function registerRunningChild(
   board: BackgroundJobBoard,
@@ -383,9 +386,9 @@ describe('task_message', () => {
     const job = board.get('ses_child1');
     expect(job).toBeDefined();
     if (!job) throw new Error('missing running job');
-    expect(
-      board.acquireCancellationLease(job.taskID, job.generation),
-    ).toBeDefined();
+    const lease = board.acquireCancellationLease(job.taskID, job.generation);
+    expect(lease).toBeDefined();
+    if (lease) board.releaseLease(lease);
   });
 
   test('rechecks the job after lookup before prompting', async () => {
@@ -539,38 +542,103 @@ describe('task_message', () => {
     ).toBeDefined();
   });
 
-  test('quarantines a timed-out pending transport until it settles', async () => {
-    const board = new BackgroundJobBoard();
-    registerRunningChild(board);
-    let settlePrompt!: () => void;
-    const prompt = mock(
-      () =>
-        new Promise<unknown>((resolve) => {
-          settlePrompt = () => resolve({});
-        }),
-    );
-    client = { session: makeSession(prompt) };
+  test.each(['resolve', 'reject', 'complete then resolve'])(
+    'quarantines only the pending write taskID and retires once on late %s',
+    async (settlement) => {
+      const board = new BackgroundJobBoard();
+      registerRunningChild(board);
+      registerRunningChild(board, 'ses_child2');
+      const transport = Promise.withResolvers<unknown>();
+      const prompt = mock((input: { path: { id: string } }) =>
+        input.path.id === 'ses_child1'
+          ? transport.promise
+          : Promise.resolve({}),
+      );
+      client = { session: makeSession(prompt) };
+      const acquire = spyOn(ProductionBoard.prototype, 'acquireMessageLease');
+      const release = spyOn(ProductionBoard.prototype, 'releaseLease');
+      const context = { sessionID: 'parent-1' } as any;
+      const tool = createTool(board);
 
-    await expect(
-      createToolWithTimeout(board, 5).execute(
-        { task_id: 'ses_child1', message: 'Please continue.' },
-        { sessionID: 'parent-1' } as any,
-      ),
-    ).rejects.toThrow('timed out');
+      await expect(
+        createToolWithTimeout(board, 5).execute(
+          { task_id: 'ses_child1', message: 'Please continue.' },
+          context,
+        ),
+      ).rejects.toThrow('timed out');
+      const lease = acquire.mock.results[0]?.value;
+      if (!lease) throw new Error('missing message lease');
+      const retirements = () =>
+        release.mock.calls.filter(
+          ([candidate]) => candidate.token === lease.token,
+        );
+      expect(board.validateLease(lease)).toBe(true);
+      expect(retirements()).toHaveLength(0);
+      expect(
+        board.acquireCancellationLease(lease.taskID, lease.generation),
+      ).toBeUndefined();
+      expect(
+        board.acquireRelaunchLease(lease.taskID, lease.generation),
+      ).toBeUndefined();
+      await expect(
+        tool.execute(
+          { task_id: 'ses_child1', message: 'Still excluded.' },
+          context,
+        ),
+      ).rejects.toThrow('message/control lease unavailable');
+      expect(prompt).toHaveBeenCalledTimes(1);
 
-    const job = board.get('ses_child1');
-    expect(job).toBeDefined();
-    if (!job) throw new Error('missing running job');
-    expect(
-      board.acquireCancellationLease(job.taskID, job.generation),
-    ).toBeUndefined();
+      // A different child on the same board/parent remains writable.
+      await expect(
+        tool.execute(
+          { task_id: 'ses_child2', message: 'Independent update.' },
+          context,
+        ),
+      ).resolves.toContain('queued');
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(prompt.mock.calls[1]?.[0].path.id).toBe('ses_child2');
+      expect(board.validateLease(lease)).toBe(true);
+      expect(retirements()).toHaveLength(0);
 
-    settlePrompt();
-    await Bun.sleep(0);
-    expect(
-      board.acquireCancellationLease(job.taskID, job.generation),
-    ).toBeDefined();
-  });
+      const completed = settlement === 'complete then resolve';
+      if (completed) {
+        // Completion can still arrive; only the lease-protected notification waits.
+        board.updateStatus({
+          taskID: lease.taskID,
+          state: 'completed',
+          resultSummary: 'done',
+        });
+        expect(board.getResultSummary(lease.taskID)).toBe('done');
+        expect(
+          board.acquireTerminalNotificationLease(
+            lease.taskID,
+            lease.generation,
+          ),
+        ).toBeUndefined();
+      }
+      const beforeSettlement = { ...board.get(lease.taskID) };
+      if (settlement === 'reject')
+        transport.reject(new Error('late transport failure'));
+      else transport.resolve({});
+      await Bun.sleep(0);
+      expect(retirements()).toHaveLength(1);
+      expect(board.validateLease(lease)).toBe(false);
+      expect(board.get(lease.taskID)).toEqual(beforeSettlement);
+
+      const replacement = completed
+        ? board.acquireTerminalNotificationLease(lease.taskID, lease.generation)
+        : board.acquireMessageLease(lease.taskID, lease.generation);
+      expect(replacement).toBeDefined();
+      if (!replacement) throw new Error('settled write retained exclusion');
+      // The settled write's lease is stale: releasing it is a rejected no-op
+      // and must not retire the replacement token. This call intentionally
+      // passes through the release spy, so retirements() above counts it.
+      expect(board.releaseLease(lease)).toBe(false);
+      expect(board.validateLease(replacement)).toBe(true);
+      expect(board.get(lease.taskID)).toEqual(beforeSettlement);
+      board.releaseLease(replacement);
+    },
+  );
 
   test('rejects a task that is no longer tracked', async () => {
     const board = new BackgroundJobBoard();

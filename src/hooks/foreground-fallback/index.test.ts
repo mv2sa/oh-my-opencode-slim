@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  jest,
+  mock,
+  test,
+} from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -12,6 +20,8 @@ import { ForegroundFallbackManager, isFailoverError } from './index';
 // current test's mock session without relying on this.input (which is
 // undefined in tests — always set in production).
 let currentMockSession: Record<string, unknown> | null = null;
+// Same idea for the raw transport used by foreground-waiter promotion.
+let currentMockPost: ((args: unknown) => Promise<unknown>) | null = null;
 
 // Isolate the persistent cooldown registry so tests never touch the real
 // ~/.config/opencode/model-cooldowns.json and start from a clean file.
@@ -46,6 +56,7 @@ function installGetClientMock(): void {
         messages: mock(() => Promise.resolve({ data: [] })),
         promptAsync: mock(() => Promise.resolve()),
       },
+      _client: currentMockPost ? { post: currentMockPost } : undefined,
     }),
   }));
 }
@@ -60,6 +71,8 @@ function createMockClient(overrides?: {
   abortImpl?: () => Promise<unknown>;
   includePromptAsync?: boolean;
   messagesData?: unknown[];
+  postImpl?: (args: unknown) => Promise<unknown>;
+  includePostClient?: boolean;
 }) {
   const promptAsync = mock(async (args: unknown) => {
     if (overrides?.promptAsyncImpl) return overrides.promptAsyncImpl(args);
@@ -74,6 +87,10 @@ function createMockClient(overrides?: {
       { info: { role: 'user' }, parts: [{ type: 'text', text: 'hello' }] },
     ],
   }));
+  const post = mock(async (args: unknown) => {
+    if (overrides?.postImpl) return overrides.postImpl(args);
+    return true;
+  });
   const session: Record<string, unknown> = {
     abort,
     messages,
@@ -84,6 +101,7 @@ function createMockClient(overrides?: {
 
   // Store for getClient mock
   currentMockSession = session;
+  currentMockPost = overrides?.includePostClient === false ? null : post;
   // Re-register the mock.module at test time so it survives any
   // overwrite from other test files loaded in the same process.
   installGetClientMock();
@@ -91,8 +109,9 @@ function createMockClient(overrides?: {
   return {
     client: {
       session,
+      _client: { post },
     } as never,
-    mocks: { promptAsync, abort, messages },
+    mocks: { promptAsync, abort, messages, post },
   };
 }
 
@@ -153,6 +172,14 @@ describe('isFailoverError', () => {
       isFailoverError({
         message:
           'Your token-plan 1-week quota has been exhausted. The quota will reset at 08-27 15:33:00 UTC.',
+      }),
+    ).toBe(true);
+  });
+
+  test('returns true for client-side response header timeouts (held upstreams)', () => {
+    expect(
+      isFailoverError({
+        message: 'Provider response headers timed out after 300000ms',
       }),
     ).toBe(true);
   });
@@ -1593,6 +1620,338 @@ describe('ForegroundFallbackManager session.status', () => {
     expect(mocks.abort).toHaveBeenCalledTimes(1);
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
     expect(calls).toEqual(['abort', 'promptAsync']);
+  });
+
+  test('promotes foreground task waiter to background before abort when child has known parent', async () => {
+    const calls: string[] = [];
+    const postArgs: unknown[] = [];
+    createMockClient({
+      abortImpl: async () => {
+        calls.push('abort');
+      },
+      promptAsyncImpl: async () => {
+        calls.push('promptAsync');
+        return {};
+      },
+      postImpl: async (args) => {
+        postArgs.push(args);
+        calls.push('promote');
+        return true;
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      3,
+    );
+
+    await mgr.handleEvent({
+      type: 'session.created',
+      properties: {
+        info: { id: 'sess-promoted-child', parentID: 'sess-promoted-parent' },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-promoted-child',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+        },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'session.status',
+      properties: {
+        sessionID: 'sess-promoted-child',
+        status: {
+          type: 'retry',
+          attempt: 1,
+          message: 'rate limit, retrying...',
+        },
+      },
+    });
+
+    // Order-critical: the promotion must land before the abort settles
+    // the job as "cancelled", or the foreground parent sees
+    // "Task cancelled" instead of backgroundResult.
+    expect(calls).toEqual(['promote', 'abort', 'promptAsync']);
+    expect(postArgs[0]).toMatchObject({
+      url: '/experimental/session/{sessionID}/background',
+      path: { sessionID: 'sess-promoted-parent' },
+    });
+  });
+
+  test('skips waiter promotion when the failing session has no known parent', async () => {
+    const calls: string[] = [];
+    createMockClient({
+      abortImpl: async () => {
+        calls.push('abort');
+      },
+      promptAsyncImpl: async () => {
+        calls.push('promptAsync');
+        return {};
+      },
+      postImpl: async () => {
+        calls.push('promote');
+        return true;
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      3,
+    );
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-no-parent',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+        },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'session.status',
+      properties: {
+        sessionID: 'sess-no-parent',
+        status: { type: 'retry', attempt: 1, message: 'rate limit' },
+      },
+    });
+
+    expect(calls).toEqual(['abort', 'promptAsync']);
+  });
+
+  test('waiter promotion failure is fail-soft: abort and fallback still proceed', async () => {
+    const calls: string[] = [];
+    createMockClient({
+      abortImpl: async () => {
+        calls.push('abort');
+      },
+      promptAsyncImpl: async () => {
+        calls.push('promptAsync');
+        return {};
+      },
+      postImpl: async () => {
+        throw new Error('no experimental endpoint on this host');
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      3,
+    );
+
+    await mgr.handleEvent({
+      type: 'session.created',
+      properties: {
+        info: {
+          id: 'sess-promote-fails',
+          parentID: 'sess-promote-fails-parent',
+        },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-promote-fails',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+        },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'session.status',
+      properties: {
+        sessionID: 'sess-promote-fails',
+        status: { type: 'retry', attempt: 1, message: 'rate limit' },
+      },
+    });
+
+    expect(calls).toEqual(['abort', 'promptAsync']);
+  });
+
+  test('promotes the waiter before the busy-session abort in execFallback too', async () => {
+    const calls: string[] = [];
+    const postArgs: unknown[] = [];
+    const { mocks } = createMockClient({
+      promptAsyncImpl: async () => {
+        calls.push('promptAsync');
+        throw new Error('session busy');
+      },
+      abortImpl: async () => {
+        calls.push('abort');
+      },
+      postImpl: async (args) => {
+        postArgs.push(args);
+        calls.push('promote');
+        return true;
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      3,
+    );
+
+    await mgr.handleEvent({
+      type: 'session.created',
+      properties: {
+        info: {
+          id: 'sess-busy-promoted',
+          parentID: 'sess-busy-promoted-parent',
+        },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-busy-promoted',
+        error: { message: 'Rate limit exceeded' },
+      },
+    });
+
+    // Same ordering contract as tryFallbackWithAbort, exercised through
+    // the promptAsync-busy abort inside execFallback: the promotion must
+    // land between the first (busy) attempt and the abort.
+    expect(calls[0]).toBe('promptAsync');
+    expect(calls[1]).toBe('promote');
+    expect(calls[2]).toBe('abort');
+    expect(postArgs[0]).toMatchObject({
+      url: '/experimental/session/{sessionID}/background',
+      path: { sessionID: 'sess-busy-promoted-parent' },
+    });
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+  });
+
+  test('promotes via serverUrl fetch when the client exposes no _client (v2)', async () => {
+    const calls: string[] = [];
+    const fetchTargets: string[] = [];
+    createMockClient({
+      includePostClient: false,
+      abortImpl: async () => {
+        calls.push('abort');
+      },
+      promptAsyncImpl: async () => {
+        calls.push('promptAsync');
+        return {};
+      },
+    });
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+        serverUrl: new URL('http://127.0.0.1:4096'),
+      } as any,
+      3,
+    );
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: unknown) => {
+      fetchTargets.push(String(input));
+      calls.push('promote');
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+    try {
+      await mgr.handleEvent({
+        type: 'session.created',
+        properties: {
+          info: { id: 'sess-v2-child', parentID: 'sess-v2-parent' },
+        },
+      });
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: 'sess-v2-child',
+            providerID: 'anthropic',
+            modelID: 'claude-opus-4-5',
+          },
+        },
+      });
+      await mgr.handleEvent({
+        type: 'session.status',
+        properties: {
+          sessionID: 'sess-v2-child',
+          status: { type: 'retry', attempt: 1, message: 'rate limit' },
+        },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(calls).toEqual(['promote', 'abort', 'promptAsync']);
+    expect(fetchTargets[0]).toBe(
+      'http://127.0.0.1:4096/experimental/session/sess-v2-parent/background',
+    );
+  });
+
+  test('does not abort through a stale client when disposed during promotion', async () => {
+    const calls: string[] = [];
+    let mgr: ForegroundFallbackManager | undefined;
+    createMockClient({
+      postImpl: async () => {
+        calls.push('promote');
+        mgr?.dispose();
+        return true;
+      },
+      abortImpl: async () => {
+        calls.push('abort');
+      },
+      promptAsyncImpl: async () => {
+        calls.push('promptAsync');
+        return {};
+      },
+    });
+    const manager = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      { directory: '/test' } as any,
+      3,
+    );
+    mgr = manager;
+
+    await manager.handleEvent({
+      type: 'session.created',
+      properties: {
+        info: { id: 'sess-dispose-child', parentID: 'sess-dispose-parent' },
+      },
+    });
+    await manager.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-dispose-child',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+        },
+      },
+    });
+    await manager.handleEvent({
+      type: 'session.status',
+      properties: {
+        sessionID: 'sess-dispose-child',
+        status: { type: 'retry', attempt: 1, message: 'rate limit' },
+      },
+    });
+
+    // The promotion landed, but the generation was disposed inside it:
+    // neither the abort nor the replay may run through the stale client.
+    expect(calls).toEqual(['promote']);
   });
 
   test('keeps registered child agent identity sticky for retry fallback chain', async () => {
@@ -4041,5 +4400,162 @@ describe('ForegroundFallbackManager - Antigravity synthetic quota', () => {
 
     // FG manager skips task-owned child session — task-session-manager owns it!
     expect(mocks.promptAsync).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dispose (reload generation cleanup)
+// ---------------------------------------------------------------------------
+
+describe('ForegroundFallbackManager dispose', () => {
+  test('dispose cancels pending initial-delay timers and empties the map', async () => {
+    // `opencode reload` destroys the plugin instance while an initial
+    // fallback delay may still be scheduled. The stale timer must not
+    // fire through the old context after dispose.
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      3, // maxRetries
+      undefined, // coordinator
+      undefined, // onSessionModelChanged
+      40, // initialRetryDelayMs
+    );
+
+    // First failover error on a fresh session schedules the initial
+    // delay instead of intervening immediately.
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-dispose-delay',
+        error: { message: 'Rate limit exceeded' },
+      },
+    });
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+    expect((mgr as any).pendingInitialDelay.size).toBe(1);
+
+    mgr.dispose();
+
+    expect((mgr as any).pendingInitialDelay.size).toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+  });
+
+  test('dispose abandons an in-flight fallback before the replay reaches the old client', async () => {
+    // Reload fencing (upstream PR #1218 P1): the transcript read can
+    // suspend across dispose(); the continuation must not re-prompt,
+    // abort, or otherwise touch the destroyed generation's client.
+    let resolveMessages!: (value: unknown) => void;
+    const messagesPromise = new Promise((resolve) => {
+      resolveMessages = resolve;
+    });
+    const promptAsync = mock(async () => ({}));
+    const abort = mock(async () => ({}));
+    currentMockSession = {
+      messages: mock(() => messagesPromise),
+      promptAsync,
+      abort,
+    };
+    installGetClientMock();
+
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+      3, // maxRetries
+      undefined, // coordinator
+      undefined, // onSessionModelChanged
+      0, // initialRetryDelayMs — intervene immediately
+    );
+
+    // Runs synchronously into the hanging transcript read.
+    const pending = mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-stale-generation',
+        error: { message: 'Rate limit exceeded' },
+      },
+    });
+
+    // Reload happens while the transcript read is suspended.
+    mgr.dispose();
+    resolveMessages({
+      data: [
+        {
+          info: { role: 'user', id: 'm1' },
+          parts: [{ type: 'text', text: 'hello' }],
+        },
+      ],
+    });
+    await pending;
+
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(abort).not.toHaveBeenCalled();
+    // The finally cleanup must still release the process-global
+    // inProgress slot so the reloaded generation is not blocked.
+    expect(mgr.isFallbackInProgress('sess-stale-generation')).toBe(false);
+  });
+
+  test('dispose during retry backoff abandons the attempt with zero further client calls', async () => {
+    // Fake timers (bun:test's jest-compat layer) drive the whole backoff
+    // window so no real wall-clock is awaited. The former real ~500ms
+    // backoff sleep held the event loop open, and concurrently scheduled
+    // test files could poll the shared getClient mock during that window,
+    // polluting the call-count assertions below (the full-suite flake;
+    // the test always passed in isolation).
+    jest.useFakeTimers();
+    try {
+      const { mocks } = createMockClient();
+      const mgr = new ForegroundFallbackManager(
+        { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+        true,
+        { directory: '/test' } as any,
+        3, // maxRetries
+        undefined, // coordinator
+        undefined, // onSessionModelChanged
+        0, // initialRetryDelayMs — intervene immediately
+        6_500, // retryDelayMs — backoff outlives the dedup spacing below
+      );
+
+      // First fallback completes normally: one transcript read + replay.
+      // (Pure microtasks — this path arms no timer.)
+      await mgr.handleEvent({
+        type: 'session.error',
+        properties: {
+          sessionID: 'sess-backoff-dispose',
+          error: { message: 'Rate limit exceeded' },
+        },
+      });
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+
+      // Second trigger: beyond the 5s dedup window but inside the
+      // retryDelayMs backoff, so tryFallback sleeps before
+      // execFallback. Advance the faked clock (moves the mocked
+      // Date.now() past the dedup window without firing any timer),
+      // then run the trigger synchronously into the faked backoff sleep.
+      jest.setSystemTime(Date.now() + 6_000);
+      const pending = mgr.handleEvent({
+        type: 'session.error',
+        properties: {
+          sessionID: 'sess-backoff-dispose',
+          error: { message: 'Rate limit exceeded' },
+        },
+      });
+
+      // Reload during the backoff sleep, then fire the faked timer:
+      // the computed delay is retryDelayMs 6_500 − 6_000 elapsed =
+      // 500ms; advance past it so the sleep settles synchronously.
+      mgr.dispose();
+      jest.advanceTimersByTime(1_000);
+      await pending;
+
+      expect(mocks.messages).toHaveBeenCalledTimes(1); // no second read
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1); // no second replay
+      expect(mocks.abort).not.toHaveBeenCalled();
+      expect(mgr.isFallbackInProgress('sess-backoff-dispose')).toBe(false);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

@@ -121,12 +121,13 @@ export function createV2InterviewBridge(
       await submitUserText(sessionID, text);
     },
     rename: async (sessionID, title) => {
-      if (typeof methods.rename !== 'function') {
+      // Renames go through session.update({sessionID, title}).
+      if (typeof methods.update !== 'function') {
         log('[v2][interview] session rename unavailable', { sessionID });
         return;
       }
       try {
-        await methods.rename({ sessionID, title });
+        await methods.update({ sessionID, title });
       } catch (err) {
         log('[v2][interview] session rename failed', {
           sessionID,

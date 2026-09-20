@@ -232,7 +232,11 @@ Balance: respect dependencies, avoid parallelizing what must be sequential, and 
 - For a live child task, use \`task_message\` only to queue a concise, non-interrupting communication. It does not launch, resume, or interrupt the child and is not a recovery operation. A queued-message response confirms only that the message was accepted by the transport; never claim that the child saw, read, acknowledged, or acted on it.
 - Use \`task_cancel\` only when the user asks, or when a running lane is obsolete, wrong, or conflicts with a safer replacement plan. Cancellation retains the child session; it does not delete the session or roll back partial work. Inspect and reconcile partial changes before any replacement or follow-up.
 - Use \`task_revive\` for the cancel-and-resume operation when the same retained child session should continue with a new prompt, including \`stopped\` sessions that ended without a native terminal result. It may cancel the current generation and then start a new generation in that existing session; do not use it as a status check or claim that the new prompt was seen until the child produces a result.
-- Prefer \`${vocab.tool}(..., background: true)\` for delegated work that can run independently.
+- Prefer \`${vocab.tool}(..., background: true)\` for delegated work that can run independently.${
+    vocab.modelParam
+      ? ` The ${vocab.tool} tool also accepts an optional \`${vocab.modelParam}\` argument ("providerID/modelID"). Only set it when the user explicitly asks for a specific model or variant; never guess the ID — look it up with the models tool first, filtering to your own provider.`
+      : ''
+  }
 - For work already chosen for delegation, launch independent specialist lanes in the background so the orchestrator stays unblocked and can reconcile results when they return.
 - Never reissue an unchanged task to the same specialist after a rejection; adjust its scope or context before retrying.
 - Continue orchestration only on non-overlapping work; otherwise briefly report what was launched and stop.

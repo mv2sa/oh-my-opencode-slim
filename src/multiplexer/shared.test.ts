@@ -294,6 +294,128 @@ describe('waitForSessionReady', () => {
     expect(delays).toEqual([50, 100]);
   });
 
+  test('sends the child directory header to the readiness probe', async () => {
+    const { waitForSessionReady } = await importShared();
+    const seen: Array<{ search: string; headers?: Record<string, string> }> =
+      [];
+    const check = mock(
+      async (
+        checkUrl: URL,
+        _sessionId: string,
+        _signal: AbortSignal,
+        headers?: Record<string, string>,
+      ) => {
+        seen.push({ search: checkUrl.search, headers });
+        return true;
+      },
+    );
+    const ready = await waitForSessionReady(url, 'session-1', {
+      checkSessionReady: check,
+      delay: async () => {},
+      directory: '/home/user/project-b',
+    });
+    expect(ready).toBe(true);
+    expect(seen).toEqual([
+      {
+        search: '',
+        headers: { 'x-opencode-directory': '%2Fhome%2Fuser%2Fproject-b' },
+      },
+    ]);
+  });
+
+  test('sends empty headers when no directory is provided', async () => {
+    const { waitForSessionReady } = await importShared();
+    const seen: Array<{ search: string; headers?: Record<string, string> }> =
+      [];
+    const check = mock(
+      async (
+        checkUrl: URL,
+        _sessionId: string,
+        _signal: AbortSignal,
+        headers?: Record<string, string>,
+      ) => {
+        seen.push({ search: checkUrl.search, headers });
+        return true;
+      },
+    );
+    const ready = await waitForSessionReady(url, 'session-1', {
+      checkSessionReady: check,
+      delay: async () => {},
+    });
+    expect(ready).toBe(true);
+    expect(seen).toEqual([{ search: '', headers: {} }]);
+  });
+
+  test('encodes percent-bearing directories exactly once for the header', async () => {
+    const { waitForSessionReady } = await importShared();
+    const seen: Array<{ search: string; headers?: Record<string, string> }> =
+      [];
+    const check = mock(
+      async (
+        checkUrl: URL,
+        _sessionId: string,
+        _signal: AbortSignal,
+        headers?: Record<string, string>,
+      ) => {
+        seen.push({ search: checkUrl.search, headers });
+        return true;
+      },
+    );
+    const ready = await waitForSessionReady(url, 'session-1', {
+      checkSessionReady: check,
+      delay: async () => {},
+      directory: '/tmp/a%20b',
+    });
+    expect(ready).toBe(true);
+    expect(seen).toEqual([
+      {
+        search: '',
+        headers: { 'x-opencode-directory': '%2Ftmp%2Fa%2520b' },
+      },
+    ]);
+  });
+
+  test('default readiness sends the directory header on its fetch', async () => {
+    const { defaultSessionReady } = await importShared();
+    const seen: Array<{ url: string; headers?: Record<string, string> }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (
+      input: unknown,
+      init?: { headers?: Record<string, string> },
+    ) => {
+      seen.push({ url: String(input), headers: init?.headers });
+      return Response.json({ 'session-1': { type: 'busy' } });
+    }) as typeof fetch;
+    try {
+      const ready = await defaultSessionReady(
+        new URL('http://127.0.0.1:7777/session/status'),
+        'session-1',
+        new AbortController().signal,
+        { 'x-opencode-directory': '%2Frepo' },
+      );
+      expect(ready).toBe(true);
+      expect(seen).toEqual([
+        {
+          url: 'http://127.0.0.1:7777/session/status',
+          headers: { 'x-opencode-directory': '%2Frepo' },
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('buildDirectoryHeaders encodes non-ASCII directories to pure ASCII', async () => {
+    const { buildDirectoryHeaders } = await importShared();
+    const headers: Record<string, string> = buildDirectoryHeaders('/home/josé');
+    expect(headers).toEqual({
+      'x-opencode-directory': '%2Fhome%2Fjos%C3%A9',
+    });
+    expect(
+      Object.values(headers).every((value) => /^[\x20-\x7E]*$/.test(value)),
+    ).toBe(true);
+  });
+
   test('readiness timeout: returns false without ever succeeding', async () => {
     const { waitForSessionReady } = await importShared();
     const check = mock(async () => false);

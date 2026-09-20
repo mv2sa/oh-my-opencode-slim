@@ -83,6 +83,7 @@ describe('session.created pairing', () => {
     });
 
     expect(board.get('child-2')?.description).toBe('L2');
+    expect(board.get('child-2')).not.toHaveProperty('provisional');
     expect(deps.pendingCallTracker.take('b')?.earlyRegisteredTaskID).toBe(
       'child-2',
     );
@@ -124,16 +125,26 @@ describe('session.created pairing', () => {
     expect(record?.description).toBe('unattributed oracle task');
     expect(record?.state).toBe('running');
     expect(record?.background).toBe(false);
+    expect(record?.provisional).toBe(true);
+    expect(board.resolve(PARENT, 'child-9')).toEqual(record);
+    expect(board.resolve(PARENT, record?.alias ?? '')).toEqual(record);
+    expect(board.formatForPromptWithMetadata(PARENT)).toBeUndefined();
   });
 
-  test('child with no pendings at all gets a placeholder registration', async () => {
-    const board = new BackgroundJobBoard();
-    const deps = createDeps(board);
+  test.each(['fixer', undefined])(
+    'child with no pendings gets a placeholder (agent=%s)',
+    async (agent) => {
+      const board = new BackgroundJobBoard();
+      const deps = createDeps(board);
 
-    await route(deps, { id: 'child-9', parentID: PARENT, agent: 'fixer' });
+      await route(deps, { id: 'child-9', parentID: PARENT, agent });
 
-    expect(board.get('child-9')?.description).toBe('unattributed fixer task');
-  });
+      expect(board.get('child-9')?.description).toBe(
+        `unattributed ${agent ?? 'unknown'} task`,
+      );
+      expect(board.get('child-9')?.provisional).toBe(true);
+    },
+  );
 
   test('title that matches no pending yields placeholder, pending untouched', async () => {
     const board = new BackgroundJobBoard();
@@ -148,6 +159,7 @@ describe('session.created pairing', () => {
     });
 
     expect(board.get('child-9')?.description).toBe('unattributed oracle task');
+    expect(board.get('child-9')?.provisional).toBe(true);
     expect(
       deps.pendingCallTracker.take('a')?.earlyRegisteredTaskID,
     ).toBeUndefined();

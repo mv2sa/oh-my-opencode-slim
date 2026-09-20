@@ -1130,7 +1130,7 @@ describe('tool execute bridge status discrimination', () => {
     expect(seen).toEqual(['']);
   });
 
-  test('absent status (older hosts) keeps the completed path', async () => {
+  test('absent status (defensive) keeps the completed path', async () => {
     const seen: unknown[] = [];
     const event = {
       tool: 'subagent',

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import type { ReusableSessionSelection } from './utils/background-job-board';
 
 /**
  * Per-session metadata projection for the clickable sidebar. Entries only
@@ -15,6 +16,11 @@ export interface TuiSessionDetails {
   model?: string;
   status?: 'busy' | 'retry';
 }
+
+/** Latest accessible reconciled session per agent of a parent session
+ * (sidebar green dot). Written only by the host-side board projection;
+ * the TUI never writes this section. Empty on hosts without a board. */
+export type TuiReusableSession = ReusableSessionSelection;
 
 export interface TuiSnapshot {
   version: 1;
@@ -38,6 +44,15 @@ export interface TuiSnapshot {
   sessionParents: Record<string, string>;
   /** Per-active-session details (alias/model/status) for the sidebar. */
   sessionDetails: Record<string, TuiSessionDetails>;
+  /**
+   * Latest reconciled reusable session per agent, keyed by parent
+   * sessionID (sidebar green dot). Version stays 1: `parseSnapshot`
+   * defaults this to `{}` so old snapshots remain readable and old
+   * writers' snapshots simply gain an empty section on rewrite.
+   * Host-board state is process-local by design (dots die on host
+   * restart), so this section is never restored from a stale file.
+   */
+  reusableByAgent: Record<string, Record<string, TuiReusableSession>>;
 }
 
 const STATE_DIR = 'oh-my-opencode-slim';
@@ -87,6 +102,7 @@ function emptySnapshot(): TuiSnapshot {
     activityPids: {},
     sessionParents: {},
     sessionDetails: {},
+    reusableByAgent: {},
   };
 }
 
@@ -127,6 +143,52 @@ function parseSessionDetails(
   return out;
 }
 
+function parseReusableByAgent(
+  value: unknown,
+): Record<string, Record<string, TuiReusableSession>> {
+  if (value === null || typeof value !== 'object') return {};
+  const out: Record<string, Record<string, TuiReusableSession>> = {};
+  for (const [parentID, byAgent] of Object.entries(
+    value as Record<string, unknown>,
+  )) {
+    if (byAgent === null || typeof byAgent !== 'object') continue;
+    const agents: Record<string, TuiReusableSession> = {};
+    for (const [agentName, entry] of Object.entries(
+      byAgent as Record<string, unknown>,
+    )) {
+      if (entry === null || typeof entry !== 'object') continue;
+      const rec = entry as {
+        taskID?: unknown;
+        alias?: unknown;
+        terminalState?: unknown;
+        completedAt?: unknown;
+        lastUsedAt?: unknown;
+      };
+      if (
+        typeof rec.taskID !== 'string' ||
+        typeof rec.alias !== 'string' ||
+        (rec.terminalState !== 'completed' &&
+          rec.terminalState !== 'error' &&
+          rec.terminalState !== 'cancelled') ||
+        typeof rec.lastUsedAt !== 'number'
+      ) {
+        continue;
+      }
+      agents[agentName] = {
+        taskID: rec.taskID,
+        alias: rec.alias,
+        terminalState: rec.terminalState,
+        ...(typeof rec.completedAt === 'number'
+          ? { completedAt: rec.completedAt }
+          : {}),
+        lastUsedAt: rec.lastUsedAt,
+      };
+    }
+    if (Object.keys(agents).length > 0) out[parentID] = agents;
+  }
+  return out;
+}
+
 function parseSnapshot(value: string): TuiSnapshot {
   const parsed = JSON.parse(value) as Partial<TuiSnapshot> | undefined;
   if (parsed?.version !== 1) return emptySnapshot();
@@ -141,6 +203,10 @@ function parseSnapshot(value: string): TuiSnapshot {
     activityPids: parsePidRecord(parsed.activityPids),
     sessionParents: parseStringRecord(parsed.sessionParents),
     sessionDetails: parseSessionDetails(parsed.sessionDetails),
+    // Absent (pre-dot snapshots) parses as {}: old writers stay
+    // readable. Present values parse normally so the TUI can render the
+    // host board's live projection.
+    reusableByAgent: parseReusableByAgent(parsed.reusableByAgent),
   };
 }
 
@@ -375,6 +441,12 @@ function cloneSnapshot(snapshot: TuiSnapshot): TuiSnapshot {
         { ...details },
       ]),
     ),
+    reusableByAgent: Object.fromEntries(
+      Object.entries(snapshot.reusableByAgent).map(([key, agents]) => [
+        key,
+        { ...agents },
+      ]),
+    ),
   };
 }
 
@@ -385,7 +457,8 @@ export function snapshotSectionsEqual(a: TuiSnapshot, b: TuiSnapshot): boolean {
     JSON.stringify(a.activeSessions) === JSON.stringify(b.activeSessions) &&
     JSON.stringify(a.activityPids) === JSON.stringify(b.activityPids) &&
     JSON.stringify(a.sessionParents) === JSON.stringify(b.sessionParents) &&
-    JSON.stringify(a.sessionDetails) === JSON.stringify(b.sessionDetails)
+    JSON.stringify(a.sessionDetails) === JSON.stringify(b.sessionDetails) &&
+    JSON.stringify(a.reusableByAgent) === JSON.stringify(b.reusableByAgent)
   );
 }
 
@@ -422,7 +495,7 @@ function memoFor(statePath: string): TuiSnapshot | undefined {
   return entry.snapshot;
 }
 
-function updateSnapshot(
+export function updateSnapshot(
   projectDir: string,
   mutator: (snapshot: TuiSnapshot) => void,
 ): void {

@@ -8,12 +8,12 @@ import {
   recordInternalAdmission,
 } from './internal-admissions';
 import {
-  __resetChatHeadersOrderingTripwireForTesting,
   type ChatHeaderSessionStates,
   createChatHeadersBridge,
   createSessionContextHandler,
   createSessionPromptBridge,
   observeChatHeaderState,
+  resetV2GenerationWarnings,
 } from './setup';
 import type {
   V2Context,
@@ -193,7 +193,7 @@ describe('observeChatHeaderState', () => {
 describe('createChatHeadersBridge', () => {
   beforeEach(() => {
     __resetInternalAdmissionsForTesting();
-    __resetChatHeadersOrderingTripwireForTesting();
+    resetV2GenerationWarnings();
   });
 
   test('sets x-initiator: agent for an internal Copilot primary request', async () => {

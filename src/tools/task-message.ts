@@ -92,26 +92,30 @@ export function createTaskMessageTool(options: {
           options.messageTimeoutMs ?? DEFAULT_MESSAGE_TIMEOUT_MS,
         );
         const deadline = Date.now() + messageTimeoutMs;
-        const lookupController = new AbortController();
         let modelSelection: ContinuationModelSelection | undefined;
-        try {
-          modelSelection = await withTimeout(
-            readCurrentChildModel(
-              session,
-              lease.taskID,
-              options.input.directory,
-              lookupController.signal,
-            ),
-            messageTimeoutMs,
-            `Task message model lookup timed out after ${messageTimeoutMs}ms`,
-          );
-        } finally {
-          lookupController.abort();
-        }
-        if (!modelSelection) {
-          throw new Error(
-            `Task ${requested} has no authoritative model identity; refusing message`,
-          );
+        // v2 prompts inherit persisted session selection; per-call overrides
+        // cannot be represented atomically. Keep the v1 lookup/pin unchanged.
+        if ((options.input as { hostFlavor?: string }).hostFlavor !== 'v2') {
+          const lookupController = new AbortController();
+          try {
+            modelSelection = await withTimeout(
+              readCurrentChildModel(
+                session,
+                lease.taskID,
+                options.input.directory,
+                lookupController.signal,
+              ),
+              messageTimeoutMs,
+              `Task message model lookup timed out after ${messageTimeoutMs}ms`,
+            );
+          } finally {
+            lookupController.abort();
+          }
+          if (!modelSelection) {
+            throw new Error(
+              `Task ${requested} has no authoritative model identity; refusing message`,
+            );
+          }
         }
 
         const remainingTimeoutMs = deadline - Date.now();
@@ -134,9 +138,13 @@ export function createTaskMessageTool(options: {
               lease.generation,
             );
             const body = {
-              agent: currentJob.agent,
-              model: modelSelection.model,
-              variant: modelSelection.variant ?? 'default',
+              ...(modelSelection
+                ? {
+                    agent: currentJob.agent,
+                    model: modelSelection.model,
+                    variant: modelSelection.variant ?? 'default',
+                  }
+                : {}),
               noReply: true,
               parts: [{ type: 'text', text: args.message.trim() }],
             } as Parameters<typeof prompt>[0]['body'];

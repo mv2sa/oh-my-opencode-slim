@@ -439,6 +439,7 @@ export async function handleEvent(
             description: `unattributed ${agent} task`,
             objective: `unattributed ${agent} task`,
             background: false,
+            provisional: true,
           });
           log(
             '[task-session-manager] placeholder board registration for unattributed child session',

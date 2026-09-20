@@ -289,9 +289,56 @@ const SCENARIOS: Scenario[] = [
 const CHEAP_SET = ['plain', 'tools'];
 const EXTENSIVE_SET = SCENARIOS.map((scenario) => scenario.name);
 
+let shuttingDown = false;
+let spawnedServe:
+  | { child: ReturnType<typeof spawn>; scratch?: string }
+  | undefined;
+
+function stopSpawnedServe(
+  spawned: { child: ReturnType<typeof spawn> } | undefined,
+  signal: NodeJS.Signals,
+): void {
+  const pid = spawned?.child.pid;
+  if (!pid) return;
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      spawned.child.kill(signal);
+    } catch {
+      // already gone
+    }
+  }
+}
+
+function cleanupSpawnedServe(): void {
+  shuttingDown = true;
+  const spawned = spawnedServe;
+  spawnedServe = undefined;
+  if (!spawned) return;
+  // The record is passed explicitly: the module global is already cleared,
+  // and reading it here would skip both signals and orphan the serve group.
+  stopSpawnedServe(spawned, 'SIGTERM');
+  stopSpawnedServe(spawned, 'SIGKILL');
+  if (spawned.scratch) {
+    try {
+      rmSync(spawned.scratch, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+  }
+}
+
 function fail(message: string): never {
   console.error(`\ncache-smoke: ${message}`);
+  cleanupSpawnedServe();
   process.exit(3);
+}
+
+function installInterruptHandlers(): void {
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.on(signal, () => fail(`interrupted (${signal})`));
+  }
 }
 
 function parseArgs(argv: string[]): Args {
@@ -667,10 +714,10 @@ async function runScenario(
 }
 
 async function main(): Promise<void> {
+  installInterruptHandlers();
   const args = parseArgs(process.argv.slice(2));
 
   let base = args.server;
-  let child: ReturnType<typeof spawn> | undefined;
   let scratch: string | undefined;
 
   if (!base) {
@@ -709,19 +756,22 @@ async function main(): Promise<void> {
     const port = await getFreePort();
     base = `http://127.0.0.1:${port}`;
     console.log(`starting opencode serve on ${base} (cwd: ${scratch})`);
-    child = spawn(
+    const child = spawn(
       binary,
       ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
       {
         cwd: scratch,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true,
       },
     );
+    spawnedServe = { child, scratch };
     const stderrChunks: string[] = [];
     child.stderr?.on('data', (chunk: Buffer) => {
       stderrChunks.push(String(chunk));
     });
     child.once('exit', (code) => {
+      if (shuttingDown) return;
       if (code !== null && code !== 0) {
         console.error(stderrChunks.join('').slice(-2000));
         fail(`opencode serve exited early with code ${code}`);
@@ -729,11 +779,6 @@ async function main(): Promise<void> {
     });
     await waitForHealth(base);
   }
-
-  const cleanup = () => {
-    child?.kill('SIGTERM');
-    if (scratch) rmSync(scratch, { recursive: true, force: true });
-  };
 
   try {
     const scenarios = SCENARIOS.filter((scenario) =>
@@ -769,7 +814,7 @@ async function main(): Promise<void> {
       );
     }
   } finally {
-    cleanup();
+    cleanupSpawnedServe();
   }
 }
 

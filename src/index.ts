@@ -23,6 +23,7 @@ import {
 } from './config/constants';
 import { RuntimeConfig } from './config/runtime';
 import { applyOrchestratorModelConfig } from './config/strip-orchestrator-model';
+import { getBuildInfo } from './generated/build-info';
 import { HEALTH_CHECK, minimumExpectedToolCount } from './health-check';
 import {
   createAbsolutePathRescueHook,
@@ -44,6 +45,7 @@ import {
   ForegroundFallbackManager,
   formatStoppedJobDelta,
   SessionLifecycle,
+  stoppedJobRecoveryReason,
 } from './hooks';
 import {
   type CooldownRegistry,
@@ -51,6 +53,7 @@ import {
 } from './hooks/foreground-fallback/cooldown-registry';
 import { createSyntheticQuotaCoordinator } from './hooks/foreground-fallback/synthetic-quota';
 import { processImageAttachments } from './hooks/image-hook';
+import { clearAllWakeSessions } from './hooks/orchestrator-wake/wake-gate';
 import { createBackgroundFallbackHandoff } from './hooks/task-session-manager/fallback-observation-transfer';
 import { createRevivedRunTracker } from './hooks/task-session-manager/revived-run-tracker';
 import type { ToolLoopGuardHook } from './hooks/tool-loop-guard/hook';
@@ -109,6 +112,7 @@ import { isPluginDisabledByEnv } from './utils/env';
 import { isInternalInitiatorPart } from './utils/internal-initiator';
 import { probeJSDOM } from './utils/jsdom';
 import { initLogger, log } from './utils/logger';
+import { getClient } from './utils/opencode-client';
 import { SessionMetadataStore } from './utils/session-metadata';
 import {
   createSessionSelectionReader,
@@ -118,6 +122,7 @@ import {
   collapseSystemInPlace,
   looksLikeMainChatRequest,
 } from './utils/system-collapse';
+import { createTuiReusableProjection } from './utils/tui-reusable-projection';
 import { createV2Setup } from './v2';
 import {
   isInternalAdmission,
@@ -237,6 +242,7 @@ export function sessionManagerMultiplexerConfig(
 export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   const sessionId = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
   initLogger(sessionId);
+  log('[plugin] build info', getBuildInfo());
 
   if (isPluginDisabledByEnv()) {
     log('[plugin] disabled by OH_MY_OPENCODE_SLIM_DISABLE');
@@ -589,6 +595,16 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     // Project launch identity (alias↔session) into TUI state so the
     // clickable sidebar can label active subagent sessions. Best-effort:
     // a failed tui-state write must never fail a launch.
+    //
+    // Generation-scoped by construction: the projector listens on THIS
+    // generation's board, which dies with the generation, so its listener
+    // is never notified after dispose and no explicit unhook is wired
+    // into the instance-disposed path. Revisit only if a board ever
+    // outlives its generation.
+    createTuiReusableProjection({
+      board: backgroundJobBoard,
+      projectDir: ctx.directory,
+    });
     backgroundJobCoordinator.addLaunchIdentityListener((event) => {
       const directory = tuiActivityDirectory(event.taskID);
       if (event.kind === 'registered') {
@@ -611,8 +627,16 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     terminalGate = createBackgroundJobTerminalGate({
       backgroundJobBoard: backgroundJobCoordinator,
       input: ctx,
+      // Configurable stop-confirmation grace (backgroundJobs.
+      // stopConfirmationMs); the default equals
+      // STOP_CONFIRMATION_GRACE_MS, so unset config keeps v1 behavior.
+      graceMs: runtime.backgroundJobs.stopConfirmationMs,
       baselineFor: (taskID, generation) =>
         revivedRunTracker?.baselineFor(taskID, generation),
+      // Local in-process integration: host and plugin timestamps share Unix ms.
+      hostOutcomeClock: 'shared-unix-ms',
+      attemptStartedAtFor: (taskID, generation) =>
+        revivedRunTracker?.attemptStartedAtFor(taskID, generation),
       observationRevisionFor: (taskID, generation) =>
         revivedRunTracker?.revisionFor(taskID, generation),
       isObservationPending: (taskID, generation) =>
@@ -677,6 +701,21 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       onSettled: (taskID) => markRevivedRunSettled(taskID),
       contextFilesForPrompt: (taskID) => getRevivedContextFiles(taskID),
       pruneContext: () => pruneRevivedContext(),
+      // Degraded-fallback wiring (revived-lineage strand): when every
+      // tracker notification attempt has failed, the publication this
+      // tracker suppressed in the terminal-outcome listener would
+      // otherwise never reach the idle parent. Re-emit it DIRECTLY
+      // through the wake scheduler — never through the listener's
+      // suppression chain: a revived lineage has no native notifier, so
+      // the first-publication-native-owned (and tracker-owned) skips
+      // must not apply to this fallback. The scheduler's own guards
+      // (canSchedule, one-flight wake gate, publication throttle) still
+      // apply, correctly.
+      onOwnershipReleased: (parentSessionID, taskID, generation) => {
+        void orchestratorWakeScheduler
+          .triggerTerminalPublicationWake(parentSessionID, taskID, generation)
+          .catch(() => undefined);
+      },
     });
     backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
       revivedRunTracker.onTerminal(record);
@@ -781,6 +820,43 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       backgroundJobBoard: backgroundJobCoordinator,
       backgroundJobSupervisor,
       backgroundTaskConcurrency,
+      hasUntrackedRunningChild: async (parentSessionID?: string) => {
+        if (!parentSessionID) return true;
+        try {
+          const client = getClient(ctx);
+          const session = client.session as unknown as
+            | { list?: unknown; status?: unknown }
+            | undefined;
+          // Old/mock hosts without the list API: probe unavailable, degrade
+          // to the plain unknown-alias drop instead of failing closed.
+          if (
+            typeof session?.list !== 'function' ||
+            typeof session?.status !== 'function'
+          ) {
+            return false;
+          }
+          const listed = await client.session.list();
+          const children = (
+            (listed.data ?? []) as Array<{ id: string; parentID?: string }>
+          ).filter((s) => s.parentID === parentSessionID);
+          if (children.length === 0) return false;
+          // Children the board already tracks are guarded by the known-task
+          // refusals upstream; only untracked ones can duplicate silently.
+          const tracked = new Set(
+            backgroundJobCoordinator.list().map((j) => j.taskID),
+          );
+          const untracked = children.filter((c) => !tracked.has(c.id));
+          if (untracked.length === 0) return false;
+          const status = await client.session.status();
+          const map = (status.data ?? {}) as Record<string, { type?: string }>;
+          return untracked.some((c) => {
+            const t = map[c.id]?.type;
+            return t === 'busy' || t === 'retry';
+          });
+        } catch {
+          return true;
+        }
+      },
       pendingCallTracker: admissionRuntimeLease.pendingCallTracker,
       getModelForAgent: (agentType: string, parentSessionID?: string) =>
         // Admission must use the config after the host has merged all of its
@@ -841,7 +917,32 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       coordinator: sessionLifecycle,
     });
     backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
+      // A placeholder is not delegated work; its stop is not recoverable
+      // by the parent until a task launch has attributed the session.
+      if (record.provisional === true) return;
       if (record.state !== 'stopped' || !record.terminalUnreconciled) return;
+      // Symmetric tracker suppression (M4): when the revived-run tracker
+      // owns this generation's delivery — it already delivered the run's
+      // terminal <task> notification — a recovery wake beside it would
+      // queue a second admission for a lineage the parent already heard
+      // from. Scoped like the publication listener's check: a stop that
+      // is the generation's FIRST publication has no tracker delivery
+      // beside it (the tracker only delivers completed/error), so the
+      // recovery wake stays that stop's one and only notification.
+      if (
+        record.terminalRevision > 1 &&
+        revivedRunTracker.willNotifyParent(record.taskID, record.generation)
+      ) {
+        log('[orchestrator-wake] stopped-job recovery wake skipped', {
+          sessionID: record.parentSessionID,
+          taskID: record.taskID,
+          generation: record.generation,
+          trigger: 'stopped-job-recovery',
+          verdict: 'skipped',
+          reason: 'revived-tracker-owns-delivery',
+        });
+        return;
+      }
       orchestratorWakeScheduler.triggerStoppedJobRecovery(
         record.parentSessionID,
         // Self-contained stop facts: the recovery wake is an
@@ -853,14 +954,72 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           taskID: record.taskID,
           generation: record.generation,
           state: record.state,
-          reason: record.timedOut
-            ? 'wall-clock deadline exceeded'
-            : record.statusUncertain
-              ? 'runtime status uncertain'
-              : 'stopped without a terminal result',
+          reason: stoppedJobRecoveryReason(record),
         }),
         `${record.taskID}:${record.generation}`,
       );
+    });
+    // Terminal-publication wake: completed/error publications reaching an
+    // IDLE parent (state-disjoint from the stopped recovery listener
+    // above — stopped+terminalUnreconciled vs completed|error). A busy
+    // parent is skipped inside the trigger: the native steer already
+    // delivered the first completion, so a queued wake would
+    // double-notify.
+    backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
+      if (record.state !== 'completed' && record.state !== 'error') return;
+      // Revived-run ownership: when the tracker will deliver this run's
+      // <task> result itself (notifyParent), a publication wake beside
+      // it would queue a SECOND admission to the idle parent — the
+      // double-notify the exactly-once notification contract forbids.
+      // Scoped to the exact (taskID, generation) the tracker owns;
+      // non-revived publications are unaffected.
+      if (
+        revivedRunTracker.willNotifyParent(record.taskID, record.generation)
+      ) {
+        log('[orchestrator-wake] terminal publication wake skipped', {
+          sessionID: record.parentSessionID,
+          taskID: record.taskID,
+          generation: record.generation,
+          trigger: 'terminal-publication',
+          verdict: 'skipped',
+          reason: 'revived-tracker-owns-delivery',
+        });
+        return;
+      }
+      // First-publication ownership (live-verified on a 2.0.8 host): the
+      // native notifier delivers a run's FIRST terminal publication to
+      // the parent even while it sits idle, so a plugin wake beside it
+      // would double-notify. On v2 EVERY plugin task launch AND relaunch
+      // is a host `subagent` tool call that arms the host's native
+      // background notifier — a relaunch re-arms it with a fresh
+      // `started_at`, defeating the notify dedupe — so the native
+      // contract covers the FIRST publication (terminalRevision 1) of
+      // EVERY generation, not just the original launch. Only later
+      // revisions of the same generation (rev>1: a child
+      // self-continuation, a direct prompt to the child session) have no
+      // native notifier and remain the plugin's to deliver (v1 behaves
+      // the same: the native task tool arms notifyBackgroundResult per
+      // background call). Edge: if a native delivery is ever lost
+      // host-side, the job falls back to board injection on the parent's
+      // next activity (pre-branch parity).
+      if (record.terminalRevision === 1) {
+        log('[orchestrator-wake] terminal publication wake skipped', {
+          sessionID: record.parentSessionID,
+          taskID: record.taskID,
+          generation: record.generation,
+          trigger: 'terminal-publication',
+          verdict: 'skipped',
+          reason: 'first-publication-native-owned',
+        });
+        return;
+      }
+      void orchestratorWakeScheduler
+        .triggerTerminalPublicationWake(
+          record.parentSessionID,
+          record.taskID,
+          record.generation,
+        )
+        .catch(() => undefined);
     });
 
     // Initialize hooks and wrapPostToolHook helper for error isolation
@@ -1236,7 +1395,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             // precedence over the config's fallback chain to preserve
             // runtime selections and avoid breaking provider cache.
             const hostModel = runtime.hostAgent(agentName)?.model;
-            if (hostModel === undefined) {
+            const inheritModelFrom = runtime.agent(agentName)?.inheritModelFrom;
+            if (hostModel === undefined && inheritModelFrom === undefined) {
               entry.model = chosen.id;
               if (chosenVariant) entry.variant = chosenVariant;
               else delete entry.variant;
@@ -1249,10 +1409,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           } else {
             // Agent exists in slim but not in opencodeConfig.agent -
             // create entry
-            (configAgent as Record<string, unknown>)[agentName] = {
-              model: chosen.id,
-              ...(chosenVariant ? { variant: chosenVariant } : {}),
-            };
+            const inheritModelFrom = runtime.agent(agentName)?.inheritModelFrom;
+            if (inheritModelFrom === undefined) {
+              (configAgent as Record<string, unknown>)[agentName] = {
+                model: chosen.id,
+                ...(chosenVariant ? { variant: chosenVariant } : {}),
+              };
+            }
           }
           log('[plugin] resolved model from array', {
             agent: agentName,
@@ -1300,6 +1463,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             } else if (override.variant === undefined) {
               delete entry.variant;
             }
+          } else if (override.inheritModelFrom !== undefined) {
+            delete entry.model;
           }
           // Explicitly set or clear scalar fields so switching from
           // Preset A (which sets a field) to Preset B (which doesn't)
@@ -1329,6 +1494,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             model: entry.model as string,
           });
         }
+        applyModelInheritanceToConfig(configAgent, runtime);
       }
 
       // Capture the resolved model state before optionally removing the
@@ -1755,15 +1921,30 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     dispose: async () => {
       terminalGate?.dispose();
+      // Cancel pending initial-delay fallback timers so a reloaded
+      // generation cannot observe one stale fallback call.
+      foregroundFallback.dispose();
       await taskSessionManagerHook.event({
         event: { type: 'server.instance.disposed' },
       });
       await orchestratorWakeScheduler.event({
         event: { type: 'server.instance.disposed' },
       });
+      // The scheduler cleanup above only clears its own instance state;
+      // the wake gate is process-global (globalThis + Symbol.for) and
+      // survives module re-entry. `opencode reload` reuses this process,
+      // so generation two would otherwise inherit generation one's
+      // two-wake no-progress caps and never wake those sessions again.
+      clearAllWakeSessions();
       await interviewManager.dispose();
       await multiplexerSessionManager.cleanupOnInstanceDisposed();
       clearTuiActivities();
+      // Explicitly release this generation's companion ownership: a
+      // reloaded generation only replaces the active manager at its own
+      // onLoad, and if it fails before that the detached companion would
+      // survive until process exit. Idempotent (registerActiveManager's
+      // replacement path and the process-exit listener tolerate repeats).
+      companionManager.onExit();
       // Release only this generation's ownership. The admission runtime
       // defers final scheduler/tracker teardown by one macrotask so an
       // immediate config-update re-init can retain active and queued calls.

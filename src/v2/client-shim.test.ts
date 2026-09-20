@@ -451,13 +451,12 @@ describe('v2 client shim delegation', () => {
     expect((seq[0].i as { files: unknown[] }).files).toHaveLength(1);
   });
 
-  test('abort delegates to interrupt', async () => {
-    const calls: unknown[] = [];
+  test('abort sends interrupt with resume:false', async () => {
+    const calls: Array<Record<string, unknown>> = [];
     const input = buildPluginInput(
       makeCtx({
-        interrupt: async (i: unknown) => {
+        interrupt: async (i: Record<string, unknown>) => {
           calls.push(i);
-          return { interrupted: true };
         },
       } as never),
     );
@@ -466,7 +465,7 @@ describe('v2 client shim delegation', () => {
         session: { abort: (a: unknown) => Promise<unknown> };
       }
     ).session.abort({ path: { id: 'ses_1' } });
-    expect(calls).toEqual([{ sessionID: 'ses_1', continue: false }]);
+    expect(calls).toEqual([{ sessionID: 'ses_1', resume: false }]);
   });
 
   test('get delegates to session.get and wraps into {data}', async () => {
@@ -488,6 +487,26 @@ describe('v2 client shim delegation', () => {
     ).session.get({ path: { id: 'ses_1' }, query: { directory: '/proj' } });
     expect(calls).toEqual([{ sessionID: 'ses_1' }]);
     expect(res.data).toEqual({ id: 'ses_1', parentID: 'ses_0', title: 't' });
+  });
+
+  test('session.update maps v1 rename body to v2 session.update', async () => {
+    const calls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        update: async (i: unknown) => {
+          calls.push(i);
+        },
+      } as never),
+    );
+    await (
+      input.client as {
+        session: { update: (a: unknown) => Promise<unknown> };
+      }
+    ).session.update({
+      path: { id: 'ses_1' },
+      body: { title: 'New title' },
+    });
+    expect(calls).toEqual([{ sessionID: 'ses_1', title: 'New title' }]);
   });
 
   test('delete delegates to session.remove with the flat {sessionID}', async () => {
@@ -1217,11 +1236,11 @@ describe('v2 client shim foreground-fallback integration', () => {
       'The previous model request failed',
     );
 
-    // Step 3: abort maps to interrupt with continue:false.
+    // Step 3: abort maps to interrupt with resume:false.
     await session.abort({ path: { id: 'ses_1' } });
     expect(seq[2]).toEqual({
       m: 'interrupt',
-      i: { sessionID: 'ses_1', continue: false },
+      i: { sessionID: 'ses_1', resume: false },
     });
   });
 
@@ -1263,6 +1282,141 @@ describe('v2 client shim foreground-fallback integration', () => {
       { type: 'text', text: 'hello' },
       { type: 'reasoning', text: 'inner' },
     ]);
+  });
+
+  // ── Task 4 live gap: terminal metadata must survive the mapping ──
+  //
+  // Live 2.0.8 incident: `session.context` returns full
+  // `SessionMessage.Info` entries (assistant turns carry
+  // `time.completed`, `finish`, `error`; tool parts carry
+  // `state.status`), but the mapping reduced `info` to `{id, role}` —
+  // every downstream classification degraded to pending/unknown and the
+  // terminal gate starved. The 2.0.8 `idle` marker that trails every
+  // finished session must map to the skippable v1 `system` role.
+
+  test('messages preserves v2 terminal metadata through the v1 mapping', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        context: async () => [
+          {
+            // Live 2.0.8 durable shape: flat user entry (text, no content).
+            id: 'msg_user',
+            type: 'user',
+            time: { created: 1789774955129 },
+            text: 'probe',
+          },
+          {
+            // Assistant turn carrying terminal metadata.
+            id: 'msg_turn',
+            type: 'assistant',
+            time: {
+              created: 1789774964894,
+              streamed: 1789774973110,
+              completed: 1789774973280,
+            },
+            finish: 'stop',
+            content: [
+              {
+                type: 'tool',
+                id: 'call_1',
+                name: 'glob',
+                state: {
+                  status: 'completed',
+                  input: { pattern: 'src/utils/*.ts' },
+                  content: [{ type: 'text', text: 'a.ts' }],
+                },
+                time: { created: 1789774971426 },
+              },
+              { type: 'text', text: 'PROBE-OK: 55' },
+            ],
+          },
+          {
+            // The 2.0.8 trailing idle lifecycle marker.
+            id: 'msg_idle',
+            type: 'idle',
+            time: { created: 1789774973283 },
+            outcome: 'succeeded',
+          },
+        ],
+      } as never),
+    );
+    const result = await (
+      input.client as {
+        session: {
+          messages: (a: unknown) => Promise<{ data: unknown[] }>;
+        };
+      }
+    ).session.messages({ sessionID: 'ses_1' });
+
+    expect(result.data).toHaveLength(3);
+    const [user, assistant, idle] = result.data as Array<{
+      info: Record<string, unknown>;
+      parts: Array<Record<string, unknown>>;
+    }>;
+    // User: flat entry, no content → empty parts; created time preserved.
+    expect(user.info).toMatchObject({
+      id: 'msg_user',
+      role: 'user',
+      time: { created: 1789774955129 },
+    });
+    expect(user.parts).toEqual([]);
+    // Assistant: time/finish preserved; tool state passes through in the
+    // v1 vocabulary the transcript classifier reads.
+    expect(assistant.info).toMatchObject({
+      id: 'msg_turn',
+      role: 'assistant',
+      time: {
+        created: 1789774964894,
+        completed: 1789774973280,
+      },
+      finish: 'stop',
+    });
+    expect(assistant.parts[0]).toMatchObject({
+      type: 'tool',
+      state: { status: 'completed' },
+    });
+    expect(assistant.parts[1]).toEqual({ type: 'text', text: 'PROBE-OK: 55' });
+    // Idle marker: lifecycle boundary, mapped to the skippable system
+    // role (never user/assistant content).
+    expect(idle.info).toMatchObject({
+      id: 'msg_idle',
+      role: 'system',
+      time: { created: 1789774973283 },
+    });
+    expect(idle.parts).toEqual([]);
+  });
+
+  test('messages preserves assistant error and finish state for failed turns', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        context: async () => [
+          {
+            id: 'msg_fail',
+            type: 'assistant',
+            time: { created: 1, completed: 2 },
+            finish: 'error',
+            error: { type: 'provider', message: 'detonated' },
+            content: [],
+          },
+        ],
+      } as never),
+    );
+    const result = await (
+      input.client as {
+        session: {
+          messages: (a: unknown) => Promise<{ data: unknown[] }>;
+        };
+      }
+    ).session.messages({ sessionID: 'ses_1' });
+    expect(result.data[0]).toMatchObject({
+      info: {
+        id: 'msg_fail',
+        role: 'assistant',
+        finish: 'error',
+        error: { type: 'provider', message: 'detonated' },
+      },
+      parts: [],
+    });
   });
 });
 

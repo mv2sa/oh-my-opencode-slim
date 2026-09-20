@@ -79,14 +79,22 @@ describe('CmuxMultiplexer', () => {
       return true;
     });
     let attempt = 0;
-    const readiness = mock(async (url: URL, sessionId: string) => {
-      events.push('status');
-      expect(url.href).toBe('https://example.test/session/status');
-      expect(sessionId).toBe('session-1');
-      attempt += 1;
-      if (attempt === 2) throw new Error('network');
-      return attempt >= 4;
-    });
+    const readiness = mock(
+      async (
+        url: URL,
+        sessionId: string,
+        _signal: AbortSignal,
+        headers?: Record<string, string>,
+      ) => {
+        events.push('status');
+        expect(url.href).toBe('https://example.test/session/status');
+        expect(headers).toEqual({ 'x-opencode-directory': '%2Frepo' });
+        expect(sessionId).toBe('session-1');
+        attempt += 1;
+        if (attempt === 2) throw new Error('network');
+        return attempt >= 4;
+      },
+    );
     const instance = new CmuxMultiplexer(api, {
       checkSessionReady: readiness,
       delay: async () => {},
@@ -162,10 +170,14 @@ describe('CmuxMultiplexer', () => {
   test('default readiness parses the target status from /session/status', async () => {
     const api = client();
     const requested: string[] = [];
-    globalThis.fetch = mock(async (input) => {
-      requested.push(String(input));
-      return Response.json({ target: { type: 'busy' } });
-    }) as typeof fetch;
+    const inits: Array<Record<string, string> | undefined> = [];
+    globalThis.fetch = mock(
+      async (input, init?: { headers?: Record<string, string> }) => {
+        requested.push(String(input));
+        inits.push(init?.headers);
+        return Response.json({ target: { type: 'busy' } });
+      },
+    ) as typeof fetch;
     expect(
       await new CmuxMultiplexer(api, {
         opencodeBinary: '/opt/opencode',
@@ -173,6 +185,33 @@ describe('CmuxMultiplexer', () => {
       }).spawnPane('target', 'agent', 'http://127.0.0.1:7777/base', '/repo'),
     ).toEqual(expect.objectContaining({ success: true }));
     expect(requested).toEqual(['http://127.0.0.1:7777/session/status']);
+    expect(inits).toEqual([{ 'x-opencode-directory': '%2Frepo' }]);
+  });
+
+  test('default readiness encodes percent-bearing directories for the header', async () => {
+    const api = client();
+    const requested: string[] = [];
+    const inits: Array<Record<string, string> | undefined> = [];
+    globalThis.fetch = mock(
+      async (input, init?: { headers?: Record<string, string> }) => {
+        requested.push(String(input));
+        inits.push(init?.headers);
+        return Response.json({ target: { type: 'busy' } });
+      },
+    ) as typeof fetch;
+    expect(
+      await new CmuxMultiplexer(api, {
+        opencodeBinary: '/opt/opencode',
+        pathExists: () => true,
+      }).spawnPane(
+        'target',
+        'agent',
+        'http://127.0.0.1:7777/base',
+        '/tmp/a%20b',
+      ),
+    ).toEqual(expect.objectContaining({ success: true }));
+    expect(requested).toEqual(['http://127.0.0.1:7777/session/status']);
+    expect(inits).toEqual([{ 'x-opencode-directory': '%2Ftmp%2Fa%2520b' }]);
   });
 
   test('uses stable create IDs for right/down anchors and close', async () => {

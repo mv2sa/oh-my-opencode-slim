@@ -6,14 +6,17 @@
  * returned v1 `Hooks` into v2 registrations: agent/tool/command transforms,
  * a single session context hook (system/messages transforms, chat.message
  * tracking, and interview + generic command marker dispatch), the native
- * `session.prompt` hook (once-per-admission chat.message fidelity, with a
- * context-hook fallback on older hosts), the native `session.model.request`
- * hook (v1 chat.headers — Copilot initiator header), tool execute hooks,
- * and the event stream. Each bridge is independently try/catch-guarded.
+ * `session.prompt` hook (once-per-admission chat.message fidelity), the
+ * native `session.model.request` hook (v1 chat.headers — Copilot
+ * initiator header), tool execute hooks, and the event stream. Session
+ * hooks register unconditionally on full contexts: a
+ * registration failure fails setup loudly. Domain transforms
+ * (agent/tool/mcp/command) stay independently try/catch-guarded.
  */
 
 import { loadPluginConfig } from '../config/loader';
 import { InterviewConfigSchema } from '../config/schema';
+import { getBuildInfo } from '../generated/build-info';
 import {
   runWithSyntheticPartCacheHintScope,
   type SyntheticPartCacheHint,
@@ -36,7 +39,11 @@ import {
 import { INTERNAL_INITIATOR_METADATA_KEY } from '../utils/internal-initiator';
 import { initLogger, log } from '../utils/logger';
 import { adaptTool, applyAgentToDraft } from './adapters';
-import { buildPluginInput, resolveV2Directory } from './client-shim';
+import {
+  buildPluginInput,
+  resetClientShimGenerationWarnings,
+  resolveV2Directory,
+} from './client-shim';
 import { subagentArgsToV1, toolNameToV1, v1ArgsToSubagent } from './delegation';
 import { mapV2EventToV1 } from './event-adapter';
 import {
@@ -504,7 +511,7 @@ export function observeChatHeaderState(
   pruneSessionMap(states);
 }
 
-/** One-time (per process) drift canary: a primary `model.request` for a
+/** One-time (per setup generation) drift canary: a primary `model.request` for a
  * session with NO context-event observation recorded means the host fired
  * the request hook before (or instead of) the context hook — the one
  * dangerous ordering direction, because later requests would then read a
@@ -516,10 +523,6 @@ const MODEL_REQUEST_BEFORE_CONTEXT_WARNING =
   'for session; host hook ordering may have changed (x-initiator marking ' +
   'may be stale)';
 let modelRequestOrderingWarned = false;
-
-export function __resetChatHeadersOrderingTripwireForTesting(): void {
-  modelRequestOrderingWarned = false;
-}
 
 /**
  * v1 `chat.headers` → v2 `session.model.request` bridge.
@@ -552,10 +555,10 @@ export function __resetChatHeadersOrderingTripwireForTesting(): void {
  * Headers are transport-level only — no payload content is read or mutated
  * (prompt-cache safety is unaffected).
  *
- * @param onOrderingDrift invoked (once per process — module-global latch)
- *   when a primary request arrives for a session with no context-event
- *   observation; injectable so tests can observe the tripwire without
- *   mocking the logger.
+ * @param onOrderingDrift invoked (once per setup generation — module-global
+ *   latch, rearmed by resetV2GenerationWarnings) when a primary request
+ *   arrives for a session with no context-event observation; injectable so
+ *   tests can observe the tripwire without mocking the logger.
  */
 export function createChatHeadersBridge(
   states: ChatHeaderSessionStates,
@@ -604,7 +607,7 @@ const COMPACTION_STRIP_METADATA_KEYS: readonly string[] = [
 ];
 
 /**
- * Native `session.compaction` hook bridge (v2.0.0+).
+ * Native `session.compaction` hook bridge.
  *
  * The host's session summarizer fires `compaction` with the request's
  * message list; without this bridge the summary would bake the plugin's
@@ -677,17 +680,35 @@ function exactActionsForV1Key(key: string): string[] {
  * (the child agent's task-policy — the same map `adaptPermissions`
  * consumes for static agent registration).
  *
- * Only entries that can be expressed WITHOUT wildcards survive:
- * - the string shorthand and whole-tool string effects (e.g.
- *   `edit: 'deny'`) apply to every resource, so emitting them would
- *   require a `'*'` resource — skipped;
- * - the `'*'` catch-all key is skipped by the action gate;
+ * Entries that can be expressed WITHOUT wildcards survive:
+ * - the string shorthand applies to every action and would require a
+ *   `'*'` resource on both axes — skipped;
+ * - the `'*'` catch-all key and wildcard-suffixed keys (e.g. MCP-derived
+ *   `github_*`) are skipped by the action gate;
  * - nested `{tool: {pattern: effect}}` entries emit
- *   `{action, resource: pattern, effect}` only when `pattern` is
+ *   `{action, resource: pattern, effect}` when `pattern` is
  *   wildcard-free (e.g. `skill: {codemap: 'allow'}`,
- *   `bash: {'git push': 'ask'}`).
+ *   `bash: {'git push': 'ask'}`);
+ * - whole-tool string effects (e.g. `read: 'allow'`, `edit: 'deny'`)
+ *   emit an action-scoped rule whose resource IS the declared v1 tool
+ *   key. A whole-tool effect semantically covers every resource, which
+ *   only a `'*'` resource could express — the tool key is the one exact
+ *   resource the declaration itself names, so the emitted rule's scope
+ *   is a strict subset of the declaration (never a widening).
  *
- * The result is defense-in-depth: the child's static agent-level
+ * Why whole-tool derivation matters: v2 children inherit their parent's
+ * session-scoped rules, and the host merges session rules AFTER the
+ * agent's static permissions (last-match-wins) — so inherited rules
+ * override what the child's agent registration allows, and an unmatched
+ * call falls back to `ask` (a permission form, poison for background
+ * children: the input-wait suppresses orchestrator wakes). A non-empty
+ * derived ruleset makes the bridge REPLACE the inherited list, after
+ * which the child's static agent permissions govern every resource the
+ * exact rules do not match. Without this, read-only agents whose maps
+ * carry only whole-tool effects (the read class: read/glob/grep/…)
+ * derived zero rules and kept the parent's inherited list verbatim.
+ *
+ * The result remains defense-in-depth: the child's static agent-level
  * permissions (from `applyAgentToDraft`) keep governing everything the
  * exact-match ruleset cannot express.
  */
@@ -695,8 +716,20 @@ export function deriveExactPermissionRules(perm: unknown): V2PermissionRule[] {
   const rules: V2PermissionRule[] = [];
   if (!perm || typeof perm !== 'object' || Array.isArray(perm)) return rules;
   for (const [tool, value] of Object.entries(perm as Record<string, unknown>)) {
-    // Only nested pattern maps carry an exact resource; string values
-    // are whole-tool effects (see the doc note above).
+    const actions = exactActionsForV1Key(tool);
+    if (actions.length === 0) continue;
+    if (typeof value === 'string') {
+      // Whole-tool effect: emit one action-scoped rule per v2 action,
+      // with the declared tool key as the exact resource (subset of the
+      // declared scope — see the doc note above).
+      if (value !== 'allow' && value !== 'deny' && value !== 'ask') continue;
+      for (const action of actions) {
+        rules.push({ action, resource: tool, effect: value });
+      }
+      continue;
+    }
+    // Nested pattern maps carry an explicit resource; only wildcard-free
+    // patterns may survive.
     if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
     for (const [pattern, effect] of Object.entries(
       value as Record<string, unknown>,
@@ -705,7 +738,7 @@ export function deriveExactPermissionRules(perm: unknown): V2PermissionRule[] {
         continue;
       }
       if (containsWildcard(pattern)) continue;
-      for (const action of exactActionsForV1Key(tool)) {
+      for (const action of actions) {
         if (containsWildcard(action)) continue; // structural invariant
         rules.push({ action, resource: pattern, effect });
       }
@@ -715,21 +748,35 @@ export function deriveExactPermissionRules(perm: unknown): V2PermissionRule[] {
 }
 
 /**
- * One-time degradation notice for hosts without `ctx.permission.rules`
- * (before v2.0.0). Same contract as the client-shim notices established
- * by commit 2bf290ad: ONE deterministic warning per plugin process
- * (module-level latch; fixed text, no timestamps or per-call ids) so a
- * missing host capability is observable in the plugin log without
- * per-child noise. Never fakes success — the rules are simply not
- * applied and the static agent permissions keep governing the child.
+ * One-time degradation notice for hosts whose session domain lacks
+ * `update` (reduced v2 host contexts). Same contract as the
+ * client-shim notices established by commit 2bf290ad: ONE
+ * deterministic warning per setup generation (module-level latch,
+ * rearmed by resetV2GenerationWarnings — `opencode reload` reuses the
+ * process, so a new generation must not inherit silence; fixed text,
+ * no timestamps or per-call ids) so a missing host capability is
+ * observable in the plugin log without per-child noise. Never fakes
+ * success — the rules are simply not applied and the static agent
+ * permissions keep governing the child.
  */
 const PERMISSION_RULES_UNAVAILABLE_WARNING =
-  '[v2][permission-rules] ctx.permission.rules unavailable on this host ' +
-  'build; child session permission rules are not applied';
+  '[v2][permission-rules] ctx.session.update unavailable on this host ' +
+  'context; child session permission rules are not applied';
 let permissionRulesUnavailableWarned = false;
 
-export function __resetPermissionRulesWarningForTesting(): void {
+/**
+ * Rearm the one-time degradation warnings for a new setup generation.
+ * `opencode reload` (OpenCode v2.0.7) destroys and recreates plugin
+ * instances inside one process while module-level state survives the
+ * disposal; without this reset the reloaded generation would stay
+ * silent about host-capability degradations the previous generation
+ * already reported. Also serves as the test-facing reset seam for the
+ * latched warning bridges.
+ */
+export function resetV2GenerationWarnings(): void {
+  modelRequestOrderingWarned = false;
   permissionRulesUnavailableWarned = false;
+  resetClientShimGenerationWarnings();
 }
 
 /** Deps for the per-session permission rules bridge. */
@@ -747,8 +794,8 @@ export interface V2PermissionRulesOptions {
 }
 
 /**
- * Per-session permission rules bridge (`ctx.permission.rules`, v2.0.0+
- * #48351; capability-probed, fail-soft).
+ * Per-session permission rules bridge (`ctx.session.update`,
+ * capability-probed, fail-soft).
  *
  * v2 children inherit their parent's session-scoped rules at creation
  * and were previously governed ONLY by the static agent-level permission
@@ -758,16 +805,19 @@ export interface V2PermissionRulesOptions {
  * child's agent is plugin-defined — the v2-local equivalent of the
  * event-router's `shouldManageSession(parent)` gate, since session agent
  * metadata lives inside the v1 factory), installs the child agent's
- * task-policy as session-scoped exact-match rules exactly once per
- * sessionID (duplicate event delivery is idempotent).
+ * task-policy as session-scoped exact-match rules via
+ * `session.update({sessionID, permissions})` exactly once per sessionID
+ * (duplicate event delivery is idempotent).
  *
- * Because `rules` REPLACES the whole session-scoped list, root sessions
- * and foreign-agent children are never touched. Hosts without the
- * capability degrade with the one-time warning above. Failures are
- * logged, never thrown into the event pump.
+ * `permissions` REPLACES the whole session-scoped rule list (identical
+ * replace-semantics to the removed `permission.rules` — both call the
+ * host's sessions.setPermissions), so root sessions and foreign-agent
+ * children are never touched. Hosts without the capability degrade
+ * with the one-time warning above. Failures are logged, never thrown
+ * into the event pump.
  */
 export function createPermissionRulesBridge(
-  permission: V2Context['permission'],
+  session: V2Context['session'] | undefined,
   options: V2PermissionRulesOptions,
 ): {
   /** Observe one raw v2 event; applies rules when it is a
@@ -782,8 +832,8 @@ export function createPermissionRulesBridge(
     sessionID: string,
     agent: string,
   ): Promise<void> {
-    const rulesFn = permission?.rules;
-    if (typeof rulesFn !== 'function') {
+    const updateFn = session?.update;
+    if (typeof updateFn !== 'function') {
       if (!permissionRulesUnavailableWarned) {
         permissionRulesUnavailableWarned = true;
         (
@@ -796,9 +846,10 @@ export function createPermissionRulesBridge(
     const rules = deriveExactPermissionRules(options.permissionForAgent(agent));
     if (rules.length === 0) {
       // Nothing in the task-policy is expressible as an exact match
-      // (e.g. a whole-tool read-only policy): an empty replace would add
-      // nothing over the static agent permissions, so skip the host
-      // call. Marked handled here — an empty derivation is a final
+      // (wildcard-only shapes: the `'*'` catch-all key alone, or
+      // wildcard-suffixed MCP keys): an empty replace would add nothing
+      // over the static agent permissions, so skip the host call.
+      // Marked handled here — an empty derivation is a final
       // answer that cannot change between duplicate events.
       applied.set(sessionID, true);
       pruneSessionMap(applied);
@@ -808,7 +859,7 @@ export function createPermissionRulesBridge(
       );
       return;
     }
-    await rulesFn({ sessionID, permissions: rules });
+    await updateFn({ sessionID, permissions: rules });
     // Latch only after the host call resolves: a rejected call leaves
     // the slot free, so a replayed or duplicate session.created retries
     // instead of stranding the child on inherited session rules
@@ -838,8 +889,9 @@ export function createPermissionRulesBridge(
         const parentID = payload.parentID;
         const agent = payload.agent;
         if (typeof sessionID !== 'string' || !sessionID) return;
-        // Root sessions never qualify — `rules` REPLACES the session's
-        // scoped list, so an unrelated session must not be touched.
+        // Root sessions never qualify — `permissions` REPLACES the
+        // session's scoped list, so an unrelated session must not be
+        // touched.
         if (typeof parentID !== 'string' || !parentID) return;
         if (applied.has(sessionID)) return;
         if (typeof agent !== 'string' || !options.pluginAgents.has(agent)) {
@@ -1191,12 +1243,13 @@ export function createToolExecuteBridges(
     const isDelegation = e.tool.toLowerCase() === 'subagent';
     // v2 execute.after is status-discriminated: `completed` → mutable
     // result; `error` → `error` payload (result may be absent or stale).
-    // Absent status (older hosts) keeps the completed path. On error the
-    // v1 output is synthesized from the error text — that is exactly the
-    // v1 shape, where a failed tool's model-visible output WAS the error
-    // message — so error-recovery consumers (json-error-recovery appends
-    // its reminder to output.output) still run meaningfully. An errored
-    // call never presents its result content as a successful output.
+    // Absent status (defensive null-safety) keeps the completed path.
+    // On error the v1 output is synthesized from the error text — that
+    // is exactly the v1 shape, where a failed tool's model-visible
+    // output WAS the error message — so error-recovery consumers
+    // (json-error-recovery appends its reminder to output.output) still
+    // run meaningfully. An errored call never presents its result
+    // content as a successful output.
     const errored = e.status === 'error';
     // Map v2 Tool.Result.content (string | Content[]) -> v1 output.output
     // string; the v1 after-hooks (postFileToolNudge, jsonErrorRecovery,
@@ -1308,6 +1361,9 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       .replace(/[-:]/g, '')
       .slice(0, 15);
     initLogger(sessionId);
+    // First logged line: identify the build that produced every following
+    // log entry (logging-only — build info never enters prompt payloads).
+    log('[v2] build info', getBuildInfo());
     // Capability guard: some hosts load this same `setup` with a reduced or
     // TUI-side context where agent/tool/session/event domains are missing.
     // Skip registration instead of crashing the host (and retry-storming).
@@ -1318,6 +1374,11 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       return async () => {};
     }
     log('[v2] setup invoked', { app: ctx.app, cwd: process.cwd() });
+
+    // Reload generations: rearm the one-time degradation warning latches
+    // BEFORE any bridge of this generation can fire them — module-level
+    // state survives instance disposal inside one process.
+    resetV2GenerationWarnings();
 
     // Directory/location resolution lives in the shim now (single source);
     // setup still needs the directory for config loading and tool adapters.
@@ -1360,7 +1421,8 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       // Capability probe: v2 one-shot generation (`ctx.generate.text`),
       // probed structurally since V2Context stays minimal by design.
       // Powers the smartfetch secondary-model summaries without a temp
-      // session; absent on older hosts → no `experimental_v2` key at all.
+      // session; hosts without the domain get no `experimental_v2` key
+      // at all.
       const generateText = (
         ctx as {
           generate?: {
@@ -1401,183 +1463,192 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
 
     if (!v1Hooks) return async () => {};
 
-    const interviewConfig = InterviewConfigSchema.parse(
-      loadPluginConfig(directory).interview ?? {},
-    );
-    const interviewBridge = createV2InterviewBridge(ctx, interviewConfig);
-    disposers.push(() => interviewBridge.dispose());
-
-    // Resolve agents/commands via the v1 config() hook (model resolution etc.).
-    let resolvedAgents: Record<string, Record<string, unknown>> | undefined;
-    let synthCommands:
-      | Record<string, { template?: string; description?: string }>
-      | undefined;
+    // Fail-loud unwinding: session hooks register
+    // unconditionally, so any throw from here through the return below
+    // must not leak the resources setup already registered (transforms,
+    // hooks, the interview bridge, v1 resources). Run the saved
+    // disposers LIFO — most recent registration first — each in its own
+    // try/catch so a failing disposer cannot mask the original error,
+    // then the v1 dispose hook best-effort, then rethrow the original
+    // error unchanged. The success path's returned cleanup keeps its
+    // own semantics.
     try {
-      const synth: Record<string, unknown> = {};
-      const configFn = v1Hooks.config as
-        | ((c: Record<string, unknown>) => Promise<void>)
-        | undefined;
-      if (configFn) {
-        await configFn(synth);
-        if (synth.agent && typeof synth.agent === 'object') {
-          resolvedAgents = synth.agent as Record<
-            string,
-            Record<string, unknown>
-          >;
-        }
-        const cmd = synth.command as
-          | Record<string, { template?: string; description?: string }>
-          | undefined;
-        if (cmd) synthCommands = cmd;
-      }
-    } catch (err) {
-      log(
-        '[v2] config() hook failed (continuing with raw agents)',
-        String(err),
+      const interviewConfig = InterviewConfigSchema.parse(
+        loadPluginConfig(directory).interview ?? {},
       );
-    }
-    if (!resolvedAgents) {
-      resolvedAgents =
-        (v1Hooks.agent as Record<string, Record<string, unknown>>) ?? {};
-    }
+      const interviewBridge = createV2InterviewBridge(ctx, interviewConfig);
+      disposers.push(() => interviewBridge.dispose());
 
-    // ── Agents ──
-    try {
-      const reg = await ctx.agent.transform((draft) => {
-        for (const [name, cfg] of Object.entries(resolvedAgents ?? {})) {
-          try {
-            applyAgentToDraft(draft, name, cfg);
-          } catch (err) {
-            log('[v2] agent adapt failed', { name, err: String(err) });
+      // Resolve agents/commands via the v1 config() hook (model resolution etc.).
+      let resolvedAgents: Record<string, Record<string, unknown>> | undefined;
+      let synthCommands:
+        | Record<string, { template?: string; description?: string }>
+        | undefined;
+      try {
+        const synth: Record<string, unknown> = {};
+        const configFn = v1Hooks.config as
+          | ((c: Record<string, unknown>) => Promise<void>)
+          | undefined;
+        if (configFn) {
+          await configFn(synth);
+          if (synth.agent && typeof synth.agent === 'object') {
+            resolvedAgents = synth.agent as Record<
+              string,
+              Record<string, unknown>
+            >;
           }
+          const cmd = synth.command as
+            | Record<string, { template?: string; description?: string }>
+            | undefined;
+          if (cmd) synthCommands = cmd;
         }
-        // Make orchestrator the default primary agent.
-        if (resolvedAgents?.orchestrator) {
-          try {
-            draft.default('orchestrator');
-          } catch {
-            /* default() optional */
-          }
-        }
-      });
-      disposers.push(() => reg.dispose());
-      log('[v2] agents registered', {
-        count: Object.keys(resolvedAgents ?? {}).length,
-      });
-    } catch (err) {
-      log('[v2] agent.transform failed', String(err));
-    }
+      } catch (err) {
+        log(
+          '[v2] config() hook failed (continuing with raw agents)',
+          String(err),
+        );
+      }
+      if (!resolvedAgents) {
+        resolvedAgents =
+          (v1Hooks.agent as Record<string, Record<string, unknown>>) ?? {};
+      }
 
-    // ── Tools ──
-    try {
-      const tools = (v1Hooks.tool ?? {}) as Record<
-        string,
-        Record<string, unknown>
-      >;
-      const toolEntries = Object.entries(tools);
-      if (toolEntries.length > 0) {
-        // Precompute JSON schemas from zod shapes (zod is bundled in v2 build).
-        const zod = (await import('zod')) as unknown as {
-          object?: (s: unknown) => unknown;
-          toJSONSchema?: (s: unknown) => unknown;
-        };
-        const schemaFor = (def: Record<string, unknown>): unknown => {
-          const args = def.args;
-          if (!args || typeof args !== 'object') {
+      // ── Agents ──
+      try {
+        const reg = await ctx.agent.transform((draft) => {
+          for (const [name, cfg] of Object.entries(resolvedAgents ?? {})) {
+            try {
+              applyAgentToDraft(draft, name, cfg);
+            } catch (err) {
+              log('[v2] agent adapt failed', { name, err: String(err) });
+            }
+          }
+          // Make orchestrator the default primary agent.
+          if (resolvedAgents?.orchestrator) {
+            try {
+              draft.default('orchestrator');
+            } catch {
+              /* default() optional */
+            }
+          }
+        });
+        disposers.push(() => reg.dispose());
+        log('[v2] agents registered', {
+          count: Object.keys(resolvedAgents ?? {}).length,
+        });
+      } catch (err) {
+        log('[v2] agent.transform failed', String(err));
+      }
+
+      // ── Tools ──
+      try {
+        const tools = (v1Hooks.tool ?? {}) as Record<
+          string,
+          Record<string, unknown>
+        >;
+        const toolEntries = Object.entries(tools);
+        if (toolEntries.length > 0) {
+          // Precompute JSON schemas from zod shapes (zod is bundled in v2 build).
+          const zod = (await import('zod')) as unknown as {
+            object?: (s: unknown) => unknown;
+            toJSONSchema?: (s: unknown) => unknown;
+          };
+          const schemaFor = (def: Record<string, unknown>): unknown => {
+            const args = def.args;
+            if (!args || typeof args !== 'object') {
+              return { type: 'object', properties: {} };
+            }
+            try {
+              const obj = zod.object?.(args);
+              if (zod.toJSONSchema && obj) return zod.toJSONSchema(obj);
+            } catch {
+              /* fall through */
+            }
             return { type: 'object', properties: {} };
-          }
-          try {
-            const obj = zod.object?.(args);
-            if (zod.toJSONSchema && obj) return zod.toJSONSchema(obj);
-          } catch {
-            /* fall through */
-          }
-          return { type: 'object', properties: {} };
-        };
+          };
 
-        const reg = await ctx.tool.transform((draft) => {
-          for (const [name, def] of toolEntries) {
-            try {
-              // adaptTool stamps `options: { codemode: false }` on every
-              // registration (CodeMode opt-out) — without it v2's
-              // Tool.snapshot() confines the tool to the `execute` tool's
-              // JS runtime instead of the model-visible tool catalog.
-              draft.add(adaptTool(name, def, directory, schemaFor(def)));
-            } catch (err) {
-              log('[v2] tool adapt failed', { name, err: String(err) });
+          const reg = await ctx.tool.transform((draft) => {
+            for (const [name, def] of toolEntries) {
+              try {
+                // adaptTool stamps `options: { codemode: false }` on every
+                // registration (CodeMode opt-out) — without it v2's
+                // Tool.snapshot() confines the tool to the `execute` tool's
+                // JS runtime instead of the model-visible tool catalog.
+                draft.add(adaptTool(name, def, directory, schemaFor(def)));
+              } catch (err) {
+                log('[v2] tool adapt failed', { name, err: String(err) });
+              }
             }
-          }
-        });
-        disposers.push(() => reg.dispose());
-        log('[v2] tools registered', { count: toolEntries.length });
-      }
-    } catch (err) {
-      log('[v2] tool.transform failed', String(err));
-    }
-
-    // ── Built-in MCPs (ctx.mcp.transform, v2 ≥ #45408) ──
-    try {
-      const mcps = (v1Hooks.mcp ?? {}) as Record<string, McpConfig>;
-      const entries = Object.entries(mcps);
-      if (entries.length > 0 && typeof ctx.mcp?.transform === 'function') {
-        const reg = await ctx.mcp.transform((draft) => {
-          for (const [name, cfg] of entries) {
-            try {
-              draft.set(name, adaptMcpServer(cfg));
-            } catch (err) {
-              log('[v2] mcp adapt failed', { name, err: String(err) });
-            }
-          }
-        });
-        disposers.push(() => reg.dispose());
-        log('[v2] mcp servers registered', { count: entries.length });
-      } else if (entries.length > 0) {
-        log('[v2] ctx.mcp.transform unavailable; MCPs stay config-only');
-      }
-    } catch (err) {
-      log('[v2] mcp.transform failed', String(err));
-    }
-
-    // ── Commands (deepwork / reflect / loop slash commands) ──
-    try {
-      const entries = Object.entries(synthCommands ?? {});
-      if (entries.length > 0) {
-        const submitCommand = createSessionSubmit(ctx);
-        const reg = await ctx.command.transform((draft) => {
-          registerSynthCommands(draft, entries, submitCommand);
-        });
-        disposers.push(() => reg.dispose());
-        log('[v2] commands registered', {
-          // Includes `interview`, which the bridge registers below.
-          count: entries.length,
-        });
-      }
-    } catch (err) {
-      log('[v2] command.transform failed', String(err));
-    }
-
-    // `/interview` is a v2 command marker. The context bridge consumes the
-    // rendered marker and delegates the actual behavior to the interview
-    // service without expanding the global v2 client shim.
-    try {
-      const reg = await ctx.command.transform((draft) => {
-        try {
-          interviewBridge.registerCommand(draft);
-        } catch (err) {
-          log('[v2] interview command adapt failed', String(err));
+          });
+          disposers.push(() => reg.dispose());
+          log('[v2] tools registered', { count: toolEntries.length });
         }
-      });
-      disposers.push(() => reg.dispose());
-    } catch (err) {
-      log('[v2] interview command registration failed', String(err));
-    }
+      } catch (err) {
+        log('[v2] tool.transform failed', String(err));
+      }
 
-    // ── Session context hook: command markers + system/messages transforms ──
-    // One registration handles: the interview marker bridge, generic command
-    // marker dispatch (deepwork/reflect/loop), chat.message agent tracking
-    // (or agent/model discovery when the native prompt hook is active), and
-    // the v1 system/messages transforms.
-    try {
+      // ── Built-in MCPs (ctx.mcp.transform, v2 ≥ #45408) ──
+      try {
+        const mcps = (v1Hooks.mcp ?? {}) as Record<string, McpConfig>;
+        const entries = Object.entries(mcps);
+        if (entries.length > 0 && typeof ctx.mcp?.transform === 'function') {
+          const reg = await ctx.mcp.transform((draft) => {
+            for (const [name, cfg] of entries) {
+              try {
+                draft.set(name, adaptMcpServer(cfg));
+              } catch (err) {
+                log('[v2] mcp adapt failed', { name, err: String(err) });
+              }
+            }
+          });
+          disposers.push(() => reg.dispose());
+          log('[v2] mcp servers registered', { count: entries.length });
+        } else if (entries.length > 0) {
+          log('[v2] ctx.mcp.transform unavailable; MCPs stay config-only');
+        }
+      } catch (err) {
+        log('[v2] mcp.transform failed', String(err));
+      }
+
+      // ── Commands (deepwork / reflect / loop slash commands) ──
+      try {
+        const entries = Object.entries(synthCommands ?? {});
+        if (entries.length > 0) {
+          const submitCommand = createSessionSubmit(ctx);
+          const reg = await ctx.command.transform((draft) => {
+            registerSynthCommands(draft, entries, submitCommand);
+          });
+          disposers.push(() => reg.dispose());
+          log('[v2] commands registered', {
+            // Includes `interview`, which the bridge registers below.
+            count: entries.length,
+          });
+        }
+      } catch (err) {
+        log('[v2] command.transform failed', String(err));
+      }
+
+      // `/interview` is a v2 command marker. The context bridge consumes the
+      // rendered marker and delegates the actual behavior to the interview
+      // service without expanding the global v2 client shim.
+      try {
+        const reg = await ctx.command.transform((draft) => {
+          try {
+            interviewBridge.registerCommand(draft);
+          } catch (err) {
+            log('[v2] interview command adapt failed', String(err));
+          }
+        });
+        disposers.push(() => reg.dispose());
+      } catch (err) {
+        log('[v2] interview command registration failed', String(err));
+      }
+
+      // ── Session context hook: command markers + system/messages transforms ──
+      // One registration handles: the interview marker bridge, generic command
+      // marker dispatch (deepwork/reflect/loop), chat.message agent tracking
+      // (or agent/model discovery when the native prompt hook is active), and
+      // the v1 system/messages transforms.
       const commandBefore = v1Hooks['command.execute.before'] as
         | V1CommandBeforeHook
         | undefined;
@@ -1612,33 +1683,23 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
 
       // Native per-admission prompt hook (v2): `session.prompt` fires once
       // per admitted input with the eventual inbox User messageID — the
-      // identity v1 chat.message consumers key on. When the host supports
-      // it, the context hook's per-request chat.message emulation narrows
-      // to agent/model discovery; older v2 hosts (hook name rejected)
-      // keep the full emulation.
+      // identity v1 chat.message consumers key on. With it registered the
+      // context hook's per-request chat.message emulation narrows to
+      // agent/model discovery (registration is unconditional on full
+      // contexts — a registration failure fails setup).
       let promptBridge: V2SessionPromptBridge | undefined;
       if (chatMessage) {
         const bridge = createSessionPromptBridge(chatMessage);
-        try {
-          const promptReg = await ctx.session.hook(
-            'prompt',
-            bridge.handlePrompt,
-          );
-          disposers.push(() => promptReg.dispose());
-          promptBridge = bridge;
-          log('[v2] native session prompt hook registered');
-        } catch (err) {
-          log(
-            '[v2] session.hook(prompt) unavailable; keeping chat.message context emulation',
-            String(err),
-          );
-        }
+        const promptReg = await ctx.session.hook('prompt', bridge.handlePrompt);
+        disposers.push(() => promptReg.dispose());
+        promptBridge = bridge;
+        log('[v2] native session prompt hook registered');
       }
 
       const handler = createSessionContextHandler({
         interviewHandleContext: (event) => interviewBridge.handleContext(event),
         commandBefore,
-        chatMessage: promptBridge ? undefined : chatMessage,
+        chatMessage: undefined,
         observeContextAgent: promptBridge?.observeContext,
         // chat.headers: trailing user-message marker state for the
         // model.request bridge below.
@@ -1663,189 +1724,196 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       log('[v2] session context hook registered');
 
       // v1 chat.headers → v2 session.model.request (per-provider-request
-      // HTTP headers; capability-probed like the prompt hook above — hosts
-      // that reject the hook name keep v1 behavior of simply not setting
+      // HTTP headers; registered unconditionally when the v1
+      // hook exists — a failure fails setup rather than silently skipping
       // the Copilot initiator header).
       if (chatHeadersHook) {
-        try {
-          const headerReg = await ctx.session.hook(
-            'model.request',
-            createChatHeadersBridge(chatHeaderStates),
-          );
-          disposers.push(() => headerReg.dispose());
-          log('[v2] chat.headers bridge registered (session.model.request)');
-        } catch (err) {
-          log(
-            '[v2] session.hook(model.request) unavailable; chat.headers not bridged',
-            String(err),
-          );
-        }
+        const headerReg = await ctx.session.hook(
+          'model.request',
+          createChatHeadersBridge(chatHeaderStates),
+        );
+        disposers.push(() => headerReg.dispose());
+        log('[v2] chat.headers bridge registered (session.model.request)');
       }
 
-      // v2 native compaction hook (v2.0.0+): strip the plugin's tagged
+      // v2 native compaction hook: strip the plugin's tagged
       // synthetic injections from the host's summarization request so
       // the compacted transcript never bakes volatile board/status
-      // content. Hook-name rejection degrades exactly like prompt /
-      // model.request above: one log, no crash (older hosts keep seeing
-      // injected content — a summary-quality issue only).
-      try {
-        const compactionReg = await ctx.session.hook(
-          'compaction',
-          createSessionCompactionBridge(),
-        );
-        disposers.push(() => compactionReg.dispose());
-        log('[v2] compaction bridge registered (session.compaction)');
-      } catch (err) {
-        log(
-          '[v2] session.hook(compaction) unavailable; compaction sees tagged content',
-          String(err),
-        );
-      }
-    } catch (err) {
-      log('[v2] session.hook(context) failed', String(err));
-    }
-
-    // ── Tool execute hooks ──
-    try {
-      const before = v1Hooks['tool.execute.before'] as
-        | ((
-            i: { tool: string; sessionID: string; callID: string },
-            o: { args: unknown },
-          ) => Promise<void>)
-        | undefined;
-      const after = v1Hooks['tool.execute.after'] as
-        | ((i: unknown, o: unknown) => Promise<void>)
-        | undefined;
-      const bridges = createToolExecuteBridges(before, after);
-      if (before) {
-        const reg = await ctx.tool.hook('execute.before', async (event) => {
-          try {
-            await bridges.beforeBridge(event as never);
-          } catch (err) {
-            log('[v2] tool.execute.before rejected call', String(err));
-            throw err; // v2 refuses the call (see createToolExecuteBridges)
-          }
-        });
-        disposers.push(() => reg.dispose());
-      }
-      if (after) {
-        const reg = await ctx.tool.hook('execute.after', async (event) => {
-          try {
-            await bridges.afterBridge(event as never);
-          } catch (err) {
-            log('[v2] tool.execute.after bridge failed', String(err));
-          }
-        });
-        disposers.push(() => reg.dispose());
-      }
-      log('[v2] tool hooks registered', { before: !!before, after: !!after });
-    } catch (err) {
-      log('[v2] tool.hook registration failed', String(err));
-    }
-
-    // ── Event stream ──
-    try {
-      const eventHook = v1Hooks.event as
-        | ((i: { event: Record<string, unknown> }) => Promise<void>)
-        | undefined;
-      if (eventHook || interviewBridge) {
-        // ── Per-session permission rules (ctx.permission.rules, v2.0.0+) ──
-        // Plugin-managed child sessions get their agent's task-policy
-        // installed as session-scoped exact-match rules at creation.
-        // Fail-soft inside the bridge; the v1 event dispatch below never
-        // depends on it (capability-absent hosts degrade with a one-time
-        // deterministic warning).
-        const permissionRulesBridge = createPermissionRulesBridge(
-          ctx.permission,
-          {
-            permissionForAgent: (agent) => resolvedAgents?.[agent]?.permission,
-            pluginAgents: new Set(Object.keys(resolvedAgents ?? {})),
-          },
-        );
-        const iter = ctx.event.subscribe();
-        const eventIterator = iter[Symbol.asyncIterator]();
-        let eventStopped = false;
-        void (async () => {
-          try {
-            while (!eventStopped) {
-              const next = await eventIterator.next();
-              if (next.done) break;
-              try {
-                // Token-stream deltas: the interview bridge already
-                // gates to managed sessions. Skip permission rules and
-                // v1 synthesis; still deliver the raw event so the
-                // multiplexer heartbeat in the v1 event hook can run.
-                const rawType =
-                  typeof next.value?.type === 'string' ? next.value.type : '';
-                const isStreamDelta =
-                  rawType === 'session.next.text.delta' ||
-                  rawType === 'session.next.reasoning.delta' ||
-                  rawType === 'message.part.delta';
-                await interviewBridge.handleEvent(next.value);
-                if (isStreamDelta) {
-                  if (eventHook) await eventHook({ event: next.value });
-                  continue;
-                }
-                // Child-session permission tightening sees the same RAW
-                // event (before v1-shape synthesis) so it is independent
-                // of v1 event-hook presence.
-                await permissionRulesBridge.observeSessionCreated(next.value);
-                if (eventHook) {
-                  for (const ev of mapV2EventToV1(next.value)) {
-                    await eventHook({ event: ev });
-                  }
-                }
-              } catch (err) {
-                log('[v2] event handler failed', String(err));
-              }
-            }
-          } catch (err) {
-            log('[v2] event stream ended', String(err));
-          }
-        })();
-        disposers.push(async () => {
-          eventStopped = true;
-          await eventIterator.return?.();
-        });
-        log('[v2] event stream subscribed');
-      }
-    } catch (err) {
-      log('[v2] event.subscribe failed', String(err));
-    }
-
-    // ── Health check: surface silent zero-registration failures ──
-    // Every bridge is fail-soft; without this, a fully broken registration
-    // would look like a successful load with an empty session.
-    if (disposers.length === 0) {
-      console.error(
-        '[oh-my-opencode-slim][v2] WARNING: no bridges registered — ' +
-          'the plugin loaded but registered nothing. Check the plugin log.',
+      // content. Registered unconditionally — a failure
+      // fails setup (tagged content baking into the compacted transcript
+      // is a correctness issue, not a summary-quality nicety).
+      const compactionReg = await ctx.session.hook(
+        'compaction',
+        createSessionCompactionBridge(),
       );
-      log('[v2] health check: zero bridges registered');
-    } else {
-      log('[v2] health check passed', { bridges: disposers.length });
-    }
+      disposers.push(() => compactionReg.dispose());
+      log('[v2] compaction bridge registered (session.compaction)');
 
-    const dispose = v1Hooks.dispose as (() => Promise<void>) | undefined;
+      // ── Tool execute hooks ──
+      try {
+        const before = v1Hooks['tool.execute.before'] as
+          | ((
+              i: { tool: string; sessionID: string; callID: string },
+              o: { args: unknown },
+            ) => Promise<void>)
+          | undefined;
+        const after = v1Hooks['tool.execute.after'] as
+          | ((i: unknown, o: unknown) => Promise<void>)
+          | undefined;
+        const bridges = createToolExecuteBridges(before, after);
+        if (before) {
+          const reg = await ctx.tool.hook('execute.before', async (event) => {
+            try {
+              await bridges.beforeBridge(event as never);
+            } catch (err) {
+              log('[v2] tool.execute.before rejected call', String(err));
+              throw err; // v2 refuses the call (see createToolExecuteBridges)
+            }
+          });
+          disposers.push(() => reg.dispose());
+        }
+        if (after) {
+          const reg = await ctx.tool.hook('execute.after', async (event) => {
+            try {
+              await bridges.afterBridge(event as never);
+            } catch (err) {
+              log('[v2] tool.execute.after bridge failed', String(err));
+            }
+          });
+          disposers.push(() => reg.dispose());
+        }
+        log('[v2] tool hooks registered', { before: !!before, after: !!after });
+      } catch (err) {
+        log('[v2] tool.hook registration failed', String(err));
+      }
 
-    return async () => {
-      log('[v2] dispose invoked');
-      for (const d of disposers) {
+      // ── Event stream ──
+      try {
+        const eventHook = v1Hooks.event as
+          | ((i: { event: Record<string, unknown> }) => Promise<void>)
+          | undefined;
+        if (eventHook || interviewBridge) {
+          // ── Per-session permission rules (ctx.session.update) ──
+          // Plugin-managed child sessions get their agent's task-policy
+          // installed as session-scoped exact-match rules at creation
+          // (session.update's `permissions` REPLACES the session-scoped
+          // list). Fail-soft inside the bridge; the v1 event dispatch
+          // below never depends on it (capability-absent hosts degrade
+          // with a one-time deterministic warning).
+          const permissionRulesBridge = createPermissionRulesBridge(
+            ctx.session,
+            {
+              permissionForAgent: (agent) =>
+                resolvedAgents?.[agent]?.permission,
+              pluginAgents: new Set(Object.keys(resolvedAgents ?? {})),
+            },
+          );
+          const iter = ctx.event.subscribe();
+          const eventIterator = iter[Symbol.asyncIterator]();
+          let eventStopped = false;
+          void (async () => {
+            try {
+              while (!eventStopped) {
+                const next = await eventIterator.next();
+                if (next.done) break;
+                try {
+                  // Token-stream deltas: the interview bridge already
+                  // gates to managed sessions. Skip permission rules and
+                  // v1 synthesis; still deliver the raw event so the
+                  // multiplexer heartbeat in the v1 event hook can run.
+                  const rawType =
+                    typeof next.value?.type === 'string' ? next.value.type : '';
+                  const isStreamDelta =
+                    rawType === 'session.next.text.delta' ||
+                    rawType === 'session.next.reasoning.delta' ||
+                    rawType === 'message.part.delta';
+                  await interviewBridge.handleEvent(next.value);
+                  if (isStreamDelta) {
+                    if (eventHook) await eventHook({ event: next.value });
+                    continue;
+                  }
+                  // Child-session permission tightening sees the same RAW
+                  // event (before v1-shape synthesis) so it is independent
+                  // of v1 event-hook presence.
+                  await permissionRulesBridge.observeSessionCreated(next.value);
+                  if (eventHook) {
+                    for (const ev of mapV2EventToV1(next.value)) {
+                      await eventHook({ event: ev });
+                    }
+                  }
+                } catch (err) {
+                  log('[v2] event handler failed', String(err));
+                }
+              }
+            } catch (err) {
+              log('[v2] event stream ended', String(err));
+            }
+          })();
+          disposers.push(async () => {
+            eventStopped = true;
+            await eventIterator.return?.();
+          });
+          log('[v2] event stream subscribed');
+        }
+      } catch (err) {
+        log('[v2] event.subscribe failed', String(err));
+      }
+
+      // ── Health check: surface silent zero-registration failures ──
+      // Every bridge is fail-soft; without this, a fully broken registration
+      // would look like a successful load with an empty session.
+      if (disposers.length === 0) {
+        console.error(
+          '[oh-my-opencode-slim][v2] WARNING: no bridges registered — ' +
+            'the plugin loaded but registered nothing. Check the plugin log.',
+        );
+        log('[v2] health check: zero bridges registered');
+      } else {
+        log('[v2] health check passed', { bridges: disposers.length });
+      }
+
+      const dispose = v1Hooks.dispose as (() => Promise<void>) | undefined;
+
+      return async () => {
+        log('[v2] dispose invoked');
+        // FIFO is intentional: the success path preserves the historical
+        // registration-order teardown; only the abort path unwinds LIFO.
+        for (const d of disposers) {
+          try {
+            await d();
+          } catch (err) {
+            log('[v2] disposer failed', String(err));
+          }
+        }
+        // v1 dispose synthesizes `server.instance.disposed` into the v1 event
+        // consumers (orchestrator-wake scheduler timers/state, task-session
+        // manager) — without it, host teardown would leak wake timers.
+        try {
+          log('[v2] v1 dispose hook invoked');
+          await dispose?.();
+        } catch (err) {
+          log('[v2] v1 dispose failed', String(err));
+        }
+      };
+    } catch (err) {
+      // Best-effort abort-path cleanup: LIFO over the saved disposers,
+      // each isolated so a failing disposer cannot mask the original
+      // error, then the v1 dispose hook, then rethrow unchanged.
+      for (const d of [...disposers].reverse()) {
         try {
           await d();
-        } catch (err) {
-          log('[v2] disposer failed', String(err));
+        } catch (disposerErr) {
+          log('[v2] abort-path disposer failed', String(disposerErr));
         }
       }
-      // v1 dispose synthesizes `server.instance.disposed` into the v1 event
-      // consumers (orchestrator-wake scheduler timers/state, task-session
-      // manager) — without it, host teardown would leak wake timers.
+      const v1Dispose = v1Hooks?.dispose as (() => Promise<void>) | undefined;
       try {
-        log('[v2] v1 dispose hook invoked');
-        await dispose?.();
-      } catch (err) {
-        log('[v2] v1 dispose failed', String(err));
+        log('[v2] v1 dispose hook invoked (abort path)');
+        await v1Dispose?.();
+      } catch (disposeErr) {
+        log('[v2] v1 dispose failed (abort path)', String(disposeErr));
       }
-    };
+      throw err;
+    }
   };
 }

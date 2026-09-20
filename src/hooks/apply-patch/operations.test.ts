@@ -278,7 +278,7 @@ PATCH`;
     ).toEqual(['omega']);
   });
 
-  test('rewritePatchText no longer rescues a trim-only stale patch', async () => {
+  test('rewritePatchText canonicalizes a trim-only stale patch (native-compatible)', async () => {
     const root = await createTempDir();
     await writeFixture(root, 'sample.txt', '  alpha  \n');
     const patchText = `*** Begin Patch
@@ -288,14 +288,12 @@ PATCH`;
 +omega
 *** End Patch`;
 
-    await expect(
-      rewritePatchText(root, patchText, DEFAULT_OPTIONS),
-    ).rejects.toThrow(
-      'apply_patch verification failed: Failed to find expected lines',
-    );
+    const rewritten = await rewritePatchText(root, patchText, DEFAULT_OPTIONS);
+    expect(rewritten).toContain('+omega');
+    expect(rewritten).toContain('-  alpha  ');
   });
 
-  test('rewritePatchText no longer canonicalizes a dangerous indented case', async () => {
+  test('rewritePatchText canonicalizes an indented case (native-compatible)', async () => {
     const root = await createTempDir();
     await writeFixture(
       root,
@@ -309,11 +307,9 @@ PATCH`;
 +enabled: true
 *** End Patch`;
 
-    await expect(
-      rewritePatchText(root, patchText, DEFAULT_OPTIONS),
-    ).rejects.toThrow(
-      'apply_patch verification failed: Failed to find expected lines',
-    );
+    const rewritten = await rewritePatchText(root, patchText, DEFAULT_OPTIONS);
+    expect(rewritten).toContain('+enabled: true');
+    expect(rewritten).toContain('-    enabled: false');
   });
 
   test('rewritePatchText rejects malformed @@ instead of silently sanitizing it', async () => {

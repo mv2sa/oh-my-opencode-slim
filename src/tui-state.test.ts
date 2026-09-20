@@ -13,6 +13,7 @@ import {
   recordTuiAgentModels,
   recordTuiSessionParent,
   resolveTuiSessionRoot,
+  snapshotSectionsEqual,
   updateTuiSessionDetails,
 } from './tui-state';
 
@@ -436,6 +437,98 @@ describe('tui-state persistence', () => {
     });
     expect(snapshot.agentVariants).toEqual({});
     expect(snapshot.activeSessions).toEqual({});
+  });
+
+  test('parseSnapshot tolerates a snapshot without reusableByAgent (defaults {})', () => {
+    const filePath = getTuiStatePath(tempDir);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: Date.now(),
+        agentModels: { explorer: 'openai/gpt-5.6-luna' },
+        // Pre-dot snapshot: no reusableByAgent key at all.
+      }),
+    );
+
+    const snapshot = readTuiSnapshot(tempDir);
+    expect(snapshot.reusableByAgent).toEqual({});
+    // Sibling sections still parse.
+    expect(snapshot.agentModels.explorer).toBe('openai/gpt-5.6-luna');
+  });
+
+  test('parseSnapshot restores a well-formed reusableByAgent section', () => {
+    const filePath = getTuiStatePath(tempDir);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: Date.now(),
+        reusableByAgent: {
+          'parent-1': {
+            oracle: {
+              taskID: 'ses_1',
+              alias: 'ora-1',
+              terminalState: 'completed',
+              completedAt: 200,
+              lastUsedAt: 300,
+            },
+          },
+        },
+      }),
+    );
+
+    const snapshot = readTuiSnapshot(tempDir);
+    expect(snapshot.reusableByAgent['parent-1']?.oracle).toEqual({
+      taskID: 'ses_1',
+      alias: 'ora-1',
+      terminalState: 'completed',
+      completedAt: 200,
+      lastUsedAt: 300,
+    });
+  });
+
+  test('parseSnapshot drops malformed reusableByAgent entries', () => {
+    const filePath = getTuiStatePath(tempDir);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: Date.now(),
+        reusableByAgent: {
+          'parent-1': {
+            oracle: { taskID: 'ses_1' }, // missing alias/lastUsedAt
+            fixer: null,
+          },
+          'parent-2': 'not-an-object',
+        },
+      }),
+    );
+
+    const snapshot = readTuiSnapshot(tempDir);
+    expect(snapshot.reusableByAgent).toEqual({});
+  });
+
+  test('snapshotSectionsEqual includes reusableByAgent', () => {
+    const base = readTuiSnapshot(tempDir);
+    const sameAgentModels = readTuiSnapshot(tempDir);
+    sameAgentModels.reusableByAgent['parent-1'] = {
+      oracle: {
+        taskID: 'ses_1',
+        alias: 'ora-1',
+        terminalState: 'completed',
+        lastUsedAt: 300,
+      },
+    };
+    // A reusableByAgent-only difference must break equality…
+    expect(snapshotSectionsEqual(base, sameAgentModels)).toBe(false);
+
+    // …and identical sections (both empty) stay equal.
+    const alsoEmpty = readTuiSnapshot(tempDir);
+    expect(snapshotSectionsEqual(base, alsoEmpty)).toBe(true);
   });
 
   test('cross-project isolation — different directories write independent state files', () => {

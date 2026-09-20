@@ -98,6 +98,7 @@ function createHook(options: {
       maxSessionsPerAgent: 2,
       maxRetainedSnapshots: 4,
       backgroundJobBoard: options.board,
+      hostOutcomeClock: 'shared-unix-ms', // The fixture shares Date.now with the gate.
       backgroundJobSupervisor: options.supervisor,
       backgroundTaskConcurrency: options.concurrency,
       shouldManageSession: () => true,
@@ -265,7 +266,11 @@ describe('rehydrate session.get existence probe', () => {
     const hook = createHook({
       board,
       getSession: mock(async () => ({
-        data: { id: 'child-done', outcome: 'succeeded' },
+        data: {
+          id: 'child-done',
+          outcome: 'succeeded',
+          time: { idle: Date.now() },
+        },
       })),
       getMessages: mock(async () => ({
         data: [
@@ -292,7 +297,10 @@ describe('rehydrate session.get existence probe', () => {
     const board = new BackgroundJobBoard();
     const hook = createHook({
       board,
-      getSession: mock(async () => ({ outcome: 'failed' })),
+      getSession: mock(async () => ({
+        outcome: 'failed',
+        time: { idle: Date.now() },
+      })),
     });
 
     await runTransform(hook, 'child-failed');

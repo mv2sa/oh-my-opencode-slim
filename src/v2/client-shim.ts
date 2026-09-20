@@ -43,6 +43,8 @@ export interface V2GenerateModelRef {
 /** Optional v2 capabilities threaded into the v1 PluginInput. Absent
  * capabilities must leave the input object unchanged (v1 parity). */
 export interface ExperimentalV2 {
+  /** Real host wait; not a snapshot, and not abortable by the 2.0.5 adapter. */
+  waitForSessionIdle?: (sessionID: string) => Promise<void>;
   /** One-shot generation (`ctx.generate.text`); no session involved. */
   generateText?: (
     prompt: string,
@@ -111,10 +113,33 @@ function filesFromBody(
 }
 
 /** v2 transcript message (content parts) → v1 SDK message view
- * (`{info: {id, role}, parts}`) expected by the v1 pipeline. */
+ * (`{info: {id, role}, parts}`) expected by the v1 pipeline.
+ *
+ * Terminal metadata is preserved, not reduced: `session.context` returns
+ * full `SessionMessage.Info` entries (schema-verified upstream), where
+ * assistant entries carry `time.completed` (set when the turn
+ * finalizes), `finish`, and `error`, and tool parts carry `state.status`
+ * in the v1 vocabulary. The old `{id, role}`-only reduction degraded
+ * every downstream classification — completion times were unreadable
+ * (eternal "pending") and finish/error states were invisible — which
+ * starved the terminal gate's transcript publish path on v2 hosts
+ * (live-verified 2.0.8 incident).
+ *
+ * The 2.0.8 `idle` marker (`{type: 'idle', time, outcome}`) trails every
+ * finished session. It is a lifecycle boundary, never content, and has
+ * no v1 transcript equivalent, so it maps to the v1 `system` role — the
+ * role transcript consumers already skip when scanning for the trailing
+ * turn. Every other entry keeps its v2 role name. */
 function toV1Message(m: Record<string, unknown>) {
+  const role = m.role ?? m.type;
   return {
-    info: { id: m.id, role: m.role ?? m.type },
+    info: {
+      id: m.id,
+      role: role === 'idle' ? 'system' : role,
+      ...(isRecord(m.time) ? { time: m.time } : {}),
+      ...(m.finish !== undefined ? { finish: m.finish } : {}),
+      ...(m.error !== undefined ? { error: m.error } : {}),
+    },
     parts: Array.isArray(m.content)
       ? (m.content as Array<Record<string, unknown>>).map((p) => ({ ...p }))
       : [],
@@ -126,17 +151,27 @@ function toV1Message(m: Record<string, unknown>) {
  * domain does not expose. Verified against the upstream promise-plugin
  * adapter (`packages/plugin/src/promise/{session,adapter}.ts`): the
  * domain is built with exactly create/get/switchAgent/switchModel/
- * prompt/generate/command/synthetic/interrupt/rename/move/wait/context —
+ * prompt/generate/command/synthetic/interrupt/update/move/wait/context —
  * NO `list` and NO `remove`. On such hosts the `list` shim used to
  * return the empty page silently (children enumeration quietly fell
  * back to event tracking) and `delete` logged a no-op notice per call.
- * Both now emit ONE deterministic warning per plugin process
- * (module-level guard; fixed text, no timestamps or per-call ids) so a
- * missing host capability is observable in the plugin log without
- * per-poll noise.
+ * Both now emit ONE deterministic warning per setup generation
+ * (module-level latch, rearmed by resetClientShimGenerationWarnings —
+ * `opencode reload` reuses the process, so a new generation must not
+ * inherit the previous one's silence; fixed text, no timestamps or
+ * per-call ids) so a missing host capability stays observable in the
+ * plugin log without per-poll noise.
  */
 let warnedListUnavailable = false;
 let warnedRemoveUnavailable = false;
+
+/** Rearm the one-time degradation notices for a new setup generation.
+ *  Called by resetV2GenerationWarnings at setup entry (and directly by
+ *  tests): module state survives instance disposal inside one process. */
+export function resetClientShimGenerationWarnings(): void {
+  warnedListUnavailable = false;
+  warnedRemoveUnavailable = false;
+}
 
 /** v1 body model (`{providerID, modelID}`) → v2 model ref
  * (`{id, providerID}`). */
@@ -238,7 +273,7 @@ function toV1SessionInfo(
  * `null` normalized to it) — and wraps the mapped page in the v1
  * `{data}` envelope. Hosts without `session.list` keep the v1-parity
  * empty page (honest absence, not a fake success) after a one-time
- * process-level warning — stock v2 hosts match this path because the
+ * per-generation warning — stock v2 hosts match this path because the
  * plugin session domain does not expose `list` (see the notice above).
  */
 export function createSessionListShim(
@@ -279,10 +314,8 @@ export function createSessionListShim(
   };
 }
 
-/** Build a v1-compatible PluginInput from the v2 context. The optional
- * `extras` threads probed v2 capabilities (e.g. one-shot generation)
- * through as `experimental_v2`; when absent no `experimental_v2` key is
- * added so the v1 pipeline stays byte-identical. */
+/** Build a v1-compatible input. Optional host idle-wait and one-shot generation
+ * share experimental_v2; absent capabilities are never replaced with stubs. */
 export function buildPluginInput(
   ctx: V2Context,
   extras?: ExperimentalV2,
@@ -304,24 +337,29 @@ export function buildPluginInput(
         : {}),
       abort: s.interrupt
         ? async (args: Record<string, unknown>) =>
-            s.interrupt?.({ sessionID: sessionIDOf(args), continue: false })
+            s.interrupt?.({ sessionID: sessionIDOf(args), resume: false })
         : async (args: Record<string, unknown>) => {
             log('[v2][shim] session.interrupt unavailable', {
               id: sessionIDOf(args),
             });
           },
-      messages: s.context
-        ? async (args: Record<string, unknown>) => ({
-            data: (
-              (await s.context?.({ sessionID: sessionIDOf(args) })) ?? []
-            ).map(toV1Message),
-          })
-        : async (args: Record<string, unknown>) => {
-            log('[v2][shim] session.context unavailable', {
-              id: sessionIDOf(args),
-            });
-            return { data: [] };
-          },
+      // `messages` is exposed only when the host provides
+      // session.context — the terminal gate's transcriptSourceAbsent
+      // predicate methods-presence as the capability signal, and a
+      // fake-empty `{data: []}` stub here would read as "source present
+      // but empty" (classifier verdict `absent` → a baseline-less child
+      // STOPPED_WITHOUT_TERMINAL_RESULT) instead of honest capability
+      // absence (same no-fake-success doctrine as the `get` omission
+      // above).
+      ...(s.context
+        ? {
+            messages: async (args: Record<string, unknown>) => ({
+              data: (
+                (await s.context?.({ sessionID: sessionIDOf(args) })) ?? []
+              ).map(toV1Message),
+            }),
+          }
+        : {}),
       // `status` is intentionally OMITTED: v2 has no equivalent of the v1
       // live session-status map, and a stub returning `{data: {}}` would be
       // an empty-but-valid map. getRuntimeSessionStatusSnapshot treats
@@ -333,11 +371,23 @@ export function buildPluginInput(
       list: createSessionListShim(s),
       prompt: s.prompt
         ? async (args: Record<string, unknown>) => {
+            const body = isRecord(args.body) ? args.body : {};
+            if (
+              ['agent', 'model', 'variant'].some(
+                (key) => body[key] !== undefined,
+              )
+            ) {
+              throw new Error(
+                '[v2] session.prompt cannot represent selection overrides (agent/model/variant); inherit the persisted session selection',
+              );
+            }
             const files = filesFromBody(args);
             return s.prompt?.({
               sessionID: sessionIDOf(args),
               text: textFromBody(args),
-              delivery: 'steer',
+              ...(body.noReply === true
+                ? ({ delivery: 'queue', resume: false } as const)
+                : ({ delivery: 'steer' } as const)),
               ...(files.length > 0 ? { files } : {}),
             });
           }
@@ -525,16 +575,16 @@ export function buildPluginInput(
         // the result are unaffected.
         return isRecord(result) ? { ...result, switched } : { switched };
       },
-      update: s.rename
+      update: s.update
         ? async (args: Record<string, unknown>) => {
             const body = (args?.body ?? {}) as { title?: string };
-            return s.rename?.({
+            return s.update?.({
               sessionID: sessionIDOf(args),
               ...(typeof body.title === 'string' ? { title: body.title } : {}),
             });
           }
         : async (args: Record<string, unknown>) => {
-            log('[v2][shim] session.rename unavailable', {
+            log('[v2][shim] session.update unavailable', {
               id: sessionIDOf(args),
             });
           },
@@ -544,7 +594,7 @@ export function buildPluginInput(
       // relies on this to not leak temp sessions on v2. Hosts without
       // `remove` (the stock v2 plugin session domain — see the one-time
       // notice block near the top of this file) degrade to a no-op with
-      // a single process-level warning (no fake success, no per-call
+      // a single per-generation warning (no fake success, no per-call
       // noise).
       delete: s.remove
         ? async (args: Record<string, unknown>) => {
@@ -582,6 +632,7 @@ export function buildPluginInput(
   };
 
   const directory = resolveV2Directory(ctx);
+  const wait = typeof s.wait === 'function' ? s.wait.bind(s) : undefined;
   return {
     client,
     hostFlavor: 'v2',
@@ -593,8 +644,20 @@ export function buildPluginInput(
     worktree: directory,
     experimental_workspace: { register() {} },
     $: typeof Bun !== 'undefined' ? Bun.$ : undefined,
-    ...(extras?.generateText
-      ? { experimental_v2: { generateText: extras.generateText } }
+    ...(extras?.generateText || wait
+      ? {
+          experimental_v2: {
+            ...(extras?.generateText
+              ? { generateText: extras.generateText }
+              : {}),
+            ...(wait
+              ? {
+                  waitForSessionIdle: (sessionID: string) =>
+                    wait({ sessionID }),
+                }
+              : {}),
+          },
+        }
       : {}),
   };
 }

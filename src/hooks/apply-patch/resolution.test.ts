@@ -104,32 +104,44 @@ describe('apply-patch/resolution', () => {
     expect(resolved.canonical_new_lines).toEqual(['omega']);
   });
 
-  test('locateChunk no longer rescues a trim-only stale patch', () => {
+  test('locateChunk canonicalizes a tolerant trim match (native-compatible)', () => {
     const chunk: PatchChunk = {
       old_lines: ['alpha'],
       new_lines: ['omega'],
     };
 
-    expect(() =>
-      locateChunk([' alpha  '], 'sample.txt', chunk, 0, DEFAULT_OPTIONS),
-    ).toThrow('Failed to find expected lines');
+    const resolved = locateChunk(
+      [' alpha  '],
+      'sample.txt',
+      chunk,
+      0,
+      DEFAULT_OPTIONS,
+    );
+
+    expect(resolved.rewritten).toBe(true);
+    expect(resolved.matchComparator).toBe('trim');
+    expect(resolved.canonical_old_lines).toEqual([' alpha  ']);
+    expect(resolved.canonical_new_lines).toEqual(['omega']);
   });
 
-  test('locateChunk no longer canonicalizes a dangerous indented case', () => {
+  test('locateChunk canonicalizes an indented match (native-compatible)', () => {
     const chunk: PatchChunk = {
       old_lines: ['enabled: false'],
       new_lines: ['enabled: true'],
     };
 
-    expect(() =>
-      locateChunk(
-        ['root:', '  child:', '    enabled: false', 'done: true'],
-        'sample.yml',
-        chunk,
-        0,
-        DEFAULT_OPTIONS,
-      ),
-    ).toThrow('Failed to find expected lines');
+    const resolved = locateChunk(
+      ['root:', '  child:', '    enabled: false', 'done: true'],
+      'sample.yml',
+      chunk,
+      0,
+      DEFAULT_OPTIONS,
+    );
+
+    expect(resolved.rewritten).toBe(true);
+    expect(resolved.matchComparator).toBe('trim');
+    expect(resolved.canonical_old_lines).toEqual(['    enabled: false']);
+    expect(resolved.canonical_new_lines).toEqual(['enabled: true']);
   });
 
   test('locateChunk preserves a real final blank line when it exists in the file', () => {

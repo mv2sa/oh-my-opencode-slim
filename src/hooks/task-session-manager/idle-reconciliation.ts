@@ -1,4 +1,5 @@
 import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
+import { log } from '../../utils/logger';
 
 /** Only parent prompt-lifecycle timers live here. Child terminal policy and
  * its one retry timer belong to the shared terminal gate. */
@@ -47,10 +48,16 @@ export function createIdleReconciler(options: {
       observedAt: idleObservedAt,
     });
     if (observation.kind === 'stale') return;
-    void options.terminalGate.reconcile(
-      run,
-      error ? { kind: 'session-error', message: error } : { kind: 'inspect' },
-    );
+    // Background reconciliation is fail-soft: a failure must be logged
+    // and swallowed, never escape as an unhandled rejection.
+    void options.terminalGate
+      .reconcile(
+        run,
+        error ? { kind: 'session-error', message: error } : { kind: 'inspect' },
+      )
+      .catch((err) => {
+        log('[idle-reconciliation] background reconcile failed', String(err));
+      });
   }
 
   function clearIdleTimers(sessionID: string): void {

@@ -325,11 +325,10 @@ export class MultiplexerSessionManager {
 
       // Attach only after the child session is visible to the server.
       const readinessOptions = this.readinessOptions();
-      const sessionReady = await waitForSessionReady(
-        serverUrl,
-        sessionId,
-        readinessOptions,
-      );
+      const sessionReady = await waitForSessionReady(serverUrl, sessionId, {
+        ...readinessOptions,
+        directory,
+      });
       if (!sessionReady || readinessOptions.signal?.aborted) {
         log(
           '[multiplexer-session-manager] child session not ready, skipping spawn',
@@ -927,11 +926,10 @@ export class MultiplexerSessionManager {
       }
 
       const readinessOptions = this.readinessOptions();
-      const sessionReady = await waitForSessionReady(
-        serverUrl,
-        sessionId,
-        readinessOptions,
-      );
+      const sessionReady = await waitForSessionReady(serverUrl, sessionId, {
+        ...readinessOptions,
+        directory: known.directory,
+      });
       if (!sessionReady || readinessOptions.signal?.aborted) {
         log(
           '[multiplexer-session-manager] child session not ready, skipping respawn',

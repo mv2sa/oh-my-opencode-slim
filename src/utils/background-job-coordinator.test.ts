@@ -1,8 +1,9 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { describe, expect, mock, spyOn, test } from 'bun:test';
 import { BackgroundJobBoard as ProductionBackgroundJobBoard } from './background-job-board';
 import { BackgroundJobCoordinator } from './background-job-coordinator';
 import { BackgroundJobBoard, boardFixture } from './background-job-fixture';
 import { createBackgroundJobTerminalGate } from './background-job-terminal-gate';
+import * as loggerModule from './logger';
 
 function createMockBoard(isRunning = false) {
   return {
@@ -388,5 +389,39 @@ describe('BackgroundJobCoordinator', () => {
     });
     expect(accepted.taskID).toBe('ses_ok');
     expect(events).toEqual(['registered:ses_ok']);
+  });
+
+  test('logs the terminal state dispatch with record identity', () => {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    try {
+      const board = new BackgroundJobBoard();
+      const coordinator = new BackgroundJobCoordinator(board);
+      const job = coordinator.registerLaunch({
+        taskID: 'ses_dispatch_log',
+        parentSessionID: 'parent-1',
+        agent: 'fixer',
+      });
+      board.updateStatus({ taskID: job.taskID, state: 'running' });
+      expect(coordinator.deferIfRunning(job.taskID)).toBe(false);
+      board.updateStatus({ taskID: job.taskID, state: 'completed' });
+      const dispatch = entries.find(
+        (entry) =>
+          entry.message === '[job-coordinator] terminal state dispatch',
+      );
+      expect(dispatch?.data).toMatchObject({
+        taskID: job.taskID,
+        generation: job.generation,
+        state: 'completed',
+        parentSessionID: 'parent-1',
+        deferredClose: true,
+      });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

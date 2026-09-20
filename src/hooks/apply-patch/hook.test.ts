@@ -386,7 +386,7 @@ PATCH`,
     );
   });
 
-  test('blocks a trim-only stale patch as verification', async () => {
+  test('passes a trim-only match through verification (native-compatible)', async () => {
     const root = await createTempDir('apply-patch-hook-');
     await writeFixture(root, 'sample.txt', '  alpha  \n');
     const hook = createHook();
@@ -398,16 +398,13 @@ PATCH`,
 *** End Patch`;
     const output = { args: { patchText } };
 
-    await expect(
-      hook['tool.execute.before'](
-        { tool: 'apply_patch', directory: root },
-        output,
-      ),
-    ).rejects.toThrow(
-      'apply_patch verification failed: Failed to find expected lines',
+    await hook['tool.execute.before'](
+      { tool: 'apply_patch', directory: root },
+      output,
     );
 
-    expect(output.args.patchText).toBe(patchText);
+    expect(output.args.patchText).toContain('+omega');
+    expect(output.args.patchText).toContain('-  alpha  ');
   });
 
   test('blocks a malformed @@ at runtime before native execution', async () => {
@@ -484,7 +481,7 @@ garbage
     }
   });
 
-  test('blocks a dangerous indented case as verification', async () => {
+  test('lets native-compatible indented matches through verification', async () => {
     const root = await createTempDir('apply-patch-hook-');
     await writeFixture(
       root,
@@ -500,16 +497,19 @@ garbage
 *** End Patch`;
     const output = { args: { patchText } };
 
-    await expect(
-      hook['tool.execute.before'](
-        { tool: 'apply_patch', directory: root },
-        output,
-      ),
-    ).rejects.toThrow(
-      'apply_patch verification failed: Failed to find expected lines',
+    await hook['tool.execute.before'](
+      { tool: 'apply_patch', directory: root },
+      output,
     );
 
-    expect(output.args.patchText).toBe(patchText);
+    expect(output.args.patchText).toBe(
+      `*** Begin Patch
+*** Update File: sample.yml
+@@
++enabled: true
+-    enabled: false
+*** End Patch`,
+    );
   });
 
   test('rewrites anchored insertion to avoid native EOF handling', async () => {

@@ -18,6 +18,8 @@ export type PreparedAutoRescueTarget = {
   unicode: string;
   trimEnd: string;
   unicodeTrimEnd: string;
+  trim: string;
+  unicodeTrim: string;
 };
 
 export function equalExact(a: string, b: string): boolean {
@@ -53,12 +55,12 @@ const autoRescueComparatorEntries: NamedComparator[] = [
     exact: false,
     same: equalUnicodeTrimEnd,
   },
-];
-
-const comparatorEntries: NamedComparator[] = [
-  ...autoRescueComparatorEntries,
   { name: 'trim', exact: false, same: equalTrim },
-  { name: 'unicode-trim', exact: false, same: equalUnicodeTrim },
+  {
+    name: 'unicode-trim',
+    exact: false,
+    same: equalUnicodeTrim,
+  },
 ];
 
 const MAX_LCS_CHUNK_LINES = 48;
@@ -66,6 +68,14 @@ const MAX_LCS_CANDIDATES = 64;
 
 export const autoRescueComparators: LineComparator[] =
   autoRescueComparatorEntries.map((entry) => entry.same);
+
+// Fuzzy rescues (prefix/suffix edges, one-line hits) keep the conservative
+// set: full-trim anchors can cross indentation levels and bind a stale chunk
+// at the wrong depth. Direct contiguous matching (seekMatch, prepared
+// targets) keeps the full native-compatible chain.
+const fuzzyRescueComparators: LineComparator[] = autoRescueComparatorEntries
+  .slice(0, 4)
+  .map((entry) => entry.same);
 
 export function prepareAutoRescueTarget(
   target: string,
@@ -78,6 +88,9 @@ export function prepareAutoRescueTarget(
     unicode,
     trimEnd,
     unicodeTrimEnd: trimEnd === target ? unicode : normalizeUnicode(trimEnd),
+    trim: target.trim(),
+    unicodeTrim:
+      target.trim() === target ? unicode : normalizeUnicode(target.trim()),
   };
 }
 
@@ -105,16 +118,22 @@ export function matchPreparedAutoRescueComparator(
     return 'unicode-trim-end';
   }
 
+  const trim = candidate.trim();
+  if (trim === target.trim) {
+    return 'trim';
+  }
+
+  const unicodeTrim = trim === candidate ? unicode : normalizeUnicode(trim);
+  if (unicodeTrim === target.unicodeTrim) {
+    return 'unicode-trim';
+  }
+
   return undefined;
 }
 
-// Full-trim comparators remain available as explicit utilities, but stay out
-// of automatic canonicalization because they can cross indentation levels and
-// rescue semantically unsafe patches.
-export const permissiveComparators: LineComparator[] = comparatorEntries.map(
-  (entry) => entry.same,
-);
-
+// The chain mirrors native OpenCode's matching passes (exact, then trim()
+// both ends, plus unicode and trim-end variants) so the pre-native gate
+// never rejects a patch native would accept (issue #1207).
 function tryMatch(
   lines: string[],
   pattern: string[],
@@ -311,7 +330,7 @@ export function rescueByPrefixSuffix(
   const hits = new Set<string>();
   let hit: MatchHit | undefined;
 
-  for (const same of autoRescueComparators) {
+  for (const same of fuzzyRescueComparators) {
     const leftHits = list(lines, left, start, same);
     if (leftHits.length === 0) {
       continue;

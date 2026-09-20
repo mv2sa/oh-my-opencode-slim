@@ -14,7 +14,15 @@ import {
 } from './background-job-terminal-gate';
 import { BackgroundTaskConcurrency } from './background-task-concurrency';
 import { classifyTerminalEvidence } from './child-transcript';
+import * as loggerModule from './logger';
 import { COMPLETED_WITHOUT_TEXT_DIAGNOSTIC } from './task';
+
+// Other test files mock the shared opencode-client module process-globally
+// (Bun mock.module is never auto-restored). Re-pin it to a passthrough so
+// this file always exercises the client each test provides via input.
+mock.module('./opencode-client', () => ({
+  getClient: (input: { client: unknown }) => input.client as never,
+}));
 
 const gates: BackgroundJobTerminalGate[] = [];
 afterEach(() => {
@@ -59,14 +67,16 @@ function harness(
   const observe = (
     kind: 'busy' | 'quiescent' | 'unknown' | 'deleted',
     stable = false,
+    observedAt?: number,
   ) => {
     const token = gate.capture(run);
     if (!token) throw new Error('missing observation');
     return gate.observe(token, {
       kind,
       readStartedAt: token.readStartedAt,
-      origin: 'test',
+      origin: observedAt === undefined ? 'test' : 'session.status-event',
       stable,
+      ...(observedAt !== undefined ? { observedAt } : {}),
     });
   };
   return {
@@ -140,6 +150,268 @@ describe('terminal evidence policy (migrated from stop confirmation)', () => {
 });
 
 describe('terminal gate', () => {
+  test.each([
+    ['old', { idle: 99 }, false],
+    ['equal', { idle: 100 }, false],
+    ['within read', { idle: 150 }, true],
+    ['read completion', { idle: 200 }, true],
+    ['future', { idle: 201 }, false],
+    ['missing', { idle: undefined }, false],
+    ['string', { idle: '150' }, false],
+    ['NaN', { idle: NaN }, false],
+    ['infinite', { idle: Infinity }, false],
+    ['negative', { idle: -1 }, false],
+    ['unaccredited clock', { clock: undefined }, false],
+    ['future generation', { start: 300 }, false],
+    ['invalid generation', { start: NaN }, false],
+    ['negative generation', { start: -1 }, false],
+    ['invalid read completion', { readAt: NaN }, false],
+    ['infinite read completion', { readAt: Infinity }, false],
+    ['negative read completion', { readAt: -1 }, false],
+    ['replacement attempt', { attempt: 160 }, false],
+    ['equal attempt', { attempt: 150 }, false],
+    ['invalid attempt', { attempt: -1 }, false],
+    ['live activity', { activity: 160 }, false],
+    ['invalid activity', { activity: NaN }, false],
+    ['fresh after all boundaries', { attempt: 120, activity: 130 }, true],
+    [
+      'first generation missing timestamp',
+      { generation: 1, idle: undefined },
+      false,
+    ],
+    ['first generation fresh timestamp', { generation: 1 }, true],
+    ['host error', { error: 'unavailable' }, false],
+    ['invalid response', { response: null }, false],
+    [
+      'malformed envelope',
+      { response: { data: false, outcome: 'failed', time: { idle: 150 } } },
+      false,
+    ],
+    ['unrecognized outcome', { outcome: 'running' }, false],
+  ] as const)(
+    'host outcome attribution: %s',
+    async (_name, overrides, accepted) => {
+      const spec = {
+        idle: 150 as unknown,
+        start: 100,
+        readAt: 200,
+        generation: 2,
+        clock: 'shared-unix-ms' as 'shared-unix-ms' | undefined,
+        attempt: undefined as number | undefined,
+        activity: undefined as number | undefined,
+        outcome: 'failed',
+        error: undefined as string | undefined,
+        response: undefined as unknown,
+        ...overrides,
+      };
+      let clock = 140;
+      const onTerminal = mock(() => {});
+      const h = harness({
+        hostOutcomeClock: spec.clock,
+        now: () => clock,
+        attemptStartedAtFor: () => spec.attempt,
+        maxEvidenceRetries: 0,
+        onTerminal,
+        baselineFor: () => undefined,
+        readTerminalEvidence: async () => ({ data: [] }),
+        input: {
+          client: {
+            session: {
+              get: async () => {
+                clock = spec.readAt;
+                if (spec.response !== undefined) return spec.response;
+                return {
+                  data: { outcome: spec.outcome, time: { idle: spec.idle } },
+                  error: spec.error,
+                };
+              },
+            },
+          },
+        } as never,
+      });
+      const run =
+        spec.generation === 1
+          ? h.run
+          : h.board.registerLaunch({
+              taskID: h.run.taskID,
+              parentSessionID: 'parent',
+              agent: 'fixer',
+              now: spec.start,
+            });
+      if (spec.activity !== undefined)
+        h.board.markRunningFromLiveSession(run.taskID, spec.activity);
+      const revision = h.board.get(run.taskID)?.terminalRevision;
+      await h.gate.reconcile(run);
+      expect(h.board.get(run.taskID)).toMatchObject(
+        accepted
+          ? {
+              state: 'error',
+              resultSummary: 'Host reported outcome: failed.',
+              terminalRevision: (revision ?? 0) + 1,
+            }
+          : {
+              state: 'running',
+              statusUncertain: true,
+              terminalRevision: revision,
+            },
+      );
+      if (!accepted)
+        expect(h.board.get(run.taskID)?.resultSummary).toBeUndefined();
+      expect(onTerminal).toHaveBeenCalledTimes(accepted ? 1 : 0);
+    },
+  );
+
+  test('unattributable host outcome clears old quiescence instead of aging into stopped', async () => {
+    let idle = 150;
+    let transcript: unknown;
+    const h = harness({
+      hostOutcomeClock: 'shared-unix-ms',
+      baselineFor: () => undefined,
+      input: {
+        client: {
+          session: {
+            get: async () => ({
+              data: { outcome: 'succeeded', time: { idle } },
+            }),
+            // Source-present host: the early-publish path for an
+            // absent transcript source must stay out of this test —
+            // its subject is the stale-quiescence aging guard, and a
+            // source-absent host would (correctly) publish completed
+            // on the first reconcile below.
+            messages: async () => ({ data: [] }),
+          },
+        },
+      } as never,
+      readTerminalEvidence: async () => transcript,
+    });
+    h.advance(200);
+    await h.gate.reconcile(h.run); // Valid quiescence, unavailable evidence.
+    idle = 0; // Equality to the generation boundary is not fresh evidence.
+    transcript = { data: [] };
+    for (let i = 1; i <= 6; i++) {
+      h.advance(200 + i * 10);
+      await h.gate.reconcile(h.run);
+    }
+    expect(h.board.get(h.run.taskID)).toMatchObject({
+      state: 'running',
+      statusUncertain: true,
+      terminalRevision: 0,
+    });
+  });
+  test('a host-timestamped busy keeps the short run outcome attributable', async () => {
+    const h = harness({
+      hostOutcomeClock: 'shared-unix-ms',
+      baselineFor: () => undefined,
+      readTerminalEvidence: async () => undefined,
+      input: {
+        client: {
+          session: {
+            get: async () => ({
+              data: { outcome: 'failed', time: { idle: 50 } },
+            }),
+          },
+        },
+      } as never,
+    });
+    // start host=10 < idle=50 < receipt 60. The adapter preserves the
+    // envelope `created`, so the delayed queued busy carries the host time
+    // and cannot fence the run's own outcome. failed publishes without
+    // transcript text.
+    h.advance(60);
+    h.observe('busy', false, 10);
+    h.advance(61);
+    h.observe('quiescent');
+    await h.gate.reconcile(h.run);
+    expect(h.board.get(h.run.taskID)).toMatchObject({
+      state: 'error',
+      resultSummary: 'Host reported outcome: failed.',
+      statusUncertain: false,
+    });
+  });
+  test('a real resume after a delayed busy still fences the stale outcome', async () => {
+    const h = harness({
+      hostOutcomeClock: 'shared-unix-ms',
+      baselineFor: () => undefined,
+      readTerminalEvidence: async () => undefined,
+      input: {
+        client: {
+          session: {
+            get: async () => ({
+              data: { outcome: 'failed', time: { idle: 50 } },
+            }),
+          },
+        },
+      } as never,
+    });
+    // The same failed outcome with an independently resumed run observed at
+    // host time 55: the outcome predates live activity and must not publish.
+    h.advance(60);
+    h.observe('busy', false, 10);
+    h.advance(62);
+    h.observe('busy', false, 55);
+    h.advance(63);
+    h.observe('quiescent');
+    await h.gate.reconcile(h.run);
+    expect(h.board.get(h.run.taskID)).toMatchObject({
+      state: 'running',
+      terminalRevision: 0,
+    });
+  });
+  test('an attributable succeeded publishes completed when the transcript source is absent', async () => {
+    const h = harness({
+      hostOutcomeClock: 'shared-unix-ms',
+      baselineFor: () => undefined,
+      readTerminalEvidence: async () => undefined,
+      input: {
+        client: {
+          session: {
+            // No session.messages: capability absence. The undefined
+            // evidence read is a dead end, not a pending transcript,
+            // so the window-attributed success publishes completed.
+            get: async () => ({
+              data: { outcome: 'succeeded', time: { idle: 50 } },
+            }),
+          },
+        },
+      } as never,
+    });
+    h.observe('quiescent');
+    h.advance(61);
+    await h.gate.reconcile(h.run);
+    expect(h.board.get(h.run.taskID)).toMatchObject({
+      state: 'completed',
+      terminalRevision: 1,
+      resultSummary: 'Host reported outcome: succeeded.',
+    });
+  });
+  test('an attributable interrupted publishes stopped, never error, when the transcript source is absent', async () => {
+    const h = harness({
+      hostOutcomeClock: 'shared-unix-ms',
+      baselineFor: () => undefined,
+      readTerminalEvidence: async () => undefined,
+      input: {
+        client: {
+          session: {
+            // No session.messages: capability absence, same as the
+            // succeeded twin above.
+            get: async () => ({
+              data: { outcome: 'interrupted', time: { idle: 50 } },
+            }),
+          },
+        },
+      } as never,
+    });
+    h.observe('quiescent');
+    h.advance(61);
+    await h.gate.reconcile(h.run);
+    // The host distinguished an interruption from a failure; the board
+    // stop family (no plugin-verified cancel lease) must carry it.
+    expect(h.board.get(h.run.taskID)).toMatchObject({
+      state: 'stopped',
+      terminalRevision: 1,
+      resultSummary: 'Host reported outcome: interrupted.',
+    });
+  });
   test('board rejects freely fabricated terminal authorization', async () => {
     const h = harness();
     const validate = mock(() => true);
@@ -305,6 +577,7 @@ describe('terminal gate', () => {
           release = resolve;
         });
       const h = harness({
+        hostOutcomeClock: 'shared-unix-ms',
         input: {
           directory: '/tmp',
           client: { session: { get: held } },
@@ -327,7 +600,9 @@ describe('terminal gate', () => {
       expect(release).toBeFunction();
       blocked = true;
       release(
-        stage === 'transcript' ? answer() : { data: { outcome: 'failed' } },
+        stage === 'transcript'
+          ? answer()
+          : { data: { outcome: 'failed', time: { idle: 1 } } },
       );
       await pending;
       expect(h.board.get(h.run.taskID)?.state).toBe('running');
@@ -380,11 +655,27 @@ describe('terminal gate', () => {
     expect((await h.gate.reconcile(h.run)).kind).toBe('deferred');
     expect(h.board.get(h.run.taskID)?.state).toBe('running');
   });
-  test.each(['completed', 'error', 'cancelled'] as const)(
-    'parsed %s is only a candidate while busy',
-    async (state) => {
-      const h = harness();
-      h.observe('busy');
+  test.each(
+    (['completed', 'error', 'cancelled'] as const).flatMap((state) =>
+      (['busy', 'retry'] as const).map((activity) => ({ state, activity })),
+    ),
+  )(
+    'parsed terminal output remains a candidate under a live v1 map: %j',
+    async ({ state, activity }) => {
+      const get = mock(async () => ({
+        data: { outcome: 'failed', time: { idle: 1 } },
+      }));
+      const h = harness({
+        input: {
+          client: {
+            session: {
+              status: async () => ({ data: { ses_child: { type: activity } } }),
+              get,
+            },
+          },
+        } as never,
+        hostOutcomeClock: 'shared-unix-ms',
+      });
       await h.gate.reconcile(h.run, {
         kind: 'output',
         status: {
@@ -396,6 +687,7 @@ describe('terminal gate', () => {
         origin: { kind: 'native', run: h.run, callID: 'call' },
       });
       expect(h.board.get(h.run.taskID)?.state).toBe('running');
+      expect(get).not.toHaveBeenCalled();
     },
   );
   test('quiescence plus attributable transcript commits exactly once', async () => {
@@ -760,6 +1052,34 @@ test('integration: historical replay + rehydration + busy host publishes nothing
 });
 
 test('integration: late acknowledgement and transport success for A cannot consume terminal B', async () => {
+  const timers = new Map<number, { delay: number; callback: () => void }>();
+  let nextID = 0;
+  const setTimer = spyOn(globalThis, 'setTimeout').mockImplementation(((
+    callback: () => void,
+    delay: number,
+  ) => {
+    const id = ++nextID;
+    timers.set(id, { delay, callback });
+    return id;
+  }) as typeof setTimeout);
+  const clearTimer = spyOn(globalThis, 'clearTimeout').mockImplementation(((
+    id: number,
+  ) => {
+    timers.delete(id);
+  }) as typeof clearTimeout);
+  const tick = async () => {
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+  };
+  const fire = (delay: number) => {
+    const entry = [...timers.entries()].find(
+      ([, timer]) => timer.delay === delay,
+    );
+    expect(entry).toBeDefined();
+    if (entry) {
+      timers.delete(entry[0]);
+      entry[1].callback();
+    }
+  };
   const board = new BackgroundJobBoard();
   const run = board.registerLaunch({
     taskID: 'ses_child',
@@ -770,13 +1090,18 @@ test('integration: late acknowledgement and transport success for A cannot consu
   });
   let text = 'A';
   let resolveA!: (value: unknown) => void;
+  let rejectB!: (error: unknown) => void;
   const transport = mock(
     (_input: { body: { parts: Array<{ text: string }> } }) =>
       transport.mock.calls.length === 1
         ? new Promise((resolve) => {
             resolveA = resolve;
           })
-        : Promise.resolve({}),
+        : transport.mock.calls.length === 2
+          ? new Promise((_, reject) => {
+              rejectB = reject;
+            })
+          : Promise.resolve({}),
   );
   const input = {
     directory: '/tmp',
@@ -796,7 +1121,7 @@ test('integration: late acknowledgement and transport success for A cannot consu
     input,
     backgroundJobBoard: board,
     terminalGate: gate,
-    maxNotificationRetries: 1,
+    maxNotificationRetries: 2,
     notificationRetryDelayMs: 1,
   });
   tracker.register({ ...run, baselineMessageID: 'baseline' });
@@ -843,7 +1168,11 @@ test('integration: late acknowledgement and transport success for A cannot consu
     const b = board.get(run.taskID);
     if (!b) throw new Error('missing terminal B');
     tracker.onTerminal(a); // A delayed adapter callback must not replace B's notification state.
-    for (let i = 0; i < 4; i++) await tick(); // Lease contention is not a failed send attempt for B.
+    for (let i = 0; i < 4; i++) {
+      fire(1); // Lease contention is not a failed send attempt for B.
+      await tick();
+    }
+    expect(transport).toHaveBeenCalledTimes(1);
     expect(b.terminalRevision).toBeGreaterThan(a.terminalRevision);
     messages.push({
       info: {
@@ -859,9 +1188,25 @@ test('integration: late acknowledgement and transport success for A cannot consu
     await hook.injectBackgroundJobBoard({}, { messages });
     // The adapter rejects A before invoking the board's acknowledgement method.
     expect(acknowledge).not.toHaveBeenCalled();
+    expect(
+      board.acquireRelaunchLease(run.taskID, run.generation),
+    ).toBeUndefined();
+    fire(10_000); // A never settled: its local wait alone must release ownership.
+    await tick();
+    const lease = board.acquireRelaunchLease(run.taskID, run.generation);
+    expect(lease).toBeDefined();
+    if (lease) board.releaseLease(lease);
+    fire(1);
+    await tick();
+    expect(transport).toHaveBeenCalledTimes(2); // B progresses without A's settlement.
     resolveA({});
     await tick();
+    expect(
+      board.acquireRelaunchLease(run.taskID, run.generation),
+    ).toBeUndefined();
+    rejectB(new Error('B was not accepted'));
     await tick();
+    fire(1); // A's success cannot accept B or cancel B's retry.
     await tick();
     expect(board.get(run.taskID)).toMatchObject({
       state: 'completed',
@@ -869,7 +1214,7 @@ test('integration: late acknowledgement and transport success for A cannot consu
       terminalUnreconciled: true,
       terminalRevision: b.terminalRevision,
     });
-    expect(transport.mock.calls.length).toBe(2);
+    expect(transport.mock.calls.length).toBe(3);
     expect(transport.mock.calls[1][0].body.parts[0].text).toContain(
       '<task_result>\nB\n</task_result>',
     );
@@ -897,6 +1242,8 @@ test('integration: late acknowledgement and transport success for A cannot consu
     resolveA?.({});
     tracker.dispose();
     await hook.event({ event: { type: 'server.instance.disposed' } });
+    setTimer.mockRestore();
+    clearTimer.mockRestore();
   }
 });
 
@@ -920,10 +1267,12 @@ test.each(['transcript', 'outcome'])(
         id: string;
         parentID: string;
         outcome?: 'succeeded';
+        time?: { idle: number };
       }> => ({
         id: 'ses_v2child',
         parentID: 'parent',
         outcome: source === 'transcript' || valid ? 'succeeded' : undefined,
+        time: { idle: Date.now() },
       }),
     );
     const input = buildPluginInput({
@@ -945,6 +1294,7 @@ test.each(['transcript', 'outcome'])(
       backgroundJobBoard: board,
       baselineFor: () => 'baseline',
       maxEvidenceRetries: source === 'transcript' ? 1 : 3,
+      hostOutcomeClock: 'shared-unix-ms',
       graceMs: 5,
     });
     gates.push(gate);
@@ -1123,6 +1473,225 @@ describe('foreground native terminal fast path (r2 hardening)', () => {
       state: 'error',
       resultSummary: COMPLETED_WITHOUT_TEXT_DIAGNOSTIC,
     });
+  });
+});
+
+describe('background reconcile failure containment', () => {
+  test('a failing scheduled reconcile is logged and contained, never an unhandled rejection', async () => {
+    // Regression (CI-only flake): a scheduled retry reconcile still in
+    // flight when another test file swaps the process-global getClient
+    // mock used to reject inside the fire-and-forget `void reconcile(run)`
+    // timer callback; the escaping rejection crashed whichever test was
+    // running by then. Background reconciliation is fail-soft: failures
+    // are logged and swallowed.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      // Throw on every getClient resolution only while armed — i.e. from
+      // the moment the first (awaited) reconcile has scheduled the retry
+      // timer until we re-arm recovery. Exactly the CI scenario: the
+      // scheduled reconcile resolves its client after another test file
+      // swapped the process-global getClient mock.
+      let armed = false;
+      let armedThrows = 0;
+      let clientReads = 0;
+      const input = {
+        directory: '/tmp',
+        get client() {
+          clientReads += 1;
+          if (armed) {
+            armedThrows += 1;
+            throw new Error('client vanished mid-flight');
+          }
+          return {
+            session: { status: async () => ({}) },
+          };
+        },
+      } as never;
+      const h = harness({ graceMs: 1, input });
+
+      // Awaited reconcile: the status read yields an invalid-response
+      // snapshot → unknown runtime → a retry is scheduled (timer) and the
+      // result is deferred, not a rejection.
+      const first = await h.gate.reconcile(h.run);
+      expect(first.kind).toBe('deferred');
+      expect(clientReads).toBeGreaterThanOrEqual(2);
+
+      armed = true;
+      // Flush the scheduled timer plus pending microtask/macrotask turns
+      // so the fire-and-forget reconcile has fully settled.
+      for (let i = 0; i < 8; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      // The scheduled reconcile really did hit the throwing client...
+      expect(armedThrows).toBeGreaterThanOrEqual(1);
+
+      // ...but the failure never escaped as an unhandled rejection.
+      expect(unhandled).toEqual([]);
+
+      // The gate still operates afterwards (client recovered).
+      armed = false;
+      const next = await h.gate.reconcile(h.run);
+      expect(['deferred', 'stale']).toContain(next.kind);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+});
+
+describe('terminal gate observability (INFO logs)', () => {
+  function captureLogs() {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    return {
+      entries,
+      of: (message: string) =>
+        entries.filter((entry) => entry.message === message),
+      restore: () => spy.mockRestore(),
+    };
+  }
+
+  test('host-outcome attribution attempt logs attempt number and attribution window', async () => {
+    const capture = captureLogs();
+    try {
+      let clock = 140;
+      const h = harness({
+        hostOutcomeClock: 'shared-unix-ms',
+        now: () => clock,
+        maxEvidenceRetries: 0,
+        baselineFor: () => undefined,
+        readTerminalEvidence: async () => ({ data: [] }),
+        input: {
+          client: {
+            session: {
+              get: async () => {
+                clock = 200;
+                return { data: { outcome: 'failed', time: { idle: 150 } } };
+              },
+            },
+          },
+        } as never,
+      });
+      const run = h.board.registerLaunch({
+        taskID: h.run.taskID,
+        parentSessionID: 'parent',
+        agent: 'fixer',
+        now: 100,
+      });
+      await h.gate.reconcile(run);
+      expect(
+        capture.of('[terminal-gate] host-outcome read initiated'),
+      ).toHaveLength(1);
+      const attempts = capture.of('[terminal-gate] host-outcome attribution');
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]?.data).toMatchObject({
+        taskID: run.taskID,
+        generation: run.generation,
+        state: 'running',
+        attribution: 'host-outcome',
+        attempt: 0,
+        outcome: 'failed',
+        windowLower: 100,
+        windowUpper: 200,
+        verdict: 'accepted',
+      });
+      const published = capture.of('[terminal-gate] terminal published');
+      expect(published).toHaveLength(1);
+      expect(published[0]?.data).toMatchObject({
+        taskID: run.taskID,
+        generation: run.generation,
+        state: 'error',
+        attribution: 'host-outcome',
+        parentSessionID: 'parent',
+      });
+    } finally {
+      capture.restore();
+    }
+  });
+
+  test('rejected host-outcome attribution logs the rejection reason', async () => {
+    const capture = captureLogs();
+    try {
+      const h = harness({
+        hostOutcomeClock: 'shared-unix-ms',
+        baselineFor: () => undefined,
+        readTerminalEvidence: async () => ({ data: [] }),
+        input: {
+          client: {
+            session: {
+              get: async () => ({
+                data: { outcome: 'running', time: { idle: 150 } },
+              }),
+            },
+          },
+        } as never,
+      });
+      h.advance(200);
+      await h.gate.reconcile(h.run);
+      const attempts = capture.of('[terminal-gate] host-outcome attribution');
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]?.data).toMatchObject({
+        taskID: h.run.taskID,
+        attribution: 'host-outcome',
+        attempt: 0,
+        verdict: 'rejected',
+        reason: 'unrecognized-outcome:running',
+      });
+    } finally {
+      capture.restore();
+    }
+  });
+
+  test('transcript publication logs transcript attribution', async () => {
+    const capture = captureLogs();
+    try {
+      const h = harness();
+      h.observe('quiescent');
+      await h.gate.reconcile(h.run);
+      const published = capture.of('[terminal-gate] terminal published');
+      expect(published).toHaveLength(1);
+      expect(published[0]?.data).toMatchObject({
+        taskID: h.run.taskID,
+        generation: h.run.generation,
+        state: 'completed',
+        attribution: 'transcript',
+        parentSessionID: 'parent',
+      });
+    } finally {
+      capture.restore();
+    }
+  });
+
+  test('evidence-unavailable give-up logs the exhausted attempt count', async () => {
+    const capture = captureLogs();
+    try {
+      const h = harness({
+        maxEvidenceRetries: 0,
+        readTerminalEvidence: async () => undefined,
+      });
+      await h.gate.reconcile(h.run);
+      const giveUps = capture.of(
+        '[terminal-gate] terminal evidence unavailable',
+      );
+      expect(giveUps).toHaveLength(1);
+      expect(giveUps[0]?.data).toMatchObject({
+        taskID: h.run.taskID,
+        generation: h.run.generation,
+        state: 'running',
+        attempt: 1,
+        verdict: 'gave-up',
+      });
+    } finally {
+      capture.restore();
+    }
   });
 });
 

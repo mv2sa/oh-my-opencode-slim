@@ -56,6 +56,10 @@ function normalizeObjectiveKey(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
+/** Random-UUID shape: the signature of hallucinated task_ids (see unknown-id branch). */
+const UUID_SHAPE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function refuseExplicitTaskId(
   requested: string,
   message: string,
@@ -133,6 +137,13 @@ export async function handleToolExecuteBefore(
     /** Opt-in provider → "foreground" map for same-provider conversion. */
     sameProviderPolicy?: Record<string, 'foreground'>;
     getLifecycleEpoch?: () => number;
+    /**
+     * Host-truth probe: does the parent conversation have a running child
+     * session that the in-memory board does not track (e.g. after a plugin
+     * restart)? Used to refuse unknown-alias drops that could duplicate
+     * live work. Fail-closed: implementers should return true on errors.
+     */
+    hasUntrackedRunningChild?: (parentSessionID?: string) => Promise<boolean>;
   },
 ): Promise<void> {
   const toolName = input.tool.toLowerCase();
@@ -242,11 +253,45 @@ export async function handleToolExecuteBefore(
 
       if (knownManagedTask) {
         refuseKnownTaskResume(requested, knownManagedTask, agentType);
+      } else if (UUID_SHAPE.test(requested)) {
+        // Hallucinated id: random UUIDs name nothing in this board and are the
+        // known failure signature of degraded fallback providers (2026-09-19:
+        // grok invented task_ids during a 429 window, then models copied the
+        // pattern from compacted history while every refusal blocked all
+        // delegations). Drop the id and proceed as a fresh spawn.
+        log('[task-session-manager] dropped hallucinated UUID task_id', {
+          task_id: requested,
+        });
+        delete args.task_id;
       } else {
-        refuseExplicitTaskId(
-          requested,
-          `Unknown task ID or alias: ${requested}. task() did not drop the id and did not create another session.`,
+        // Unknown alias (fix-99, v2 non-ses sessionID): drop the id and spawn
+        // a new child instead of refuse-without-spawn — unless the board may
+        // have merely lost the mapping (plugin restart) while a child session
+        // is still running: silently spawning then would duplicate live work
+        // and lose the specialist's context.
+        let untrackedRunning = false;
+        try {
+          untrackedRunning =
+            (await deps.hasUntrackedRunningChild?.(input.sessionID)) ?? false;
+        } catch {
+          untrackedRunning = true;
+        }
+        if (untrackedRunning) {
+          refuseExplicitTaskId(
+            requested,
+            `Unknown task ID or alias: ${requested}. The board may have lost its mapping (plugin restart) while a child session may still be running or retrying; task() will not silently spawn a duplicate. Omit task_id to deliberately spawn a fresh session, or resume with the exact ses_* session id.`,
+            { unknownAlias: true, probe: 'untracked-running-child' },
+          );
+        }
+        log(
+          '[task-session-manager] dropped unknown task_id; spawning new session',
+          {
+            task_id: requested,
+            agentType,
+            parentSessionID: input.sessionID,
+          },
         );
+        delete args.task_id;
       }
     } else {
       const relaunchLease = deps.backgroundJobBoard.acquireRelaunchLease(
@@ -385,6 +430,11 @@ export async function handleToolExecuteAfter(
     syntheticQuotaCoordinator?: SyntheticQuotaCoordinator;
     bindConcurrencyTicket?: (taskID: string, pending: PendingTaskCall) => void;
     releaseConcurrencyTask?: (taskID: string) => void;
+    backgroundTaskConcurrency?: BackgroundTaskConcurrency;
+    getModelForAgent?: (
+      agentType: string,
+      parentSessionID?: string,
+    ) => string | undefined;
     /** Record direct task cleanup even when the store is a thin facade. */
     recordLifecycleSuppression?: (taskID: string) => void;
     /** Clear a deletion guard when a new native task output proves a run exists. */
@@ -492,6 +542,44 @@ export async function handleToolExecuteAfter(
 
   try {
     if (typeof output.output !== 'string') return;
+    const backgroundMeta = output.metadata as
+      | { background?: unknown }
+      | undefined;
+    // The host only reports background:true here when it promoted the
+    // foreground waiter (or the launch was native): it is authoritative
+    // for the child this output describes, regardless of call identity.
+    const hostConfirmedBackground = backgroundMeta?.background === true;
+    if (hostConfirmedBackground && !pending.background) {
+      // Foreground-fallback promoted this waiter to background before its
+      // fallback abort: the tool resolved via backgroundResult, so the
+      // pending (registered as a foreground call) must follow suit or the
+      // board record would stay foreground and miss the background-only
+      // observation and supervision paths.
+      pending.background = true;
+      // The foreground call skipped concurrency admission, so the
+      // promoted run would otherwise bypass the configured limits: take
+      // the same ticket a native background launch holds. No ready-await
+      // — the child is already running; registration below binds the
+      // ticket and the terminal path releases it.
+      if (deps.backgroundTaskConcurrency && !pending.concurrencyTicket) {
+        const isManagedTask = deps.backgroundJobBoard
+          .taskIDs()
+          .has(pending.parentSessionId);
+        if (!isManagedTask) {
+          pending.concurrencyTicket = deps.backgroundTaskConcurrency.acquire({
+            model: deps.getModelForAgent?.(
+              pending.agentType,
+              pending.parentSessionId,
+            ),
+          });
+          // Fire-and-forget accounting: nobody awaits ticket.ready here,
+          // so a rejection (queue cancelled by disposal while waiting)
+          // must be marked handled or it surfaces as an unhandled
+          // rejection. A granted or released ticket is unaffected.
+          void pending.concurrencyTicket.ready.catch(() => {});
+        }
+      }
+    }
     if (pending.earlyRegistrationRejected) {
       log(
         '[task-session-manager] task output previously fenced; re-evaluating registration against board state',
@@ -505,6 +593,7 @@ export async function handleToolExecuteAfter(
         launch.taskID,
         pending,
         exactCallConfirmed,
+        hostConfirmedBackground,
         deps,
       );
       if (!record) return;
@@ -533,6 +622,7 @@ export async function handleToolExecuteAfter(
         status.taskID,
         pending,
         exactCallConfirmed,
+        hostConfirmedBackground,
         deps,
       );
       if (!record) return;
@@ -638,7 +728,32 @@ export async function handleToolExecuteAfter(
       return;
     }
 
-    deps.taskContextTracker.pendingManagedTaskIds.delete(taskId);
+    // An ID-only output still identifies this call's own child: a
+    // placeholder is promoted with the owning pending's launch metadata
+    // (identity-unresolved pendings paint nothing, per the identity rule),
+    // and once promoted the child is supervised and context-tracked like
+    // any parsed launch.
+    const promoted = deps.backgroundJobBoard.promoteProvisional(
+      taskId,
+      pending.parentSessionId,
+      pending.identityUnresolved
+        ? undefined
+        : {
+            agent: pending.agentType,
+            description: pending.label,
+            objective: pending.fullObjective,
+            background: pending.background,
+          },
+    );
+    if (promoted && !promoted.provisional) {
+      deps.bindConcurrencyTicket?.(promoted.taskID, pending);
+      if (exactCallConfirmed) {
+        deps.backgroundJobSupervisor?.onLaunch(promoted);
+      }
+      deps.taskContextTracker.pendingManagedTaskIds.add(taskId);
+    } else {
+      deps.taskContextTracker.pendingManagedTaskIds.delete(taskId);
+    }
     deps.backgroundJobBoard.addContext(
       taskId,
       deps.taskContextTracker.contextFilesForPrompt(taskId),
@@ -657,6 +772,7 @@ function registerTaskOutputLaunch(
   taskID: string,
   pending: PendingTaskCall,
   exactCallConfirmed: boolean,
+  hostConfirmedBackground: boolean,
   deps: {
     backgroundJobBoard: BackgroundJobStore;
     backgroundJobSupervisor?: BackgroundJobSupervisor;
@@ -748,7 +864,8 @@ function registerTaskOutputLaunch(
             description: pending.label,
             objective: pending.fullObjective ?? pending.label,
           }),
-      background: exactCallConfirmed && pending.background,
+      background:
+        (exactCallConfirmed || hostConfirmedBackground) && pending.background,
       preserveRun:
         pending.earlyRegisteredTaskID === taskID ||
         pending.resumedTaskId === undefined,

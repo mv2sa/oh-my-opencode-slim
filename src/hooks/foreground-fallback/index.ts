@@ -136,6 +136,11 @@ const TRANSPORT_MESSAGE_PATTERNS = [
   /^connect ECONNREFUSED\b/i,
   /^getaddrinfo ENOTFOUND\b/i,
   /authentication unavailable/i,
+  // Bun's fetch aborts connections whose response headers never arrive
+  // (e.g. an upstream holding the request instead of answering) with this
+  // client-side phrasing. Classify it as failover so a hanging upstream
+  // triggers the model chain instead of dying as an opaque error.
+  /response headers timed out/i,
   // Provider SDKs also report connection failures with natural-language
   // messages (e.g. "stream error: Cannot connect to API") that carry no
   // transport code. Match the narrow phrase only.
@@ -304,6 +309,10 @@ export function isInlineFailoverError(error: unknown): boolean {
 /** Prevent re-triggering within this window for the same session. */
 const DEDUP_WINDOW_MS = 5_000;
 const REPROMPT_DELAY_MS = 500;
+/** Ceiling on the waiter-promotion round-trip: a hung transport must not
+ *  stall the fallback abort below, or the broken session stays busy and
+ *  the fallback never arrives — a variant of the bug being fixed. */
+const PROMOTE_WAITER_TIMEOUT_MS = 2_000;
 const FALLBACK_IN_PROGRESS_KEY = Symbol.for(
   'oh-my-opencode-slim.foreground-fallback.in-progress',
 );
@@ -355,6 +364,11 @@ export class ForegroundFallbackManager {
   private readonly sessionModel = new Map<string, string>();
   /** sessionID → agent name (populated from message.updated info.agent field) */
   private readonly sessionAgent = new Map<string, string>();
+  /** child sessionID → parent sessionID (from session.created info).
+   *  Lets the fallback abort path promote a foreground task() waiter to
+   *  background first, so the waiting tool resolves via backgroundResult
+   *  instead of "Task cancelled" while the child continues on fallback. */
+  private readonly sessionParent = new Map<string, string>();
   /** sessionID → set of models already attempted this session */
   private readonly sessionTried = new Map<string, Set<string>>();
   /** Process-local sessions with an active fallback switch in flight. */
@@ -386,6 +400,11 @@ export class ForegroundFallbackManager {
    *   (one retry chance); 2 = exhausted again, aborted — stop intervening.
    *   Reset to 0 on successful responses or session deletion. */
   private readonly chainExhaustion = new Map<string, number>();
+  /** True once dispose() ran. `opencode reload` destroys this instance's
+   *  context mid-attempt; in-flight fallback chains check this at every
+   *  suspension point so their continuation never touches the old
+   *  generation's client (transcript reads, aborts, re-prompts). */
+  private disposed = false;
   /** sessionID → notified when the session switched to a new model mid-flight
    *  (e.g. after a fallback re-prompt). Lets the background-task admission
    *  scheduler migrate provider/model accounting to the new model. */
@@ -642,6 +661,34 @@ export class ForegroundFallbackManager {
     }
 
     return undefined;
+  }
+
+  /** Plugin dispose: cancel scheduled initial-delay timers and fence off
+   *  in-flight fallback chains. `opencode reload` destroys this instance
+   *  mid-attempt — pending timers are cancelled here, and suspension
+   *  points inside tryFallback/tryFallbackWithAbort/execFallback abandon
+   *  their continuation (see abandonedByDispose) so no replay, abort, or
+   *  transcript read runs through the destroyed generation's client. */
+  dispose(): void {
+    this.disposed = true;
+    for (const handle of this.pendingInitialDelay.values()) {
+      clearTimeout(handle);
+    }
+    this.pendingInitialDelay.clear();
+  }
+
+  /** Dispose fence for fallback chains: true when this generation was
+   *  disposed and the caller must abandon its attempt. Deterministic log
+   *  (fixed text, sessionID only — no timestamps or per-call ids). The
+   *  caller's `finally` still clears the process-global inProgress slot,
+   *  so the reloaded generation is never blocked by the abandoned one. */
+  private abandonedByDispose(sessionID: string): boolean {
+    if (!this.disposed) return false;
+    log(
+      '[foreground-fallback] disposed while fallback in flight; abandoning stale attempt',
+      { sessionID },
+    );
+    return true;
   }
 
   constructor(
@@ -1081,6 +1128,18 @@ export class ForegroundFallbackManager {
         break;
       }
 
+      case 'session.created': {
+        const info = (
+          event.properties as
+            | { info?: { id?: string; parentID?: string } }
+            | undefined
+        )?.info;
+        if (info?.id && info.parentID) {
+          this.sessionParent.set(info.id, info.parentID);
+        }
+        break;
+      }
+
       case 'subagent.session.created': {
         // Some builds of OpenCode include the agent name here.
         const props = event.properties as
@@ -1101,6 +1160,7 @@ export class ForegroundFallbackManager {
           log('[foreground-fallback] session.deleted observed', {
             sessionID: id,
           });
+          this.sessionParent.delete(id);
         }
         break;
       }
@@ -1151,12 +1211,18 @@ export class ForegroundFallbackManager {
         if (existing) clearTimeout(existing);
         const handle = setTimeout(() => {
           this.pendingInitialDelay.delete(sessionID);
+          // Background fallback is fail-soft: a failure must be logged
+          // and swallowed, never escape as an unhandled rejection.
           // Call tryFallbackWithAbort for session.status retry path
-          if (needsAbort) {
-            void this.tryFallbackWithAbort(sessionID);
-          } else {
-            void this.tryFallback(sessionID);
-          }
+          const trigger = needsAbort
+            ? this.tryFallbackWithAbort(sessionID)
+            : this.tryFallback(sessionID);
+          void trigger.catch((err) => {
+            log('[foreground-fallback] delayed fallback trigger failed', {
+              sessionID,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
         }, this.initialRetryDelayMs);
         this.pendingInitialDelay.set(sessionID, handle);
         return false;
@@ -1208,6 +1274,9 @@ export class ForegroundFallbackManager {
 
   private async tryFallback(sessionID: string, error?: unknown): Promise<void> {
     if (!sessionID) return;
+    // Reload fence at entry, before any state mutation: a trigger racing
+    // dispose() must not start a new chain through the dead context.
+    if (this.abandonedByDispose(sessionID)) return;
     if (this.inProgress.has(sessionID)) return;
     // No chain -> no fallback. Skip before dedup so we don't stamp lastTrigger
     // for sessions we will never re-prompt (e.g. councillor via CouncilManager).
@@ -1234,6 +1303,11 @@ export class ForegroundFallbackManager {
             elapsed,
           });
           await new Promise((r) => setTimeout(r, delay));
+          // The backoff slept through a dispose(): execFallback would
+          // read the transcript and re-prompt through the destroyed
+          // generation's client. The finally below still releases the
+          // process-global inProgress slot.
+          if (this.abandonedByDispose(sessionID)) return;
         }
       }
 
@@ -1255,18 +1329,92 @@ export class ForegroundFallbackManager {
    * without a replacement model only races owners that manage their own
    * lifecycle (e.g. CouncilManager for councillor) and produces noise.
    */
+  /** Promote a foreground task() waiter to background BEFORE the abort
+   *  below settles the child's job as "cancelled": the host resolves the
+   *  parent's wait via backgroundResult, so the waiting tool returns
+   *  "Background task started", its after-hook attributes the child, and
+   *  the fallback replay runs on a tracked session instead of orphaning
+   *  a headless run. Fail-soft by design: unknown host endpoint, missing
+   *  experimental flag, or transport failure degrade to the previous
+   *  behavior ("Task cancelled" + untracked replay). Order-critical:
+   *  must precede the abort. */
+  private async promoteForegroundWaiter(sessionID: string): Promise<void> {
+    const parentSessionID = this.sessionParent.get(sessionID);
+    if (!parentSessionID) return;
+    try {
+      const client = getClient(this.input) as unknown as {
+        _client?: {
+          post?: (args: {
+            url: string;
+            path: Record<string, string>;
+          }) => Promise<unknown>;
+        };
+      };
+      const post = client._client?.post;
+      const request: Promise<unknown> =
+        typeof post === 'function'
+          ? post.call(client._client, {
+              url: '/experimental/session/{sessionID}/background',
+              path: { sessionID: parentSessionID },
+            })
+          : // v2 plugin inputs carry no _client: hit the server URL
+            // directly. Same host, same endpoint, same fail-soft envelope.
+            fetch(
+              new URL(
+                `/experimental/session/${encodeURIComponent(parentSessionID)}/background`,
+                this.input.serverUrl,
+              ),
+              { method: 'POST' },
+            );
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          request,
+          new Promise((_, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error('foreground waiter promotion timed out')),
+              PROMOTE_WAITER_TIMEOUT_MS,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
+      log(
+        '[foreground-fallback] promoted foreground task waiter to background',
+        { sessionID, parentSessionID },
+      );
+    } catch {
+      log(
+        '[foreground-fallback] foreground waiter promotion failed; continuing fallback',
+        { sessionID },
+      );
+    }
+  }
+
   private async tryFallbackWithAbort(
     sessionID: string,
     error?: unknown,
   ): Promise<void> {
     if (!sessionID) return;
+    // Reload fence at entry (same rationale as tryFallback).
+    if (this.abandonedByDispose(sessionID)) return;
     if (this.inProgress.has(sessionID)) return;
     if (!this.hasFallbackChain(sessionID)) return;
     if (this.isDeduped(sessionID)) return;
 
     this.inProgress.add(sessionID);
     try {
+      await this.promoteForegroundWaiter(sessionID);
+      // Promotion awaited: a reload may have disposed this generation in
+      // the meantime — never abort through a stale client.
+      if (this.abandonedByDispose(sessionID)) return;
       await abortSessionWithTimeout(getClient(this.input), sessionID);
+      // The abort suspended across a dispose(): its outcome no longer
+      // matters to the reloaded generation — do not continue into
+      // execFallback (transcript read + replay on the dead client).
+      // The finally below still releases the process-global slot.
+      if (this.abandonedByDispose(sessionID)) return;
       await this.execFallback(sessionID, error);
     } finally {
       this.inProgress.delete(sessionID);
@@ -1295,6 +1443,10 @@ export class ForegroundFallbackManager {
     sessionID: string,
     error?: unknown,
   ): Promise<void> {
+    // Reload fence at entry: execFallback is reached after suspension
+    // points in the tryFallback* callers; a disposed generation must not
+    // even read the transcript through the old client.
+    if (this.abandonedByDispose(sessionID)) return;
     const session = getClient(this.input).session;
     try {
       const observedModel = this.sessionModel.get(sessionID);
@@ -1502,6 +1654,11 @@ export class ForegroundFallbackManager {
       const result = await session.messages({
         path: { id: sessionID },
       });
+      // Transcript read suspended across a dispose(): everything from
+      // here on — handoff arming, replay prompt, switch claim — would
+      // run through the destroyed generation's client. Abandon before
+      // arming anything; the tryFallback* finally releases inProgress.
+      if (this.abandonedByDispose(sessionID)) return;
       // result.data may contain partial/streaming messages whose `info` is
       // undefined at runtime (OpenCode violates its own declared type), and
       // v2 messages carry `type`/`text` instead of `info`/`parts`, so guard
@@ -1623,6 +1780,9 @@ export class ForegroundFallbackManager {
         log('[foreground-fallback] promptAsync on busy session, aborting', {
           sessionID,
         });
+        await this.promoteForegroundWaiter(sessionID);
+        // Same stale-generation fence as the failover abort above.
+        if (this.abandonedByDispose(sessionID)) return;
         try {
           await abortSessionWithTimeout(getClient(this.input), sessionID);
         } catch (abortErr) {
@@ -1633,6 +1793,15 @@ export class ForegroundFallbackManager {
           throw abortErr;
         }
         await new Promise((r) => setTimeout(r, REPROMPT_DELAY_MS));
+        // The abort/re-prompt-delay suspended across a dispose(): the
+        // second replay must not go through the old client. The first
+        // prompt's transport failed with an unknown outcome, so convert
+        // (never drop) the armed handoff exactly like the retry-failure
+        // path below.
+        if (this.abandonedByDispose(sessionID)) {
+          settleUnresolvedHandoff();
+          return;
+        }
         try {
           promptResult = await promptAsync(promptBody);
         } catch (retryErr) {

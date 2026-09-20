@@ -5,11 +5,12 @@ and OpenCode v2 (`opencode2`) from a single published package. This document
 describes how each host loads the plugin, what is supported where, and how to
 register it.
 
-The verified compatibility baseline is **OpenCode v2.0.3 stable** (Sep 12,
-2026). The stable line so far — v2.0.0 (Sep 11) through v2.0.3 — shipped 35
-commits with **zero `packages/plugin` API changes** (every fix landed
-elsewhere), so the plugin's shim targets are valid across the whole v2.0.x
-range, not just the newest patch release.
+The verified compatibility baseline is **OpenCode v2.0.7**. The plugin
+requires OpenCode v2.0.7+ on v2 hosts; older v2 hosts are unsupported.
+The adapter targets the v2 plugin API surface (see
+[The v2 plugin API surface](#the-v2-plugin-api-surface-this-adapter-uses)),
+and the compile-time mirror guard below is pinned to `@opencode/plugin`
+2.0.7.
 
 ## How it works
 
@@ -80,8 +81,8 @@ plugin context it consumes in `src/v2/types.ts` — the v1 host must be able to
 load the main build with no v2 package installed. This is a known tradeoff,
 not an oversight: the mirror is refreshed by hand and can drift from
 upstream, so every v2 release bump needs a deliberate diff of
-`src/v2/types.ts` against the new `@opencode/plugin`. That diff now has
-a compile-time tripwire: `src/v2/mirror-conformance.ts` — typechecked
+`src/v2/types.ts` against the new `@opencode/plugin`. That diff is
+backed by a compile-time tripwire: `src/v2/mirror-conformance.ts` — typechecked
 against the `@opencode/plugin` devDependency, pinned to the audited
 version — fails `bun run typecheck` when either the mirror or the
 pinned official surface drifts (hook-name sets, key payload fields).
@@ -95,12 +96,19 @@ name for the chat.headers bridge; the event stream, bridges, and
 orchestrator-wake children-driven degraded mode are exercised end-to-end
 on the stable host — live mock-driven re-verification on 2026-09-09
 included a queued wake firing after 60 s of parent idle with a stalled
-background child). Every v2 API the adapter touches is
+background child). v2 conformance is compile-time-pinned by the
+mirror-conformance guard against the `@opencode/plugin` 2.0.7
+devDependency and exercised by the mock-driven bridge tests. Every v2
+API the adapter touches is
 capability-probed at runtime (`typeof ctx.mcp?.transform === 'function'`,
 `s.switchModel`, `ctx.generate`, …), so a host lacking one capability
 degrades that single feature with a log line instead of breaking the load.
+The session hooks are the deliberate exception: on full contexts they
+register unconditionally and a
+registration failure fails setup (see
+[The v2 adapter](#the-v2-adapter-srcv2setupts)).
 `ctx.mcp.transform` in particular is present in **all** v2.0.x stable hosts;
-its probe only ever matters on pre-stable beta builds.
+its probe only ever matters on non-stable host builds.
 
 ## The v2 adapter (`src/v2/setup.ts`)
 
@@ -109,9 +117,15 @@ its probe only ever matters on pre-stable beta builds.
 1. Builds a v1-shaped `PluginInput` from the v2 context
    (`src/v2/client-shim.ts`): the project directory from `ctx.location`,
    and a shim `client` that **really delegates** the v1 SDK call shapes to
-   v2 flat session calls — `session.get`, `session.abort`→`interrupt`,
-   `session.messages`→`context`, `session.prompt` (as `delivery: "steer"`),
-   `session.update`→`rename`, `session.delete`→`remove` (same
+   v2 flat session calls — `session.get`, `session.abort`→`interrupt`
+   (`resume: false` aborts the active run), `session.messages`→`context`
+   (mapped entries preserve the v2 terminal metadata — `time.completed`,
+   `finish`, `error` — and the 2.0.8 trailing `idle` lifecycle marker maps
+   to the skippable v1 `system` role, so transcript classification works
+   natively on v2), `session.prompt` (default `delivery: "steer"`;
+   `noReply: true` maps to `delivery: "queue", resume: false`),
+   `session.update`→
+   `session.update` (`{sessionID, title}`), `session.delete`→`remove` (same
    `DELETE /api/session/:id`; stops the smartfetch secondary-model temp
    sessions leaking), and `session.list` (v2 `Session.Info` page → the v1
    `{data}` envelope with `directory` derived from `location` and `outcome`
@@ -252,8 +266,61 @@ its probe only ever matters on pre-stable beta builds.
      secondary-model summaries without a temp session
    - `dispose` → returned cleanup
 
-Each bridge is independently try/catch-guarded so one failure cannot disable
-the rest, and a zero-registration load logs a loud health-check warning.
+Each domain-transform bridge (agent/tool/mcp/command) is independently
+try/catch-guarded so one failure cannot disable the rest, and a
+zero-registration load logs a loud health-check warning. The session hooks
+(`prompt`, `context`, `model.request`, `compaction`) register
+**unconditionally** on full v2 contexts: a registration failure fails
+setup loudly instead of degrading — hook-name rejection is treated as a
+host contract violation, not a degrade path.
+
+### Task-control prompt and idle-wait contracts
+
+The v1-facing `session.prompt` shim preserves text and file attachments. A
+`noReply: true` write is a real, non-synthetic prompt with `queue` + `resume: false`;
+queue alone would not preserve the no-resume intent. Unsupported per-call
+agent/model/variant overrides are rejected before writing, never silently dropped
+or implemented by non-atomic `switchAgent`/`switchModel` calls. `task_message`
+explicitly inherits persisted selection on v2; other noReply callers, including
+interview notifications, retain the same no-resume semantics.
+
+`experimental_v2.waitForSessionIdle(sessionID)` exists only when the host provides
+`session.wait({sessionID})`. It delegates that method alongside the unchanged
+`generateText` channel; it fabricates neither a status map nor board state.
+`session.status` remains absent. Historical `session.get` outcomes cannot authorize
+revive. The official 2.0.5 prompt intent fields and wait signature are pinned in
+`mirror-conformance.ts`, and tool→shim→host contracts have dedicated tests.
+The 2.0.5 promise adapter does not forward AbortSignal to these methods, so the
+bounded idle wait does not pretend to cancel the host operation: late settlement
+is observed without authorizing a prompt. It waits for idle within its budget,
+not for an atomic reservation; queued delivery can still follow an external resume.
+
+The terminal gate alone attributes `session.get` outcomes, in both v1 and v2.
+Only integrations explicitly declaring `hostOutcomeClock: 'shared-unix-ms'`
+(the local in-process wiring) may use them. Other factories default to distrust.
+Finite nonnegative timestamps must satisfy `max(generation start, attempt start,
+latest live activity) < time.idle <= read completion`; equality is ambiguous.
+Attempt boundaries survive handoff promotion and late ACKs. An unattributable
+outcome cannot establish or preserve host-outcome quiescence; it leaves the run
+uncertain, not stopped. Fresh `succeeded` still requires valid post-baseline result
+evidence — except on hosts that expose no transcript source at all (no callable
+`session.messages`), where a window-attributed `succeeded` publishes `completed`
+from the host outcome alone (attribution `host-outcome`): capability absence is a
+dead end, never a pending transcript, and a host whose transcript is present but
+unfinalized keeps waiting exactly as on v1. Independent runtime maps, native
+returns and cancellation keep their fences.
+
+Known limitation (documented dead end): a host outcome that becomes
+attributable only after the gate's evidence retry budget is exhausted (initial
+read plus 3 retries at `stopConfirmationMs` cadence, with no further events
+arriving) strands the board entry at `running` until the parent's next
+activity rehydrate reconciles it. The parked probe test in
+`src/terminal-gate.integration.test.ts` (`probe: late-attributable outcome
+after exhaustion terminalizes the stranded board`, `test.skip`) records the
+mechanism: neither a later idle pair nor a busy→idle contrast cycle re-arms
+an outcome read. Note `stopConfirmationMs` doubles as the retry cadence —
+raising it stretches the stranding window proportionally (~4× its value at
+the default budget).
 
 ## Feature matrix
 
@@ -267,7 +334,7 @@ the rest, and a zero-registration load logs a loud health-check warning.
 | Message transforms (phase reminder, skills filter, image routing, display-name rewrite) | ✅ | ✅ via the single context hook | — |
 | Event handling (session tracking, lifecycle, cache telemetry) | ✅ | ✅ event pump + additive v2→v1 synthesis | — |
 | Tool execute hooks (apply-patch recovery, task-session, json-recovery) | ✅ | ✅ `createToolExecuteBridges` with subagent→task normalization | — |
-| Built-in MCPs (context7, gh_grep) auto-registered | ✅ | ✅ `ctx.mcp.transform` | `ctx.mcp.transform` is present in all v2.0.x stable hosts; the runtime capability probe only ever matters on pre-stable beta builds |
+| Built-in MCPs (context7, gh_grep) auto-registered | ✅ | ✅ `ctx.mcp.transform` | `ctx.mcp.transform` is present in all v2.0.x stable hosts; the runtime capability probe is belt-and-suspenders |
 | webfetch secondary-model summaries | ✅ | ✅ via `ctx.generate.text` | host without `ctx.generate` → summaries unavailable (logged) |
 | Background-job state persistence (tombstones, deletion epochs, alias high-water marks) | ➖ process-local | ✅ via `ctx.storage` | optional domain; absent → pure in-memory fallback, zero behavior change (see [Background job state](#background-job-state-rehydrate-probe-and-persistence)) |
 | Foreground model fallback (rate-limit failover) | ✅ | ✅ shim translates re-prompt into `session.switchModel` + `delivery:"steer"` prompt | — |
@@ -334,43 +401,52 @@ currently break this plugin:
 - **Runtime status reconciliation is capability-gated.** v2 has no
   equivalent of the v1 live session-status map (`client.session.status`
   is not a function on v2 hosts; `session.status` is not exposed to
-  plugins as of v2.0.3), so the task-session-manager's
+  plugins), so the task-session-manager's
   runtime-status reconciliation poll is disabled entirely on hosts
   without the method — a single per-instance log line notes the
   disabled reconciliation instead of logging uncertainty every ~5s poll.
   v1 hosts expose the method and keep the exact historical polling
   behavior. Background job stop-confirmation was never obtainable from
   the v2 poll anyway (the lookup failed every time).
-- **Stable-line plugin API additions (verified in v2.0.3).** Between the
-  pre-stable betas and v2.0.0, upstream grew the plugin surface with
+- **Plugin API surface and adoption status.** The v2 plugin API exposes
   session hooks `compaction`, `generate`, and `title` (the title and
-  compaction hooks may set `result` to skip the model call entirely),
-  per-session `permission.rules`, and TUI `ui.tabs.move()` (with
-  `tabs.open` no longer focusing a tab and `tabs.focus` now opening the
-  tab if needed). The `SessionContext` request shape also merged
-  `generation` and `providerOptions` into a single `options` object —
-  the plugin is unaffected: its context bridge mutates only
-  system/messages, and cache hints ride `ContentPart.cache`, which is
-  unchanged. Adoption status: the **compaction hook is adopted** — the
-  plugin strips its tagged synthetic parts from the compaction input
-  (new in this release); **`permission.rules` is adopted** —
+  compaction hooks may set `result` to skip the model call entirely)
+  and TUI `ui.tabs.move()` (`tabs.open` does not focus a tab;
+  `tabs.focus` opens the tab if needed). The `SessionContext` request
+  shape carries `generation` and `providerOptions` in a single
+  `options` object — the plugin is unaffected: its context bridge
+  mutates only system/messages, and cache hints ride
+  `ContentPart.cache`. Adoption status: the **compaction hook is
+  adopted** — the plugin strips its tagged synthetic parts from the
+  compaction input; **child-session permission rules are applied** —
   plugin-managed child sessions receive exact-match task-policy rules
-  once at creation (`createPermissionRulesBridge` in
-  `src/v2/setup.ts`; exact-match strings only, no wildcards, while
-  upstream matching semantics settle — PRs #48194/#46495/#46871); the
-  `generate` session hook (not the `ctx.generate` text channel the
-  webfetch summaries use), the `title` hook, and the new `tabs`
-  methods are not used.
+  once at creation via `ctx.session.update({sessionID, permissions})`
+  (`createPermissionRulesBridge` in `src/v2/setup.ts`; exact-match
+  strings only, no wildcards, while upstream matching semantics settle —
+  PRs #48194/#46495/#46871; whole-tool declarations (the read-class
+  `read`/`glob`/`grep` allows read-only agents declare) derive
+  action-scoped rules with the declared tool key as the exact resource,
+  so every agent with any declaration gets a non-empty replacing
+  ruleset instead of keeping the parent's inherited session rules;
+  triggered on plugin-managed child
+  `session.created` and fail-soft with a one-time warning on reduced
+  hosts without the method); the `generate` session hook (not the
+  `ctx.generate` text channel the webfetch summaries use), the `title`
+  hook, and the `tabs` methods are not used. On the client SDK,
+  `server.status` is named `server.info` (the plugin never calls it),
+  and the `location.reload` / `fs.write` endpoints and the Form
+  `hidden` field are likewise not adopted. The applied child-session
+  allow rules always lose to a matching user-config `deny` (see the
+  config permission policies bullet above).
   The `title` hook needs no adoption for child sessions: v2 hosts
   title subagent children deterministically at creation (the
   `subagent` tool sets `title` from its `description` argument, which
-  the delegation pipeline always supplies) — the earlier
-  "deterministic child titles" future-work item is closed as natively
-  covered; the hook only matters if custom title formats are wanted.
-  Upstream is still actively fixing compaction×hook plumbing and
-  compaction×cache behavior after v2.0.3, so compaction-hook semantics
-  may evolve; the plugin's hook callback is written shape-tolerant
-  (messages-only mutation) to ride those changes.
+  the delegation pipeline always supplies) — the hook only matters if
+  custom title formats are wanted. Upstream is still actively fixing
+  compaction×hook plumbing and compaction×cache behavior, so
+  compaction-hook semantics may evolve; the plugin's hook callback is
+  written shape-tolerant (messages-only mutation) to ride those
+  changes.
 - **Duplicate idle delivery.** The adapter synthesizes both an idle
   `session.status` and a `session.idle` from each terminal execution event,
   so a consumer watching both sees idle twice per terminal transition.
@@ -393,6 +469,79 @@ currently break this plugin:
   matches raw MCP tool names: MCP access is granted per server name
   (`"mcps": ["context7", "!gh_grep"]` in agent config), and registration
   uses its own server names via `draft.set(name, ...)`.
+- **`opencode reload` recreates plugin instances in-process.** The CLI
+  `opencode reload` command, the TUI reload command, and the
+  `location.reload` HTTP endpoint all rebuild the host's location
+  service layer: plugin instances are destroyed and recreated, `setup`
+  re-enters in the same process, and the host calls the cleanup
+  returned by the previous generation before the new generation loads.
+  Pending permissions and forms are cancelled, and running sessions
+  swap to the new service layer at the next step boundary. There is no
+  unload-style lifecycle hook. Module state of an npm-form plugin
+  survives the reload (the module instance is reused); a
+  local-directory plugin is forced onto a fresh module instance
+  whenever its files change. The plugin handles the in-process re-entry
+  explicitly: the v1 `dispose` hook cancels pending foreground-fallback
+  initial-delay timers and fences off in-flight fallback chains at
+  their suspension points (`foregroundFallback.dispose()` — no replay,
+  abort, or transcript read continues through the destroyed client),
+  clears the process-global wake-gate
+  progress so the next generation does not inherit the previous
+  generation's two-wake no-progress caps (`clearAllWakeSessions()`),
+  and explicitly releases companion ownership
+  (`companionManager.onExit()` — idempotent). The v2 `setup` entry
+  calls `resetV2GenerationWarnings()`, rearming the one-time
+  degradation latches (model.request ordering drift, permission-rules
+  unavailable, session.list/remove unavailable) so every generation
+  warns once. Background-job persistence resets unconditionally on
+  every generation setup behind an epoch fence, so persisted write
+  queues cannot leak across generations. The event adapter passes
+  `location.shutdown` events through raw with no synthesis. The
+  user-wait-gate (`wait_for_user` HITL latch) stays armed across a
+  reload by design, and the admission runtime defers its final
+  scheduler/tracker teardown by one macrotask so an immediate re-init
+  can retain active and queued calls.
+- **Config permission policies are kernel-enforced and deny-final.**
+  `experimental.policies` supports `action: "permission"` entries
+  (`effect: "allow"`/`"deny"`, resource wildcards) enforced by the host
+  kernel. An explicit `deny` is final and never reaches the evaluate
+  hooks: a user-config `deny` can suppress the plugin's allow rules or
+  permission upgrades, and the plugin's exact-match allow rules on
+  child sessions coexist with user config — on a match the user `deny`
+  wins over the plugin's allow. No plugin code participates in that
+  resolution.
+- **Provider failure retries are aggressive.** The host retries a
+  failing provider call up to 10 times within a total window of about
+  84 s (4xx responses are never retried). Observation-style hooks
+  therefore fire far more frequently in a failing session than in a
+  healthy one.
+
+### The v2 plugin API surface this adapter uses
+
+- **`session.update({sessionID, title?, permissions?})`.** Sets the
+  session title and/or REPLACES the session-scoped permission rule
+  list. The client shim's v1-facing `session.update({body: {title}})`
+  and the v2 interview bridge's session renames both call it, and the
+  child-session permission bridge applies its rules through the
+  `permissions` field (see the adoption-status bullet above).
+- **`session.interrupt({sessionID, resume})`.** `resume: false` aborts
+  the active run; the shim's abort path sends exactly that.
+- **`experimental.ws.handshake` / `experimental.ws.send` /
+  `experimental.ws.receive` session hooks.** Official experimental
+  hooks on the pinned surface (the mirror-conformance guard's
+  `OfficialSessionHookNames` set of 12); **not registered and not
+  used** by this plugin — they appear only in the official-set pin.
+- **Core `# Your Model` identity system part.** v2 core splices a
+  `# Your Model` identity part at `system[1]` on every LLM request. The
+  plugin's system transform keeps appending the orchestrator prompt to
+  `system[0]` and collapses all parts into one — locked by a regression
+  test in `src/index.test.ts`.
+- **Subagent `model` param.** The built-in `subagent` tool takes an
+  optional `model` argument (`"providerID/modelID"`). The delegation
+  vocabulary exposes it (`modelParam`) and the orchestrator/council
+  prompts carry a one-sentence guardrail: only set it when the user
+  explicitly asks for a specific model or variant; never guess the ID —
+  look it up with the models tool first.
 
 ## Installing on v2
 
@@ -506,10 +655,12 @@ taskID:
   `updateStatus` semantics as the idle-reconciliation host-outcome path:
   `succeeded` requires usable final assistant text (otherwise the
   textless-completion diagnostics apply, per the #1115 precedent);
-  `failed`/`interrupted` settle as error with the host outcome recorded.
+  `failed` settles as error with the host outcome recorded; `interrupted`
+  is a host stop, not a failure, and settles as `stopped` (the stop
+  family — no plugin-verified cancel lease), never a false error.
 
 Related injection hardening: a remembered (possibly stale) processed
-completion now skips *cleanly* — the fence check runs before the
+completion skips *cleanly* — the fence check runs before the
 deletion-epoch fail-closed branch in `updateFromInjectedCompletion`, so
 replaying an old completion after a delete + same-ID relaunch can no
 longer poison the fresh generation with `markStatusUncertain`. Unobserved
@@ -604,11 +755,11 @@ Q&A history.
 The v2 plugin session domain (`packages/plugin/src/promise/session.ts`,
 `SessionDomain`, mirrored by the runtime object the promise adapter
 builds) exposes exactly `create`/`get`/`switchAgent`/`switchModel`/
-`prompt`/`generate`/`command`/`synthetic`/`interrupt`/`rename`/`move`/
-`wait`/`context` — **`list` and `remove` are not handed to plugins**
-(as of v2.0.3). Both endpoints exist on the host's HTTP API, but the
+`prompt`/`generate`/`command`/`synthetic`/`interrupt`/`update`/`move`/
+`wait`/`context` — **`list` and `remove` are not handed to plugins**.
+Both endpoints exist on the host's HTTP API, but the
 plugin context never receives them. `session.status`, `session.todo`, and
-`session.children` are likewise not exposed as of v2.0.3 — the wake
+`session.children` are likewise not exposed to plugins — the wake
 scheduler's fallback enumeration, the delete no-op below, and the disabled
 runtime-status reconciliation (see
 [Upstream behaviors](#upstream-behaviors-to-know)) all follow from these
@@ -643,8 +794,7 @@ silently (`list`) or logging on every call (`remove`):
 
 The guards are module-level booleans with fixed text — no timestamps,
 session ids, or per-call payloads — so repeated wake polls and cleanup
-calls do not flood the log (the remove warning used to fire once per
-delete attempt).
+calls do not flood the log.
 
 ### Orchestrator-wake on v2 (children-driven degraded mode)
 
@@ -652,7 +802,7 @@ The wake scheduler is **active on v2** in a degraded mode, configured with
 `backgroundJobs.orchestratorWake.mode` (`"auto"` | `"todo"` | `"children"`,
 default `"auto"`: todo-gating on v1, children-driven on v2; an explicit
 `"todo"` degrades to children because v2 has no todo surface exposed to
-plugins as of v2.0.3 — logged once).
+plugins — logged once).
 
 How it differs from the v1 path:
 
@@ -668,8 +818,8 @@ How it differs from the v1 path:
   child). A finished child is therefore terminal immediately instead of
   reading active for the whole staleness window, and a live child stays
   visible on its host evidence rather than dropping out on stale local
-  evidence. As of v2.0.3, `session.list` is not exposed to plugins on any
-  stable host
+  evidence. `session.list` is not exposed to plugins on any stable
+  host
   (see
   [Not exposed to plugins](#not-exposed-to-plugins-sessionlist-sessionremove)),
   so the event-tracked fallback is the operative path. Results are scoped
@@ -704,6 +854,64 @@ parent natively — that covers the happy path. What the port adds is a
 periodic watchdog: an idle parent with a stuck or unreconciled child (or a
 job that stopped without a terminal result) gets woken to assess, cancel, or
 respawn, bounded by the same no-progress cap as v1.
+
+### Terminal-publication wake（终态后唤醒）
+
+The native notifier fires on the FIRST terminal publication of every
+generation — on v2 every plugin task launch AND relaunch is a host
+`subagent` tool call that arms the native background notifier (a relaunch
+re-arms it with a fresh `started_at`, defeating the notify dedupe). Only a
+terminal publication that lands while the parent sits idle on a LATER
+revision of the same generation (a child that self-continues via its own
+background-shell notification and finishes again, or a completion after a
+direct prompt to the child session) would otherwise wait for the periodic
+idle evaluation (up to `orchestratorWake.intervalMs`, default 5 minutes).
+The **terminal-publication wake** closes that gap on both host flavors:
+
+- **Trigger:** the terminal gate publishes a `completed` or `error` host
+  outcome (state-disjoint from the stopped-job recovery listener, which
+  keys on `stopped` + terminal-unreconciled) AND the parent is idle AND
+  no input wait is open AND at least `publicationWakeMinIntervalMs` has
+  passed since this parent's last *delivered* publication wake (the
+  per-parent throttle is consumed only on delivery — and only after the
+  evaluation actually queues the wake admission; a suppressed OR vetoed
+  attempt, including an in-evaluation no-delivery exit such as the
+  unchanged-fingerprint no-progress stop or an SDK error, burns
+  nothing). The FIRST terminal publication of ANY generation
+  (`terminalRevision` 1) is suppressed with `reason:
+  "first-publication-native-owned"` — the native notifier armed by that
+  generation's `subagent` tool call already delivers it to an idle
+  parent; if that native delivery is ever lost host-side, the job falls
+  back to board injection on the parent's next activity. Exception: a
+  revived run whose tracker-owned `<task>` notification exhausts its
+  whole retry budget releases ownership and re-emits the publication
+  wake directly through the scheduler (a revived lineage has no native
+  notifier, so the first-publication suppression must not apply to that
+  degraded fallback) — the idle parent always ends up with exactly one
+  delivery: the notification or the fallback wake.
+- **Busy parent → skip entirely:** the native steer already delivered the
+  first completion; a queued wake would double-notify.
+- **Delivery:** the same `promptAsync` machinery as the periodic wake —
+  `delivery: "queue"`, `modelSelection: "inherit"`, the session's current
+  model variant — reusing the existing wake text (no new prompt surface).
+- **Shared gate:** one-flight, the two-wake no-progress cap, and
+  `expectingWakeBusy` are the periodic scheduler's, not a parallel gate.
+  A publication wake enters evaluation past the cap's pre-check and lets
+  the in-evaluation fingerprint comparison decide: a publication that
+  changed the children fingerprint un-stops the session; an unchanged
+  fingerprint keeps the cap tripped.
+
+Config knobs (see the `backgroundJobs.orchestratorWake` rows in the
+[configuration reference](configuration.md#background-job-management)):
+`wakeOnTerminalPublication` (boolean, default `true` — the feature flag)
+and `publicationWakeMinIntervalMs` (integer ms, default `30_000` — the
+per-parent throttle window; a burst of publications collapses into one
+wake).
+
+Related: when a job whose terminal report the parent already consumed
+(reconciled) reopens to running, the board injection appends exactly one
+corrective trailing notice ("previously reported terminal, now running
+again; the earlier report is superseded") in the cache-safe tail zone.
 
 ### Environment caveats
 

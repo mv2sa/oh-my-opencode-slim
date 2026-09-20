@@ -1028,6 +1028,33 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "Amm1rr",
+      "name": "Mohammad",
+      "avatar_url": "https://avatars.githubusercontent.com/u/480468?v=4",
+      "profile": "https://github.com/Amm1rr",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "kumar-shivang",
+      "name": "Shivang Kumar",
+      "avatar_url": "https://avatars.githubusercontent.com/u/89011717?v=4",
+      "profile": "https://github.com/kumar-shivang",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "ScoFan-official",
+      "name": "ScoFan-official",
+      "avatar_url": "https://avatars.githubusercontent.com/u/137064417?v=4",
+      "profile": "https://github.com/ScoFan-official",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"

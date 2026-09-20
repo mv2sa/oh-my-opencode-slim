@@ -1,5 +1,5 @@
 /**
- * v2 compaction hook bridge (`ctx.session.hook("compaction")`, v2.0.0+).
+ * v2 compaction hook bridge (`ctx.session.hook("compaction")`).
  *
  * Coverage:
  * - tagged synthetic parts are stripped from the compaction event's
@@ -8,9 +8,10 @@
  * - read-only guarantees: `system` is never modified and `result` is
  *   never set (host-owned; open host bug — the compaction system prompt
  *   may be absent, so the bridge must not add or rewrite one)
- * - registration degrade: a host that rejects the hook name keeps the
- *   rest of setup intact with a one-time deterministic log (mirrors the
- *   prompt / model.request degrade tests in setup.e2e.test.ts)
+ * - registration contract: a host that rejects the hook
+ *   name fails setup loudly — the error propagates instead of being
+ *   swallowed with a fallback log (mirrors the model.request contract
+ *   test in setup.e2e.test.ts)
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { readdirSync as readDirSync, readFileSync } from 'node:fs';
@@ -371,29 +372,28 @@ describe('createV2Setup compaction hook', () => {
     }
   }, 20_000);
 
-  test('host rejecting the compaction hook name degrades: one log, setup completes', async () => {
+  test('host rejecting the compaction hook name fails setup loudly', async () => {
+    // Hook-name rejection is a host contract
+    // violation, not a degrade path — the error propagates out of setup
+    // instead of being swallowed with a fallback log line.
     const { ctx, hooks, rejected, getContextCb } = makeCtx({
       rejectCompaction: true,
     });
-    const cleanup = await createV2Setup()(ctx);
+    await expect(createV2Setup()(ctx)).rejects.toThrow(
+      'unknown session hook: compaction',
+    );
 
-    try {
-      // The compaction registration was attempted exactly once and
-      // rejected; every other session bridge still registered.
-      expect(rejected).toEqual(['compaction']);
-      expect(hooks).toContain('context');
-      expect(getContextCb()).toBeFunction();
+    // The compaction registration was attempted exactly once and
+    // rejected; bridges registered before the failure are intact.
+    expect(rejected).toEqual(['compaction']);
+    expect(hooks).toContain('context');
+    expect(getContextCb()).toBeFunction();
 
-      await flushLoggerForTesting();
-      const logText = readPluginLog();
-      expect(logText).toContain(
-        '[v2] session.hook(compaction) unavailable; compaction sees tagged content',
-      );
-      expect(
-        logText.match(/compaction sees tagged content/g) ?? [],
-      ).toHaveLength(1);
-    } finally {
-      await cleanup(); // must not throw despite the rejected hook
-    }
+    await flushLoggerForTesting();
+    const logText = readPluginLog();
+    expect(logText).not.toContain('compaction sees tagged content');
+    expect(logText).not.toContain(
+      '[v2] compaction bridge registered (session.compaction)',
+    );
   }, 20_000);
 });

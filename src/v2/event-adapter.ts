@@ -307,9 +307,24 @@ export function mapV2EventToV1(
     if (typeof props.sessionID === 'string') {
       const sessionID = props.sessionID;
       if (type === 'session.execution.started') {
+        // The host envelope timestamps every event with `created`
+        // (Clock.currentTimeMillis). Preserve it as the activity boundary:
+        // the router forwards it as observedAt, so a delayed delivery keeps
+        // the host time instead of degenerating into a local receipt time,
+        // which cannot prove activity after a recorded host idle.
+        const activityAt =
+          typeof event.created === 'number' &&
+          Number.isFinite(event.created) &&
+          event.created >= 0
+            ? event.created
+            : undefined;
         out.push({
           type: 'session.status',
-          properties: { sessionID, status: { type: 'busy' } },
+          properties: {
+            sessionID,
+            status: { type: 'busy' },
+            ...(activityAt !== undefined ? { activityAt } : {}),
+          },
         });
       } else {
         if (type === 'session.execution.failed') {

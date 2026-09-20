@@ -20,7 +20,7 @@ export interface V2AgentDraft {
  * definitions — everything else is reachable only inside the `execute`
  * tool's confined JS runtime, so session tool catalogs yield
  * `Unknown tool: <name>` even though registration succeeded. The field
- * is additive: older hosts ignore it. */
+ * is additive: hosts that don't recognize the field ignore it. */
 export interface V2ToolOptions {
   codemode?: boolean;
   namespace?: string;
@@ -118,7 +118,7 @@ export interface V2SessionModelRequestEvent {
   headers: Record<string, string>;
 }
 /**
- * v2 `session.compaction` hook payload (v2.0.0+): the host's session
+ * v2 `session.compaction` hook payload: the host's session
  * summarization request. Same request shape as the context event plus an
  * optional host-owned `result`. The plugin bridge only strips its own
  * tagged synthetic parts from `messages`; `system` is never rewritten
@@ -164,9 +164,9 @@ export interface V2Registration {
  * #48194/#46495/#46871), so rules emitted by this plugin are ALWAYS
  * exact-match strings — never `*` or `?` wildcards. */
 export interface V2PermissionRule {
-  action: string;
-  resource: string;
-  effect: 'allow' | 'deny' | 'ask';
+  readonly action: string;
+  readonly resource: string;
+  readonly effect: 'allow' | 'deny' | 'ask';
 }
 /** v2 mcp transform draft (used after capability probing; RemoteConfig
  * shape see packages/schema/src/mcp.ts — no `enabled`, it uses
@@ -222,15 +222,16 @@ export interface V2Context {
       name: 'model.request',
       cb: (event: V2SessionModelRequestEvent) => Promise<void>,
     ): Promise<V2Registration>;
-    /** v2 session.compaction hook (v2.0.0+) — host summarization request
-     * (see V2SessionCompactionEvent). Older v2 hosts reject the name;
-     * callers must degrade. */
+    /** v2 session.compaction hook — host summarization request
+     * (see V2SessionCompactionEvent). */
     hook(
       name: 'compaction',
       cb: (event: V2SessionCompactionEvent) => Promise<void>,
     ): Promise<V2Registration>;
     /** v2 session.get — SessionInfo by id (runtime-probed). */
     get?(input: { sessionID: string }): Promise<unknown>;
+    /** Wait for the session agent loop to become idle (runtime-probed). */
+    wait?(input: { sessionID: string }): Promise<void>;
     /** v2 session.remove — DELETE /api/session/:id (runtime-probed). */
     remove?(input: { sessionID: string }): Promise<unknown>;
     /** v2 session.list — query-filtered listing (runtime-probed).
@@ -240,10 +241,18 @@ export interface V2Context {
       directory?: string;
       parentID?: string | null;
     }): Promise<unknown>;
-    /** v2 session.interrupt — `continue: false` aborts the active run. */
+    /** v2 session.interrupt — `resume: false` aborts the active run. */
     interrupt?(input: {
       sessionID: string;
-      continue?: boolean;
+      resume?: boolean;
+    }): Promise<unknown>;
+    /** v2 session.update ({sessionID, title?, permissions?}) — sets the
+     * session title and/or REPLACES the session-scoped rule list (see
+     * createPermissionRulesBridge in setup.ts). */
+    update?(input: {
+      sessionID: string;
+      title?: string;
+      permissions?: V2PermissionRule[];
     }): Promise<unknown>;
     /** v2 session.switchModel — v2 prompts carry no model, so a model
      * change must precede the prompt (runtime-probed). */
@@ -255,9 +264,15 @@ export interface V2Context {
     context?(input: {
       sessionID: string;
     }): Promise<Array<Record<string, unknown>>>;
-    /** v2 session.prompt — flat PromptInput ({sessionID, text, files?,
-     * agents?, skills?, metadata?, delivery?, resume?}). */
-    prompt?(input: Record<string, unknown>): Promise<unknown>;
+    /** v2 session.prompt subset used here; resume:false admits without waking. */
+    prompt?(input: {
+      sessionID: string;
+      text: string;
+      files?: Array<{ uri: string; name?: string }>;
+      metadata?: Record<string, unknown>;
+      delivery?: 'steer' | 'queue';
+      resume?: boolean;
+    }): Promise<unknown>;
     /** v2 session.synthetic — like prompt but not persisted as user
      * input. `delivery` routes the inbox entry ("steer" | "queue");
      * `resume: false` admits the input WITHOUT waking the session. */
@@ -270,8 +285,6 @@ export interface V2Context {
       delivery?: 'steer' | 'queue';
       resume?: boolean;
     }): Promise<unknown>;
-    /** v2 session.rename ({sessionID, title}). */
-    rename?(input: Record<string, unknown>): Promise<unknown>;
     /** v2 session.switchAgent ({sessionID, agent}). */
     switchAgent?(input: Record<string, unknown>): Promise<unknown>;
   };
@@ -295,21 +308,6 @@ export interface V2Context {
   mcp?: {
     transform(cb: (draft: V2McpDraft) => void): Promise<V2Registration>;
     reload(): Promise<void>;
-  };
-  /** v2 permission domain (runtime-probed optional — hosts before
-   * v2.0.0 expose no permission surface to plugins). Mirrors the
-   * OpenCode-core `PermissionDomain` subset; `rules` itself is optional
-   * and must be probed (typeof check) before use. */
-  readonly permission?: {
-    /** v2 permission.rules — REPLACES the session-scoped rule list for
-     * the session (v2.0.0+, #48351). Children inherit their parent's
-     * session rules at creation; the plugin installs each task child's
-     * own exact-match rules here (see createPermissionRulesBridge in
-     * setup.ts). */
-    rules?(input: {
-      sessionID: string;
-      permissions: V2PermissionRule[];
-    }): Promise<unknown>;
   };
 }
 

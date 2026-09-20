@@ -7,11 +7,18 @@ import {
   spyOn,
   test,
 } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { stateFilePath } from './companion/manager';
 import type { MultiplexerConfig } from './config';
 import { RuntimeConfig } from './config/runtime';
+import * as wakeHooks from './hooks';
 import { CooldownRegistry } from './hooks/foreground-fallback/cooldown-registry';
+import {
+  getWakeProgress,
+  resetOrchestratorWakeGateForTests,
+} from './hooks/orchestrator-wake/wake-gate';
 import pluginModuleDefault, {
   OhMyOpenCodeLite as plugin,
   selectLiveOrSoonestReset,
@@ -19,6 +26,8 @@ import pluginModuleDefault, {
   shouldEnableMultiplexer,
 } from './index';
 import { readTuiSnapshot, snapshotSectionsEqual } from './tui-state';
+import { BackgroundJobCoordinator } from './utils/background-job-coordinator';
+import { BackgroundJobBoard } from './utils/background-job-fixture';
 import { BackgroundTaskConcurrency } from './utils/background-task-concurrency';
 import { createInternalAgentTextPart } from './utils/internal-initiator';
 import { SessionMetadataStore } from './utils/session-metadata';
@@ -430,6 +439,168 @@ describe('plugin tool registration', () => {
       Date.now = originalNow;
       await rm(configDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('plugin reload generation cleanup', () => {
+  let originalEnv: typeof process.env;
+  let projectDir: string;
+
+  const createHooks = (pluginConfig: Record<string, unknown> = {}) =>
+    plugin({
+      client: createPluginClient(async () => ({})),
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+      ...pluginConfig,
+    } as never);
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    projectDir = await mkdtemp('/tmp/oh-my-opencode-slim-gens-');
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: projectDir,
+      XDG_DATA_HOME: `${projectDir}/data`,
+      XDG_CACHE_HOME: `${projectDir}/cache`,
+      OPENCODE_LOG_DIR: `${projectDir}/logs`,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({ companion: { enabled: false } }),
+    );
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  test('v1 dispose clears the process-global wake gate progress', async () => {
+    resetOrchestratorWakeGateForTests();
+    try {
+      const hooks = await createHooks();
+
+      // Simulate a generation-one session that already hit the two-wake
+      // no-progress cap. The wake gate is process-global (globalThis +
+      // Symbol.for), so without explicit disposal cleanup a reloaded
+      // generation would inherit the cap and never wake this session.
+      const progress = getWakeProgress('wake-generation-session');
+      progress.unchangedWakeCount = 2;
+      progress.stopped = true;
+      progress.expectingWakeBusy = true;
+
+      await hooks.dispose?.();
+
+      // The fork's wake-gate carries additional process-global progress
+      // fields (fingerprints, external-message IDs, lifecycle flags); dispose
+      // must clear the whole entry back to its fresh defaults.
+      expect(getWakeProgress('wake-generation-session')).toEqual({
+        unchangedWakeCount: 0,
+        lastFingerprint: undefined,
+        stopped: false,
+        expectingWakeBusy: false,
+        observedModel: undefined,
+        fingerprints: new Map(),
+        externalMessageIDs: new Set(),
+        idlePrompted: false,
+        running: false,
+        pendingLegacyIdle: undefined,
+      });
+    } finally {
+      resetOrchestratorWakeGateForTests();
+    }
+  });
+
+  test.each(['provisional', 'promoted', 'preserveRun', 'attributed'])(
+    'stopped recovery listener respects explicit provenance: %s',
+    async (kind) => {
+      const wake = mock(() => {});
+      const createScheduler = wakeHooks.createOrchestratorWakeScheduler;
+      const scheduler = spyOn(
+        wakeHooks,
+        'createOrchestratorWakeScheduler',
+      ).mockImplementation((...args) => ({
+        ...createScheduler(...args),
+        triggerStoppedJobRecovery: wake,
+      }));
+      const subscriptions = spyOn(
+        BackgroundJobCoordinator.prototype,
+        'addTerminalOutcomeListener',
+      );
+      let hooks: Awaited<ReturnType<typeof plugin>> | undefined;
+      try {
+        hooks = await createHooks();
+        const board = new BackgroundJobBoard();
+        const launch = {
+          taskID: 'child-1',
+          parentSessionID: 'parent-1',
+          agent: 'unknown',
+          description: 'unattributed unknown task',
+          now: 100,
+        };
+        const initial = board.registerLaunch({
+          ...launch,
+          ...(kind === 'attributed' ? {} : { provisional: true as const }),
+        });
+        if (kind === 'attributed')
+          expect(initial).not.toHaveProperty('provisional');
+        if (kind === 'promoted' || kind === 'preserveRun')
+          board.registerLaunch({
+            ...launch,
+            preserveRun: kind === 'preserveRun',
+          });
+        const stopped = board.markStopped(launch.taskID, 'no outcome', 200);
+        if (!stopped) throw new Error('missing stopped record');
+        expect(stopped).toMatchObject({
+          state: 'stopped',
+          terminalUnreconciled: true,
+        });
+        // Invoke the real subscriptions installed by the plugin composition.
+        for (const [listener] of subscriptions.mock.calls) listener(stopped);
+        expect(wake).toHaveBeenCalledTimes(kind === 'provisional' ? 0 : 1);
+        if (kind !== 'provisional') {
+          expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
+          expect(board.formatForPrompt('parent-1')).toContain(launch.taskID);
+        }
+      } finally {
+        await hooks?.dispose?.();
+        scheduler.mockRestore();
+        subscriptions.mockRestore();
+      }
+    },
+  );
+
+  test('v1 dispose releases this generation companion manager', async () => {
+    // Enabled with a custom (missing) binaryPath: registration and state
+    // writes run, but neither the updater nor spawnIfAvailable touches
+    // the network or spawns a child.
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: {
+          enabled: true,
+          binaryPath: `${projectDir}/missing-companion-bin`,
+        },
+      }),
+    );
+    const hooks = await createHooks();
+    const readSessionIds = (): string[] => {
+      const state = JSON.parse(readFileSync(stateFilePath(), 'utf8')) as {
+        sessions: Array<{ session_id: string }>;
+      };
+      return state.sessions.map((s) => s.session_id);
+    };
+
+    // onLoad registered this generation's manager in the state file.
+    expect(readSessionIds()).toContain(`proc_${process.pid}`);
+
+    await hooks.dispose?.();
+
+    // dispose must call companionManager.onExit(): the session entry is
+    // withdrawn even if the next generation fails before its own onLoad.
+    expect(readSessionIds()).not.toContain(`proc_${process.pid}`);
   });
 });
 
@@ -1051,9 +1222,85 @@ describe('plugin TUI agent activity', () => {
       } as never,
     );
 
+    // #1215: a callID-confirmed foreground native terminal return is itself
+    // terminal evidence, so the active session clears immediately.
     const snapshot = readTuiSnapshot(projectDir);
     expect(snapshot.activeSessions['child-fg-1']).toBeUndefined();
     expect(snapshot.sessionDetails['child-fg-1']).toBeUndefined();
+  });
+
+  test('unattributed terminal output defers until idle evidence clears it', async () => {
+    await hooks?.['chat.message']?.(
+      { sessionID: 'parent-4', agent: 'orchestrator' } as never,
+      {} as never,
+    );
+    // The pending call is registered under a different callID than the
+    // returning output, so attribution is text-parsed, never
+    // callID-confirmed: the #1215 fast path must not fire. The child's
+    // session.created early-registers the pending for this task ID, so
+    // the mismatched return still resolves identity — unconfirmed.
+    await hooks?.['tool.execute.before']?.(
+      { tool: 'task', sessionID: 'parent-4', callID: 'call-fg-2a' } as never,
+      {
+        args: {
+          background: false,
+          subagent_type: 'oracle',
+          description: 'foreground child',
+        },
+      } as never,
+    );
+    await hooks?.event?.({
+      event: {
+        type: 'session.created',
+        properties: {
+          info: { id: 'child-fg-2', parentID: 'parent-4', agent: 'oracle' },
+        },
+      },
+    } as never);
+    await hooks?.['chat.message']?.(
+      { sessionID: 'child-fg-2', agent: 'oracle' } as never,
+      {} as never,
+    );
+    await busy('child-fg-2');
+
+    expect(readTuiSnapshot(projectDir).activeSessions['child-fg-2']).toBe(
+      'oracle',
+    );
+
+    await hooks?.['tool.execute.after']?.(
+      { tool: 'task', sessionID: 'parent-4', callID: 'call-fg-2b' } as never,
+      {
+        output: [
+          'task_id: child-fg-2',
+          'state: completed',
+          '',
+          '<task_result>',
+          'Analysis finished.',
+          '</task_result>',
+        ].join('\n'),
+      } as never,
+    );
+
+    // Unconfirmed attribution keeps the full runtime discipline: the
+    // terminal text alone must not clear the active session yet.
+    expect(readTuiSnapshot(projectDir).activeSessions['child-fg-2']).toBe(
+      'oracle',
+    );
+
+    // Idle runtime evidence is what publishes the terminal state.
+    await hooks?.event?.({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'child-fg-2', status: { type: 'idle' } },
+      },
+    } as never);
+    for (let i = 0; i < 3; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const snapshot = readTuiSnapshot(projectDir);
+    expect(snapshot.activeSessions['child-fg-2']).toBeUndefined();
+    expect(snapshot.sessionDetails['child-fg-2']).toBeUndefined();
   });
 
   test('string status idle clears active sessions', async () => {
@@ -1821,6 +2068,84 @@ describe('persistent cooldown plugin hooks', () => {
     await hooks.dispose?.();
   });
 
+  test('layered extends preset with inheritModelFrom is not overwritten by cooldown pass', async () => {
+    // a/primary is marked dead in beforeEach.
+    // Base preset configures a fallback chain for fixer: ['a/primary', 'b/fallback'].
+    // Derived preset extends base, but fixer inherits from orchestrator.
+    // Switching to the derived preset must resolve fixer to orchestrator model,
+    // not leave the cooldown-selected b/fallback in place.
+    await writeFile(
+      `${configDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        autoUpdate: false,
+        preset: 'base',
+        presets: {
+          base: {
+            orchestrator: { model: 'orch/model' },
+            fixer: {
+              model: [
+                { id: 'a/primary', variant: 'low' },
+                { id: 'b/fallback', variant: 'high' },
+              ],
+            },
+          },
+          derived: {
+            extends: 'base',
+            fixer: {
+              inheritModelFrom: 'orchestrator',
+            },
+          },
+        },
+      }),
+    );
+    const hooks = await createHooks();
+    const host: Record<string, unknown> = { agent: {} };
+    await hooks.config?.(host);
+    expect((host.agent as Record<string, any>).fixer?.model).toBe('b/fallback');
+
+    // Switch to derived preset at runtime and re-run config hook on the same mutated host config
+    RuntimeConfig.get(configDir).setRuntimePreset('derived');
+    await hooks.config?.(host);
+    expect((host.agent as Record<string, any>).fixer?.model).toBe('orch/model');
+
+    await hooks.dispose?.();
+
+    // Fresh startup directly on derived preset (which extends base)
+    // must also resolve fixer to orchestrator model, not cooldown fallback
+    await writeFile(
+      `${configDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        autoUpdate: false,
+        preset: 'derived',
+        presets: {
+          base: {
+            orchestrator: { model: 'orch/model' },
+            fixer: {
+              model: [
+                { id: 'a/primary', variant: 'low' },
+                { id: 'b/fallback', variant: 'high' },
+              ],
+            },
+          },
+          derived: {
+            extends: 'base',
+            fixer: {
+              inheritModelFrom: 'orchestrator',
+            },
+          },
+        },
+      }),
+    );
+    RuntimeConfig.reset(configDir);
+    const hooksDerived = await createHooks();
+    const hostDirect: Record<string, unknown> = { agent: {} };
+    await hooksDerived.config?.(hostDirect);
+    expect((hostDirect.agent as Record<string, any>).fixer?.model).toBe(
+      'orch/model',
+    );
+    await hooksDerived.dispose?.();
+  });
+
   test('chat.message selects fallback model and variant for a delegated child', async () => {
     const hooks = await createHooks();
     const input = {
@@ -2134,6 +2459,32 @@ describe('system.transform orchestrator injection', () => {
         { system } as never,
       );
       expect(system[0]).toContain('<Role>');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('collapses the v2.0.5 identity part spliced at system[1] after the orchestrator prompt', async () => {
+    // OpenCode v2.0.5 core splices a "# Your Model" identity part at
+    // system[1] (packages/core/src/plugin/identity.ts). The transform
+    // must keep appending the orchestrator prompt to system[0] and
+    // collapse deterministically regardless.
+    const hooks = await loadPluginWithOrchestratorSession();
+    try {
+      const system = [
+        'You are an agent powered by OpenCode.\n<env>Working directory: /tmp</env>',
+        '# Your Model\n- Name: GLM\n- Provider ID: zhipuai\n- Model ID: glm-5.3',
+      ];
+      await hooks['experimental.chat.system.transform']?.(
+        { sessionID: 'ses-orc', agent: 'orchestrator' } as never,
+        { system } as never,
+      );
+      expect(system).toHaveLength(1);
+      expect(system[0]).toContain('# Your Model');
+      const identityAt = (system[0] as string).indexOf('# Your Model');
+      const orchestratorAt = (system[0] as string).indexOf('<Role>');
+      expect(orchestratorAt).toBeGreaterThan(-1);
+      expect(identityAt).toBeGreaterThan(orchestratorAt);
     } finally {
       await hooks.dispose?.();
     }

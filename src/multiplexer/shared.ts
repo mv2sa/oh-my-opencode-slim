@@ -252,6 +252,7 @@ export interface SessionReadinessOptions {
     url: URL,
     sessionId: string,
     signal: AbortSignal,
+    headers?: Record<string, string>,
   ) => Promise<boolean>;
   /** Injectable cancellation-safe delay for backoff between attempts. */
   delay?: (milliseconds: number) => Promise<void>;
@@ -271,6 +272,16 @@ export interface SessionReadinessOptions {
    * in-flight probes are aborted through this signal.
    */
   signal?: AbortSignal;
+  /**
+   * Project directory of the child session. Required in shared
+   * `opencode serve` topologies: without it the server routes
+   * `/session/status` to its own process.cwd() and never reports
+   * sessions spawned in other project directories as ready. Sent as the
+   * `x-opencode-directory` header (pre-encoded, the official SDK
+   * contract), so percent-bearing and non-ASCII paths resolve exactly
+   * and older servers simply ignore it.
+   */
+  directory?: string;
 }
 
 const SESSION_READINESS_DEADLINE_MS = 2_000;
@@ -306,6 +317,7 @@ export async function waitForSessionReady(
   const signal = options.signal;
   const deadlineAt = now() + deadlineMs;
   const url = new URL('/session/status', serverUrl);
+  const headers = buildDirectoryHeaders(options.directory ?? '');
 
   const abortedPromise = signal
     ? new Promise<false>((resolve) => {
@@ -335,7 +347,7 @@ export async function waitForSessionReady(
     let ready = false;
     try {
       ready = await Promise.race([
-        check(url, sessionId, controller.signal),
+        check(url, sessionId, controller.signal, headers),
         abortedPromise ?? neverPromise,
         new Promise<boolean>((resolve) =>
           controller.signal.addEventListener('abort', () => resolve(false), {
@@ -365,12 +377,27 @@ export async function waitForSessionReady(
   }
 }
 
-async function defaultSessionReady(
+/**
+ * Headers that route the status request to the child's project directory.
+ * The value is pre-encoded: the server reads it raw and decodes it exactly
+ * once (the same contract the official SDK uses), so percent-bearing and
+ * non-ASCII paths resolve correctly. Unlike the query parameter, headers
+ * are not schema-validated, so older servers ignore them without a 400.
+ */
+export function buildDirectoryHeaders(
+  directory: string,
+): Record<string, string> {
+  if (!directory) return {};
+  return { 'x-opencode-directory': encodeURIComponent(directory) };
+}
+
+export async function defaultSessionReady(
   url: URL,
   sessionId: string,
   signal: AbortSignal,
+  headers?: Record<string, string>,
 ): Promise<boolean> {
-  const response = await fetch(url, { signal });
+  const response = await fetch(url, { signal, headers });
   if (!response.ok) return false;
   const statuses = (await response.json()) as Record<
     string,

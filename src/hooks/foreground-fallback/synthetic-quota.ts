@@ -521,6 +521,7 @@ export function createSyntheticQuotaCoordinator(
         },
       };
 
+      const attemptStartedAt = now();
       const dispatchPromise = (async (): Promise<void> => {
         const response = await (
           sessionClient as { promptAsync: (args: unknown) => Promise<unknown> }
@@ -621,6 +622,7 @@ export function createSyntheticQuotaCoordinator(
               description:
                 job.description ?? input.pendingLabel ?? input.taskID,
               baselineMessageID: failedMessageID,
+              attemptStartedAt,
             });
           } else {
             // Invalidation occurred while transport was running:

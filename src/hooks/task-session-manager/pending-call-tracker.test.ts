@@ -445,4 +445,44 @@ describe('adoptEarlyRegistrations', () => {
     // A resolved pending keeps its verified label.
     expect(newBoard.get('ses_clean')?.description).toBe('Clean label');
   });
+
+  test('adoption over an existing placeholder promotes it', () => {
+    const oldBoard = new BackgroundJobBoard();
+    const newBoard = new BackgroundJobBoard();
+    oldBoard.registerLaunch({
+      taskID: 'ses_adopt',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      description: 'L1',
+      now: 100,
+    });
+    const placeholder = newBoard.registerLaunch({
+      taskID: 'ses_adopt',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      provisional: true,
+      now: 100,
+    });
+
+    const tracker = createPendingCallTracker();
+    tracker.add(
+      pending({
+        callId: 'a',
+        label: 'L1',
+        earlyRegisteredTaskID: 'ses_adopt',
+        earlyRegistration: {
+          taskID: 'ses_adopt',
+          generation: oldBoard.get('ses_adopt')?.generation ?? 1,
+          backgroundJobBoard: oldBoard,
+        },
+      }),
+    );
+
+    tracker.adoptEarlyRegistrations(newBoard);
+
+    // The destination record is attributed work from the source board, so
+    // the colliding placeholder is promoted without disturbing its state.
+    expect(newBoard.get('ses_adopt')?.provisional).toBe(false);
+    expect(newBoard.get('ses_adopt')?.state).toBe(placeholder.state);
+  });
 });

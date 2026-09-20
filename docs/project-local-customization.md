@@ -19,6 +19,7 @@ This document describes how to configure and customize oh-my-opencode-slim on a 
 | **Built-in prompt overrides** | `.opencode/oh-my-opencode-slim/<agent>.md` | Override the built-in system prompt for any agent (e.g. `oracle.md`, `explorer.md`, `orchestrator.md`, or custom agents). Acts as the default when no inline `prompt` is set in config. |
 | **Append prompts** | `.opencode/oh-my-opencode-slim/<agent>_append.md` | Append additional rules or guidelines to the existing base (inline, file, or default built-in) prompt without overriding it completely. |
 | **Per-agent skills** | `agents.<agent>.skills` | Explicitly restrict or authorize specific local codebase skills/scripts that this agent is allowed to execute. |
+| **Automatic project-local skills** | `agents.<agent>.skills_include_local` | Add all valid skills discovered under this project's `.opencode/skills/**/SKILL.md` tree without listing every skill name. |
 | **Per-agent MCPs** | `agents.<agent>.mcps` | Assign, restrict, or authorize specific Model Context Protocol (MCP) servers (like `context7` or `gh_grep`) to specific agents. |
 | **Presets** | `presets` configuration block | Bundle named agent environments. User and project preset definitions deep-merge; the active preset then merges into `agents`. |
 | **Precedence** | User config, project config, presets, prompt files | Project-local settings take precedence over user-global settings, while root `agents.*` entries beat active preset entries. |
@@ -79,6 +80,45 @@ Effective result: `codemap`, `deepwork`, `project-architecture`, `project-testin
 Resolution order is deterministic: resolve the inherited/configured `skills` list, then apply `skills_add`, then apply `skills_remove`. Duplicates are removed (first occurrence wins), and `skills_remove` wins over `skills_add` for the same skill. When the effective list contains `"*"`, removals are expressed with the existing `!name` exclusion syntax (e.g. effective `["*", "!codemap"]`). The directives are folded into `skills` during agent resolution — after all layers (user config, project config, presets, runtime `/preset` switching) have determined the effective `skills` value — and stripped from the final agent configuration, so agent definitions and hooks only ever see a plain `skills` list. On an agent without a `skills` list, directives resolve against that agent's default grants, so `skills_add` keeps the defaults and appends.
 
 See [Skills Assignment](skills.md#adding-or-removing-skills-on-top-of-an-inherited-list) for the full rule set, including behavior when no `skills` list is configured.
+
+### Including all project-local skills automatically
+
+When a repository carries several custom OpenCode skills under `.opencode/skills`, set `skills_include_local: true` instead of repeating every local skill name in `skills_add`:
+
+```text
+.opencode/skills/
+├── project-architecture/SKILL.md  # name: project-architecture
+├── project-testing/SKILL.md       # name: project-testing
+└── project-release/SKILL.md       # name: project-release
+```
+
+```jsonc
+// <project>/.opencode/oh-my-opencode-slim.jsonc
+{
+  "agents": {
+    "oracle": {
+      "skills_include_local": true
+    }
+  }
+}
+```
+
+The flag behaves like automatically adding every valid skill discovered under the current project's `.opencode/skills/**/SKILL.md` tree. Skill identity comes from the `name` frontmatter field, not the directory name. If another local `SKILL.md` is added later, it is picked up without another config edit.
+
+It composes with the existing directives. For example, include all project-local skills but exclude one from `fixer`:
+
+```jsonc
+{
+  "agents": {
+    "fixer": {
+      "skills_include_local": true,
+      "skills_remove": ["project-release"]
+    }
+  }
+}
+```
+
+`skills_remove` still wins over automatically included local skills. Global skills, compatibility directories, configured external paths, and URL skill sources are intentionally outside this flag's scope.
 
 ---
 

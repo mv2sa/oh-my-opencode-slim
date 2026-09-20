@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { BackgroundJobBoard as ProductionBackgroundJobBoard } from '../../utils/background-job-board';
 import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import {
@@ -6,6 +6,7 @@ import {
   createBackgroundJobTerminalGate,
 } from '../../utils/background-job-terminal-gate';
 import { SLIM_INTERNAL_INITIATOR_MARKER } from '../../utils/internal-initiator';
+import * as opencodeClient from '../../utils/opencode-client';
 import type { ForegroundFallbackManager } from '../foreground-fallback';
 import { createSyntheticQuotaCoordinator } from '../foreground-fallback/synthetic-quota';
 import { createRevivedRunTracker } from './revived-run-tracker';
@@ -17,8 +18,14 @@ function createHarness(
   prompt = mock(async () => ({})),
   assertBound = false,
   options: {
+    maxNotificationRetries?: number;
     stabilizationProbeDelayMs?: number;
     handoffExpiryMs?: number;
+    onOwnershipReleased?: (
+      parentSessionID: string,
+      taskID: string,
+      generation: number,
+    ) => void;
     resolveSelection?: (sessionID: string) => Promise<{
       agent?: string;
       model?: { providerID: string; modelID: string };
@@ -27,6 +34,10 @@ function createHarness(
     }>;
   } = {},
 ) {
+  // Other suites install process-global getClient mocks; restore in afterEach.
+  spyOn(opencodeClient, 'getClient').mockImplementation(
+    (input) => input.client,
+  );
   const board = new BackgroundJobBoard();
   board.registerLaunch({
     taskID: 'ses_child',
@@ -85,6 +96,8 @@ function createHarness(
       tracker.baselineFor(taskID, generation),
     observationRevisionFor: (taskID, generation) =>
       tracker.revisionFor(taskID, generation),
+    attemptStartedAtFor: (taskID, generation) =>
+      tracker.attemptStartedAtFor(taskID, generation),
     isObservationPending: (taskID, generation) =>
       tracker.isObservationPending(taskID, generation),
     graceMs: options.stabilizationProbeDelayMs ?? 150,
@@ -169,6 +182,7 @@ afterEach(() => {
   for (const gate of gates.splice(0)) gate.dispose();
   globalThis.setTimeout = realSetTimeout;
   globalThis.clearTimeout = realClearTimeout;
+  mock.restore();
 });
 
 describe('revived run tracker', () => {
@@ -224,6 +238,78 @@ describe('revived run tracker', () => {
       (harness.prompt.mock.calls[0]?.[0] as { delivery?: string } | undefined)
         ?.delivery,
     ).toBe('queue');
+  });
+
+  // ── v2-sim pin: queue delivery + exactly-once across the double-idle ──
+  //
+  // On a v2 host the event adapter synthesizes BOTH a `session.status`
+  // idle and a `session.idle` for one terminal execution event (the
+  // documented double-idle invariant), so the terminal observation is
+  // redelivered to every publication listener and the tracker's probe
+  // can be re-driven. The parent notification must still be delivered
+  // EXACTLY ONCE, via promptAsync with `delivery: 'queue'` (v1
+  // prompt_async parity — 'steer' would hijack an in-flight parent,
+  // #1192) and `modelSelection: 'inherit'` (lifecycle continuation,
+  // #1079): the exact argument pair the v2 client shim translates.
+  test('v2-sim: double-delivered terminal observation notifies the parent exactly once with queue delivery', async () => {
+    let probe = false;
+    const harness = createHarness(
+      completedTranscript(() => probe),
+      undefined,
+      false,
+    );
+    const baseline = await harness.tracker.captureBaseline('ses_child');
+    harness.tracker.register({
+      taskID: harness.run.taskID,
+      generation: harness.run.generation,
+      parentSessionID: 'parent',
+      baselineMessageID: baseline,
+      description: 'inspect the change',
+    });
+    probe = true;
+    await harness.tracker.probe(harness.run.taskID, harness.run.generation);
+    await flushNotify();
+
+    // The second half of the double-idle pair: the coordinator's
+    // terminal-outcome listener redelivers the SAME publication, and a
+    // re-driven probe reconciles to the already-terminal record.
+    const published = harness.board.get('ses_child');
+    if (!published) throw new Error('missing publication');
+    harness.tracker.onTerminal(published);
+    await harness.tracker.probe(harness.run.taskID, harness.run.generation);
+    await flushNotify();
+
+    expect(harness.prompt).toHaveBeenCalledTimes(1);
+    expect(harness.prompt.mock.calls[0]?.[0]).toMatchObject({
+      path: { id: 'parent' },
+      delivery: 'queue',
+      modelSelection: 'inherit',
+    });
+    const body = (
+      harness.prompt.mock.calls[0]?.[0] as
+        | {
+            body?: {
+              agent?: string;
+              parts?: Array<{
+                text?: string;
+                metadata?: Record<string, unknown>;
+              }>;
+            };
+          }
+        | undefined
+    )?.body;
+    expect(body?.agent).toBe('orchestrator');
+    expect(body?.parts?.[0]?.text).toContain('<task ');
+    expect(body?.parts?.[0]?.text).toContain('state="completed"');
+    expect(body?.parts?.[0]?.text).toContain(SLIM_INTERNAL_INITIATOR_MARKER);
+    expect(
+      body?.parts?.[0]?.metadata?.['oh-my-opencode-slim.internalInitiator'],
+    ).toBe(true);
+    // The board stays settled after the redelivery — no second terminal.
+    expect(harness.board.get('ses_child')).toMatchObject({
+      state: 'completed',
+      resultSummary: 'new result',
+    });
   });
 
   test('notifies the parent in its current selection instead of hardcoded orchestrator', async () => {
@@ -725,19 +811,9 @@ describe('revived run tracker', () => {
     return { timers, cleared, settle, fire, soleSurviving };
   }
 
-  test('late transport success after timeout marks sent and cancels the retry', async () => {
-    const clock = installCapturedTimers();
-    let resolvePrompt: ((value: unknown) => void) | undefined;
-    const prompt = mock(
-      () =>
-        new Promise((resolve) => {
-          resolvePrompt = resolve;
-        }),
-    );
-    const harness = createHarness(() => ({ data: [] }), prompt);
+  function publish(harness: ReturnType<typeof createHarness>) {
     harness.tracker.register({
-      taskID: harness.run.taskID,
-      generation: harness.run.generation,
+      ...harness.run,
       parentSessionID: 'parent',
       description: 'inspect the change',
     });
@@ -749,165 +825,410 @@ describe('revived run tracker', () => {
     });
     if (!terminal) throw new Error('missing terminal record');
     harness.tracker.onTerminal(terminal);
-    await clock.settle();
-    expect(harness.prompt).toHaveBeenCalledTimes(1);
+    return terminal;
+  }
 
-    // Local 10s transport timeout fires while promptAsync is still pending.
-    clock.fire(10_000);
-    await clock.settle();
-    const retryTimer = clock.soleSurviving(0);
-    expect(retryTimer).toBeDefined();
-
-    // The original transport settles successfully AFTER the timeout.
-    resolvePrompt?.({});
-    await clock.settle();
-
-    expect(harness.prompt).toHaveBeenCalledTimes(1);
-    expect([...clock.timers.values()]).not.toContain(retryTimer);
-  });
-
-  test('late transport failure after timeout keeps the retry path', async () => {
-    const clock = installCapturedTimers();
-    let rejectPrompt: ((reason: unknown) => void) | undefined;
-    const prompt = mock(
-      () =>
-        new Promise((_resolve, reject) => {
-          rejectPrompt = reject;
-        }),
+  function expectRelaunchAvailable(harness: ReturnType<typeof createHarness>) {
+    const lease = harness.board.acquireRelaunchLease(
+      harness.run.taskID,
+      harness.run.generation,
     );
-    const harness = createHarness(() => ({ data: [] }), prompt);
-    harness.tracker.register({
-      taskID: harness.run.taskID,
-      generation: harness.run.generation,
-      parentSessionID: 'parent',
-      description: 'inspect the change',
+    expect(lease).toBeDefined();
+    if (lease) harness.board.releaseLease(lease);
+  }
+
+  test.each([0, 1, 3])(
+    'hung transport releases before retries with budget %i',
+    async (maxNotificationRetries) => {
+      const clock = installCapturedTimers();
+      const harness = createHarness(
+        () => ({ data: [] }),
+        mock(() => new Promise(() => {})),
+        false,
+        { maxNotificationRetries },
+      );
+      const terminal = publish(harness);
+      for (
+        let attempt = 1;
+        attempt <= Math.max(1, maxNotificationRetries);
+        attempt++
+      ) {
+        await clock.settle();
+        expect(harness.prompt).toHaveBeenCalledTimes(attempt);
+        expect(
+          harness.board.acquireRelaunchLease(
+            terminal.taskID,
+            terminal.generation,
+          ),
+        ).toBeUndefined();
+        expect(clock.fire(10_000)).toBeDefined();
+        await clock.settle();
+        // Availability must precede retry execution, even if no transport settles.
+        expectRelaunchAvailable(harness);
+        if (attempt < maxNotificationRetries) {
+          expect(clock.fire(0)).toBeDefined();
+        } else {
+          expect(clock.soleSurviving(0)).toBeUndefined();
+        }
+      }
+      expect(harness.board.get(terminal.taskID)).toMatchObject(terminal);
+      harness.tracker.dispose();
+    },
+  );
+
+  function deferred() {
+    let resolve!: (value: unknown) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise((yes, no) => {
+      resolve = yes;
+      reject = no;
     });
-    const terminal = harness.board.updateStatus({
-      taskID: harness.run.taskID,
-      expectedGeneration: harness.run.generation,
-      state: 'completed',
-      resultSummary: 'done',
-    });
-    if (!terminal) throw new Error('missing terminal record');
-    harness.tracker.onTerminal(terminal);
-    await clock.settle();
+    return { promise, resolve, reject };
+  }
 
-    clock.fire(10_000);
-    await clock.settle();
-    expect(clock.soleSurviving(0)).toBeDefined();
-
-    // The original transport fails after the timeout: the retry must stay
-    // armed and deliver the notification on the next attempt.
-    rejectPrompt?.(new Error('host unavailable'));
-    await clock.settle();
-    expect(clock.soleSurviving(0)).toBeDefined();
-
-    clock.fire(0);
-    await clock.settle();
-    expect(harness.prompt).toHaveBeenCalledTimes(2);
-  });
-
-  test('late transport error envelope after timeout is not delivery', async () => {
-    const clock = installCapturedTimers();
-    let resolvePrompt: ((value: unknown) => void) | undefined;
-    const prompt = mock(
-      () =>
-        new Promise((resolve) => {
-          resolvePrompt = resolve;
+  test.each(['success', 'sync throw', 'async rejection', 'error envelope'])(
+    '%s releases the lease; only success accepts the publication',
+    async (outcome) => {
+      const clock = installCapturedTimers();
+      const harness = createHarness(
+        () => ({ data: [] }),
+        mock(() => {
+          if (outcome === 'sync throw') throw new Error('host unavailable');
+          if (outcome === 'async rejection')
+            return Promise.reject(new Error('host unavailable'));
+          return Promise.resolve(
+            outcome === 'success' ? {} : { error: 'host rejected' },
+          );
         }),
-    );
-    const harness = createHarness(() => ({ data: [] }), prompt);
-    harness.tracker.register({
-      taskID: harness.run.taskID,
-      generation: harness.run.generation,
-      parentSessionID: 'parent',
-      description: 'inspect the change',
-    });
-    const terminal = harness.board.updateStatus({
-      taskID: harness.run.taskID,
-      expectedGeneration: harness.run.generation,
-      state: 'completed',
-      resultSummary: 'done',
-    });
-    if (!terminal) throw new Error('missing terminal record');
-    harness.tracker.onTerminal(terminal);
-    await clock.settle();
-    expect(harness.prompt).toHaveBeenCalledTimes(1);
+      );
+      const terminal = publish(harness);
+      await clock.settle();
+      expectRelaunchAvailable(harness);
+      expect(clock.soleSurviving(10_000)).toBeUndefined();
+      expect(Boolean(clock.soleSurviving(0))).toBe(outcome !== 'success');
+      if (outcome === 'success') {
+        harness.tracker.onTerminal(terminal);
+        await clock.settle();
+        expect(harness.prompt).toHaveBeenCalledTimes(1);
+      } else {
+        clock.fire(0);
+        await clock.settle();
+        expect(harness.prompt).toHaveBeenCalledTimes(2);
+      }
+      expect(harness.board.get(terminal.taskID)).toMatchObject(terminal);
+      harness.tracker.dispose();
+    },
+  );
 
-    clock.fire(10_000);
-    await clock.settle();
+  test.each(['before timeout', 'timer first', 'settlement first'])(
+    'acceptance survives the timeout race: %s',
+    async (order) => {
+      const clock = installCapturedTimers();
+      const transport = deferred();
+      const harness = createHarness(
+        () => ({ data: [] }),
+        mock(() => transport.promise),
+      );
+      const terminal = publish(harness);
+      await clock.settle();
+      const timeout = clock.soleSurviving(10_000);
+      expect(timeout).toBeDefined();
+      if (order === 'timer first') timeout?.callback();
+      transport.resolve({});
+      if (order === 'settlement first') timeout?.callback();
+      await clock.settle();
+      expectRelaunchAvailable(harness);
+      expect(clock.soleSurviving(0)).toBeUndefined();
+      expect(clock.soleSurviving(10_000)).toBeUndefined();
+      harness.tracker.onTerminal(terminal);
+      await clock.settle();
+      expect(harness.prompt).toHaveBeenCalledTimes(1);
+      harness.tracker.dispose();
+    },
+  );
 
-    // The transport PROMISE resolves, but with a host error envelope —
-    // a resolved SDK call without throwOnError is not a delivered
-    // notification. The retry must stay armed.
-    resolvePrompt?.({ error: { message: 'host rejected' } });
-    await clock.settle();
-    expect(clock.soleSurviving(0)).toBeDefined();
+  test.each(['before retry', 'during selection'])(
+    'late success cancels further sends: %s',
+    async (phase) => {
+      const clock = installCapturedTimers();
+      const transport = deferred();
+      const secondSelection = deferred();
+      let selectionCalls = 0;
+      const harness = createHarness(
+        () => ({ data: [] }),
+        mock(() => transport.promise),
+        false,
+        {
+          resolveSelection: async () => {
+            selectionCalls += 1;
+            if (selectionCalls >= 2) await secondSelection.promise;
+            return { agent: 'plan', provenance: 'host-persisted' };
+          },
+        },
+      );
+      const terminal = publish(harness);
+      await clock.settle();
+      expect(harness.prompt).toHaveBeenCalledTimes(1);
+      clock.fire(10_000);
+      await clock.settle();
+      expectRelaunchAvailable(harness);
+      const retry = clock.soleSurviving(0);
+      expect(retry).toBeDefined();
+      if (phase === 'during selection') {
+        clock.fire(0);
+        await clock.settle();
+        expect(selectionCalls).toBe(2);
+      }
+      transport.resolve({});
+      await clock.settle();
+      secondSelection.resolve(undefined);
+      await clock.settle();
+      expect(clock.soleSurviving(0)).toBeUndefined();
+      // Even an already-queued callback must respect the acceptance latch.
+      retry?.callback();
+      harness.tracker.onTerminal(terminal);
+      await clock.settle();
+      expect(harness.prompt).toHaveBeenCalledTimes(1);
+      expectRelaunchAvailable(harness);
+      harness.tracker.dispose();
+    },
+  );
 
-    clock.fire(0);
-    await clock.settle();
-    expect(harness.prompt).toHaveBeenCalledTimes(2);
-  });
+  test.each(
+    ['rejection', 'error envelope'].flatMap((outcome) =>
+      [1, 3].map((budget) => ({ outcome, budget })),
+    ),
+  )(
+    'late $outcome preserves the retry budget $budget',
+    async ({ outcome, budget }) => {
+      const clock = installCapturedTimers();
+      const transport = deferred();
+      const harness = createHarness(
+        () => ({ data: [] }),
+        mock(() => transport.promise),
+        false,
+        { maxNotificationRetries: budget },
+      );
+      publish(harness);
+      await clock.settle();
+      clock.fire(10_000);
+      await clock.settle();
+      const retry = clock.soleSurviving(0);
+      expect(Boolean(retry)).toBe(budget > 1);
+      if (outcome === 'rejection')
+        transport.reject(new Error('host unavailable'));
+      else transport.resolve({ error: 'host rejected' });
+      await clock.settle();
+      expect(clock.soleSurviving(0)).toBe(retry);
+      expectRelaunchAvailable(harness);
+      for (let attempt = 2; attempt <= budget; attempt++) {
+        expect(clock.fire(0)).toBeDefined();
+        await clock.settle();
+        expect(harness.prompt).toHaveBeenCalledTimes(attempt);
+        expectRelaunchAvailable(harness);
+      }
+      expect(clock.soleSurviving(0)).toBeUndefined();
+      expect(harness.prompt).toHaveBeenCalledTimes(budget);
+      harness.tracker.dispose();
+    },
+  );
 
-  test('late success while a retry waits on selection prevents a second send', async () => {
-    const clock = installCapturedTimers();
-    let resolvePrompt: ((value: unknown) => void) | undefined;
-    const prompt = mock(
-      () =>
-        new Promise((resolve) => {
-          resolvePrompt = resolve;
-        }),
-    );
-    // First selection resolves immediately (attempt 1 sends); the second
-    // call (retry) blocks until released, modeling a slow host read.
-    let selectionCalls = 0;
-    let releaseSecondSelection: (() => void) | undefined;
-    const secondGate = new Promise<void>((resolve) => {
-      releaseSecondSelection = resolve;
-    });
-    const harness = createHarness(() => ({ data: [] }), prompt, false, {
-      resolveSelection: async () => {
-        selectionCalls += 1;
-        if (selectionCalls >= 2) await secondGate;
-        return { agent: 'plan', provenance: 'host-persisted' };
-      },
-    });
-    harness.tracker.register({
-      taskID: harness.run.taskID,
-      generation: harness.run.generation,
-      parentSessionID: 'parent',
-      description: 'inspect the change',
-    });
-    const terminal = harness.board.updateStatus({
-      taskID: harness.run.taskID,
-      expectedGeneration: harness.run.generation,
-      state: 'completed',
-      resultSummary: 'done',
-    });
-    if (!terminal) throw new Error('missing terminal record');
-    harness.tracker.onTerminal(terminal);
-    await clock.settle();
-    expect(harness.prompt).toHaveBeenCalledTimes(1);
+  test.each(['rejection', 'error envelope', 'timeout'])(
+    'A accepts while B is sending; B %s cannot trigger C or lose its lease',
+    async (outcome) => {
+      const clock = installCapturedTimers();
+      const a = deferred();
+      const b = deferred();
+      const prompt = mock(() =>
+        prompt.mock.calls.length === 1 ? a.promise : b.promise,
+      );
+      const harness = createHarness(() => ({ data: [] }), prompt);
+      const terminal = publish(harness);
+      await clock.settle();
+      clock.fire(10_000);
+      await clock.settle();
+      expectRelaunchAvailable(harness);
+      clock.fire(0);
+      await clock.settle();
+      expect(harness.prompt).toHaveBeenCalledTimes(2);
+      a.resolve({});
+      await clock.settle();
+      expect(
+        harness.board.acquireRelaunchLease(
+          terminal.taskID,
+          terminal.generation,
+        ),
+      ).toBeUndefined();
+      if (outcome === 'timeout') clock.fire(10_000);
+      else if (outcome === 'rejection') b.reject(new Error('host unavailable'));
+      else b.resolve({ error: 'host rejected' });
+      await clock.settle();
+      expectRelaunchAvailable(harness);
+      expect(clock.soleSurviving(0)).toBeUndefined();
+      harness.tracker.onTerminal(terminal);
+      await clock.settle();
+      expect(harness.prompt).toHaveBeenCalledTimes(2);
+      expect(harness.board.get(terminal.taskID)).toMatchObject(terminal);
+      harness.tracker.dispose();
+    },
+  );
 
-    // Local timeout: retry armed and fired; the retry passes its entry
-    // guard (sent is still false) and parks on the selection await.
-    clock.fire(10_000);
-    await clock.settle();
-    clock.fire(0);
-    await clock.settle();
-    expect(selectionCalls).toBeGreaterThanOrEqual(2);
+  test.each(
+    [
+      { replacement: 'same generation', timedOut: false },
+      { replacement: 'same generation', timedOut: true },
+      { replacement: 'new generation', timedOut: true },
+      { replacement: 'discardRun', timedOut: false },
+      { replacement: 'discardRun', timedOut: true },
+      { replacement: 'dispose', timedOut: false },
+      { replacement: 'dispose', timedOut: true },
+    ].flatMap((scenario) =>
+      ['success', 'rejection', 'error envelope'].map((outcome) => ({
+        ...scenario,
+        outcome,
+      })),
+    ),
+  )(
+    'stale $outcome after $replacement (timeout=$timedOut) cannot alter its successor',
+    async ({ replacement, timedOut, outcome }) => {
+      const clock = installCapturedTimers();
+      const a = deferred();
+      const b = deferred();
+      const prompt = mock(() =>
+        prompt.mock.calls.length === 1 ? a.promise : b.promise,
+      );
+      const harness = createHarness(() => ({ data: [] }), prompt);
+      const terminal = publish(harness);
+      await clock.settle();
+      if (timedOut) {
+        clock.fire(10_000);
+        await clock.settle();
+      }
+      const oldRetry = clock.soleSurviving(0);
+      const hasSuccessor = replacement.includes('generation');
+      let current = terminal;
+      if (replacement === 'new generation') {
+        const lease = harness.board.acquireRelaunchLease(
+          terminal.taskID,
+          terminal.generation,
+        );
+        if (!lease) throw new Error('missing relaunch lease');
+        harness.board.registerLaunch({ ...harness.run, relaunchLease: lease });
+        harness.board.releaseLease(lease);
+        const next = harness.board.updateStatus({
+          taskID: terminal.taskID,
+          state: 'completed',
+          resultSummary: 'new generation',
+        });
+        if (!next) throw new Error('missing new-generation terminal record');
+        current = next;
+      }
+      if (hasSuccessor) {
+        harness.tracker.register({ ...current, description: 'successor' });
+        harness.tracker.onTerminal(current);
+      } else if (replacement === 'discardRun') {
+        harness.board.markRunningFromLiveSession(
+          terminal.taskID,
+          terminal.updatedAt + 1,
+          terminal.generation,
+          terminal.terminalRevision,
+        );
+        expect(
+          harness.tracker.prepareObservation({
+            ...harness.run,
+            description: 'replacement observation',
+          }),
+        ).toBe(true);
+        harness.tracker.rejectObservation(terminal.taskID, terminal.generation);
+      } else {
+        harness.tracker.dispose();
+      }
+      await clock.settle();
+      if (outcome === 'success') a.resolve({});
+      else if (outcome === 'rejection') a.reject(new Error('old failure'));
+      else a.resolve({ error: 'old failure' });
+      await clock.settle();
+      if (hasSuccessor) {
+        if (!timedOut) {
+          expect(clock.fire(0)).toBeDefined();
+          await clock.settle();
+        }
+        expect(harness.prompt).toHaveBeenCalledTimes(2);
+        expect(
+          harness.board.acquireRelaunchLease(
+            current.taskID,
+            current.generation,
+          ),
+        ).toBeUndefined();
+        b.reject(new Error('successor not accepted'));
+        await clock.settle();
+        const newRetry = clock.soleSurviving(0);
+        expect(newRetry).toBeDefined();
+        oldRetry?.callback();
+        await clock.settle();
+        expect(clock.soleSurviving(0)).toBe(newRetry);
+        clock.fire(0);
+        await clock.settle();
+        expect(harness.prompt).toHaveBeenCalledTimes(3);
+        expect(harness.board.get(current.taskID)).toMatchObject(current);
+      } else {
+        oldRetry?.callback();
+        await clock.settle();
+        expect(clock.soleSurviving(0)).toBeUndefined();
+        expect(harness.prompt).toHaveBeenCalledTimes(1);
+        expectRelaunchAvailable(harness);
+      }
+      harness.tracker.dispose();
+    },
+  );
 
-    // The ORIGINAL transport settles successfully after everything: the
-    // notification is delivered, sent is marked, and the parked retry
-    // must not acquire the lease or send again.
-    resolvePrompt?.({});
-    await clock.settle();
-    releaseSecondSelection?.();
-    await clock.settle();
-    await clock.settle();
-
-    expect(harness.prompt).toHaveBeenCalledTimes(1);
-  });
+  test.each([
+    'withdraw publication',
+    'replace run',
+    'dispose',
+    'release lease',
+  ])(
+    'invalidating between acquisition and the deferred send prevents promptAsync: %s',
+    async (invalidation) => {
+      const clock = installCapturedTimers();
+      const harness = createHarness(() => ({ data: [] }));
+      const acquire = harness.board.acquireTerminalNotificationLease.bind(
+        harness.board,
+      );
+      let acquired = false;
+      let invalidated = false;
+      harness.board.acquireTerminalNotificationLease = (...args) => {
+        const lease = acquire(...args);
+        acquired = lease !== undefined && harness.board.validateLease(lease);
+        queueMicrotask(() => {
+          if (invalidation === 'withdraw publication')
+            harness.board.markRunningFromLiveSession(
+              harness.run.taskID,
+              Date.now(),
+              harness.run.generation,
+              lease?.terminalRevision,
+            );
+          else if (invalidation === 'replace run')
+            harness.tracker.register({
+              ...harness.run,
+              description: 'successor',
+            });
+          else if (invalidation === 'dispose') harness.tracker.dispose();
+          else if (lease) harness.board.releaseLease(lease);
+          invalidated = true;
+        });
+        return lease;
+      };
+      publish(harness);
+      await clock.settle();
+      expect(acquired).toBe(true);
+      expect(invalidated).toBe(true);
+      expect(harness.prompt).not.toHaveBeenCalled();
+      expectRelaunchAvailable(harness);
+      expect(clock.soleSurviving(10_000)).toBeUndefined();
+      harness.tracker.dispose();
+    },
+  );
 
   test('a pending probe replaced by another same-generation registration does not terminalize', async () => {
     let resolveMessages: ((value: unknown) => void) | undefined;
@@ -978,7 +1299,13 @@ describe('revived run tracker', () => {
     ).toBe(true);
     expect(harness.tracker.isObservationPending('ses_child', gen)).toBe(true);
 
+    const attemptStart = harness.tracker.attemptStartedAtFor('ses_child', gen);
+    expect(typeof attemptStart).toBe('number');
+    await new Promise((resolve) => setTimeout(resolve, 2));
     expect(harness.tracker.admitObservation('ses_child', gen)).toBe(true);
+    expect(harness.tracker.attemptStartedAtFor('ses_child', gen)).toBe(
+      attemptStart,
+    );
     expect(harness.tracker.isTracked('ses_child', gen)).toBe(true);
     expect(harness.tracker.isObservationPending('ses_child', gen)).toBe(false);
 
@@ -1034,7 +1361,12 @@ describe('revived run tracker', () => {
     // First expiry promotes; the unresolved-admission bound is a second
     // window of the same length. Assert the fenced promoted state in
     // between, then admit before that bound lifts.
+    const attemptStart = harness.tracker.attemptStartedAtFor('ses_child', gen);
     await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(harness.tracker.attemptStartedAtFor('ses_child', gen)).toBe(
+      attemptStart,
+    );
+    const revision = harness.tracker.revisionFor('ses_child', gen);
     expect(harness.tracker.isTracked('ses_child', gen)).toBe(true);
     expect(harness.tracker.isObservationPending('ses_child', gen)).toBe(true);
     expect(harness.board.get('ses_child')?.state).toBe('running');
@@ -1042,6 +1374,10 @@ describe('revived run tracker', () => {
     // The late acceptance resolves it and fires the delivering probe.
     resultReady = true;
     expect(harness.tracker.admitObservation('ses_child', gen)).toBe(true);
+    expect(harness.tracker.attemptStartedAtFor('ses_child', gen)).toBe(
+      attemptStart,
+    );
+    expect(harness.tracker.revisionFor('ses_child', gen)).toBe(revision);
     expect(harness.tracker.isObservationPending('ses_child', gen)).toBe(false);
     await flushNotify();
     expect(harness.board.get('ses_child')?.state).toBe('completed');
@@ -1146,6 +1482,171 @@ describe('revived run tracker', () => {
     // Stale generations never resolve a revision.
     expect(harness.tracker.revisionFor('ses_child', gen + 1)).toBeUndefined();
   });
+
+  // ── willNotifyParent: publication-wake suppression predicate ──
+  //
+  // The terminal-publication wake listener (src/index.ts) consults this
+  // predicate to skip the wake when the tracker owns delivery for the
+  // exact (taskID, generation): a revived run's completion must produce
+  // ONE queued admission (the tracker's notifyParent), never two.
+  describe('willNotifyParent', () => {
+    test('claims delivery for a tracked run before, during, and after its notification', async () => {
+      let resultReady = false;
+      const harness = createHarness(completedTranscript(() => resultReady));
+      const gen = harness.run.generation;
+
+      // Untracked / stale: the wake is the deliverer.
+      expect(harness.tracker.willNotifyParent('ses_child', gen)).toBe(false);
+      expect(harness.tracker.willNotifyParent('unknown', gen)).toBe(false);
+
+      harness.tracker.register({
+        taskID: 'ses_child',
+        generation: gen,
+        parentSessionID: 'parent',
+        baselineMessageID: 'baseline',
+        description: 'inspect the change',
+      });
+      expect(harness.tracker.willNotifyParent('ses_child', gen)).toBe(true);
+      expect(harness.tracker.willNotifyParent('ses_child', gen + 1)).toBe(
+        false,
+      );
+
+      resultReady = true;
+      await harness.tracker.probe('ses_child', gen);
+      await flushNotify();
+      expect(harness.prompt).toHaveBeenCalledTimes(1);
+      // Delivered (sent): the tracker still owns this run's delivery —
+      // a wake beside it would double-notify.
+      expect(harness.tracker.willNotifyParent('ses_child', gen)).toBe(true);
+    });
+
+    test('releases ownership once the retry budget is exhausted', async () => {
+      const harness = createHarness(
+        () => ({ data: [] }),
+        mock(async () => {
+          throw new Error('parent unavailable');
+        }),
+        false,
+        { maxNotificationRetries: 1 },
+      );
+      publish(harness);
+      await flushNotify();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      // Attempt 1 of 1 failed; no retry is scheduled, so the tracker
+      // will never deliver — the publication wake is the legitimate
+      // degraded fallback and must not be suppressed.
+      expect(harness.prompt).toHaveBeenCalledTimes(1);
+      expect(
+        harness.tracker.willNotifyParent(
+          harness.run.taskID,
+          harness.run.generation,
+        ),
+      ).toBe(false);
+
+      // Contrast: with budget remaining (a retry scheduled), the
+      // tracker still owns delivery.
+      const retrying = createHarness(
+        () => ({ data: [] }),
+        mock(async () => {
+          throw new Error('parent unavailable');
+        }),
+      );
+      publish(retrying);
+      await flushNotify();
+      expect(retrying.prompt).toHaveBeenCalledTimes(1);
+      expect(
+        retrying.tracker.willNotifyParent(
+          retrying.run.taskID,
+          retrying.run.generation,
+        ),
+      ).toBe(true);
+      retrying.tracker.dispose();
+    });
+  });
+
+  describe('onOwnershipReleased', () => {
+    test('fires exactly once with the run ids when every retry fails', async () => {
+      const released: Array<{
+        parentSessionID: string;
+        taskID: string;
+        generation: number;
+      }> = [];
+      const harness = createHarness(
+        () => ({ data: [] }),
+        mock(async () => {
+          throw new Error('parent unavailable');
+        }),
+        false,
+        {
+          maxNotificationRetries: 2,
+          onOwnershipReleased: (parentSessionID, taskID, generation) => {
+            released.push({ parentSessionID, taskID, generation });
+          },
+        },
+      );
+      const terminal = publish(harness);
+      await flushNotify();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Attempt 1 failed, one retry fired and failed: the budget is
+      // spent with nothing sent and no timer armed — the organic
+      // give-up point.
+      expect(harness.prompt).toHaveBeenCalledTimes(2);
+      expect(released).toEqual([
+        {
+          parentSessionID: 'parent',
+          taskID: harness.run.taskID,
+          generation: harness.run.generation,
+        },
+      ]);
+
+      // A duplicate terminal observation of the SAME revision must NOT
+      // make a third transport attempt: the released lifecycle passed
+      // delivery ownership to the fallback publication wake, so a fresh
+      // attempt here could queue a second prompt beside it (two parent
+      // turns for one result). The release stays exactly-once and the
+      // tracker stays silent.
+      harness.tracker.onTerminal(terminal);
+      await flushNotify();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(harness.prompt).toHaveBeenCalledTimes(2);
+      expect(released).toHaveLength(1);
+
+      // Plain dispose never fires the release either.
+      harness.tracker.dispose();
+      expect(released).toHaveLength(1);
+    });
+
+    test('never fires on successful delivery', async () => {
+      const released: string[] = [];
+      let resultReady = false;
+      const harness = createHarness(
+        completedTranscript(() => resultReady),
+        mock(async () => ({})),
+        false,
+        {
+          onOwnershipReleased: (parentSessionID) =>
+            released.push(parentSessionID),
+        },
+      );
+      harness.tracker.register({
+        taskID: harness.run.taskID,
+        generation: harness.run.generation,
+        parentSessionID: 'parent',
+        baselineMessageID: 'baseline',
+        description: 'inspect the change',
+      });
+      resultReady = true;
+      await harness.tracker.probe(harness.run.taskID, harness.run.generation);
+      await flushNotify();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(harness.prompt).toHaveBeenCalledTimes(1);
+      expect(released).toEqual([]);
+      harness.tracker.dispose();
+    });
+  });
 });
 
 describe('gate evidence hook (synthetic quota)', () => {
@@ -1222,6 +1723,8 @@ describe('gate evidence hook (synthetic quota)', () => {
       readTerminalEvidence: async () => quotaTranscript(),
       baselineFor: (taskID, generation) =>
         tracker?.baselineFor(taskID, generation),
+      attemptStartedAtFor: (taskID, generation) =>
+        tracker?.attemptStartedAtFor(taskID, generation),
       observationRevisionFor: (taskID, generation) =>
         tracker?.revisionFor(taskID, generation),
       isObservationPending: (taskID, generation) =>
@@ -1429,5 +1932,31 @@ describe('gate evidence hook (synthetic quota)', () => {
     expect(h.board.get('ses_child')?.state).not.toBe('completed');
     expect(h.board.get('ses_child')?.resultSummary).toContain('quarantined');
     expect(continuationCalls(h.promptAsync)).toHaveLength(1);
+  });
+
+  test('continuation attemptStartedAt is captured before dispatch, attributing outcomes that arrive before registration', async () => {
+    let currentTime = 1_000;
+    const h = createGateHarness(continuationManager(), {
+      now: () => currentTime,
+    });
+
+    // Advance time during the promptAsync dispatch to simulate delay between
+    // dispatch and settlement/registration
+    h.promptAsync.mockImplementation(async (args) => {
+      const id = (args as { path?: { id?: string } })?.path?.id;
+      if (id === 'ses_child') {
+        currentTime = 1_100; // time moves forward while dispatch is in flight
+      }
+      return {};
+    });
+
+    await h.gate.reconcile(h.run);
+    await flushNotify();
+
+    // attemptStartedAt must be the pre-dispatch timestamp (1000), not the
+    // post-dispatch settlement timestamp (1100).
+    expect(h.tracker.attemptStartedAtFor('ses_child', h.run.generation)).toBe(
+      1_000,
+    );
   });
 });

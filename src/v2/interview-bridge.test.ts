@@ -9,14 +9,14 @@ import {
 
 function createContext(overrides?: {
   synthetic?: (input: Record<string, unknown>) => Promise<unknown>;
-  rename?: (input: Record<string, unknown>) => Promise<unknown>;
+  update?: (input: Record<string, unknown>) => Promise<unknown>;
   prompt?: (input: Record<string, unknown>) => Promise<unknown>;
 }): any {
   return {
     session: {
       hook: mock(async () => ({ dispose() {} })),
       synthetic: overrides?.synthetic,
-      rename: overrides?.rename,
+      update: overrides?.update,
       prompt: overrides?.prompt,
     },
   };
@@ -51,9 +51,9 @@ describe('v2 interview bridge', () => {
   test('registers an add-only marker command and rewrites only the tail', async () => {
     const directory = `.tmp-v2-interview-${Date.now()}`;
     const synthetic = mock(async () => ({}));
-    const rename = mock(async () => ({}));
+    const update = mock(async () => ({}));
     const bridge = createV2InterviewBridge(
-      createContext({ synthetic, rename }),
+      createContext({ synthetic, update }),
       {
         outputFolder: directory,
       } as never,
@@ -103,7 +103,7 @@ describe('v2 interview bridge', () => {
     expect(event.messages[1].content[0].text).toContain('build a notes app');
     expect(event.messages[1].content[0].text).toContain('<interview_state>');
     expect(synthetic).toHaveBeenCalled();
-    expect(rename).toHaveBeenCalledWith({
+    expect(update).toHaveBeenCalledWith({
       sessionID: 'ses_v2',
       title: 'Interview: build a notes app',
     });
@@ -165,7 +165,7 @@ describe('v2 interview bridge', () => {
         prompt: track('prompt'),
         synthetic: track('synthetic'),
         switchAgent: track('switchAgent'),
-        rename: track('rename'),
+        update: track('update'),
       },
     } as never);
 
@@ -189,7 +189,7 @@ describe('v2 interview bridge', () => {
 
     await bridge.runtime.rename('ses_r', 'Interview: x');
     expect(calls).toContainEqual({
-      method: 'rename',
+      method: 'update',
       input: { sessionID: 'ses_r', title: 'Interview: x' },
     });
 

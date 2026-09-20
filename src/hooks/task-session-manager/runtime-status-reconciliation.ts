@@ -44,7 +44,14 @@ export function createRuntimeStatusReconciler(options: {
       return;
     timer = setTimeout(() => {
       timer = undefined;
-      void reconcile();
+      // Background reconciliation is fail-soft: a failure must be logged
+      // and swallowed, never escape as an unhandled rejection.
+      void reconcile().catch((err) => {
+        log(
+          '[runtime-status-reconciliation] background reconcile failed',
+          String(err),
+        );
+      });
     }, delayMs);
     timer.unref?.();
   }

@@ -412,6 +412,12 @@ export function createPendingCallTracker(
         }
 
         let adopted = existing;
+        if (adopted?.provisional) {
+          // The adopted registration is attributed work: promoting the
+          // placeholder it collides with preserves known provenance.
+          adopted =
+            backgroundJobBoard.promoteProvisional(adopted.taskID) ?? adopted;
+        }
         if (!adopted) {
           try {
             adopted = backgroundJobBoard.registerLaunch({

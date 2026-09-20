@@ -69,6 +69,20 @@ Its job is to:
 
 Specialists do the work. The orchestrator manages the work.
 
+### Unattributed sessions and restart scope
+
+A child observed before it can be attributed to a task launch is retained as a
+provisional placeholder. It remains resolvable by task ID or alias for
+`task_status`, but is omitted from the operational Background Job Board listing.
+A stopped placeholder does not trigger a stopped-job recovery wake for its parent:
+it is not yet known to be delegated work. Attribution through the existing task
+launch path promotes it to an ordinary listed task, including recovery wakes.
+This distinction uses explicit provenance, not agent names or description text.
+
+Aliases and reusable-session history are process-local and do not survive process
+restarts as a reusable board. Post-restart recovery is partial and best-effort;
+it does not guarantee restoration of those aliases or the complete history.
+
 ---
 
 ## Execution Loop
@@ -176,6 +190,18 @@ Terminal jobs are reconciled automatically after their result is injected into
 the orchestrator session. That lifecycle state is not proof the output was used;
 the orchestrator must still verify it consumed the relevant result before
 finalizing.
+
+Parent terminal notifications are best-effort, with retries bounded by the
+existing notification policy (a zero retry budget still permits the initial
+send). Each transport wait is limited to 10 seconds. No notification attempt
+retains its lifecycle lease after that local wait ends, even if the host call
+never settles; other lifecycle operations still enforce their own safety checks.
+A timeout does not cancel a notification already queued by the host, so an
+ambiguous outcome can produce duplicate deliveries if a retry also succeeds.
+Acceptance of any attempt for the same current publication suppresses further
+retries, including a late acceptance while another attempt is pending. This
+records host acceptance, not parent consumption or job-board reconciliation;
+it is not an exactly-once delivery guarantee.
 
 To stop self-reinforcing acknowledgment loops, a brand-new `task` spawn is
 refused while the parent still owns an unreconciled terminal job with the same
@@ -406,60 +432,17 @@ Behavior:
 - One in-flight evaluation/wake per session. Status/waits/generation are
   rechecked immediately before `promptAsync`. Cooldown/reservation is recorded
   before the call so a failed `promptAsync` cannot storm retries.
-- Default-on safety: **two automatic prompt attempts per session without
-  meaningful progress**, shared process-globally by periodic TODO, stopped-child,
-  Controller idle, and restart recovery sources. Admission checks the owner and
-  cap and debits before SDK invocation; errors consume attempts and an owner
-  cannot commit twice. Hook recreation/disposal does not refill a live budget.
-- Only distinct genuine external host message IDs (first 256 IDs remembered per
-  session), or changed authoritative component telemetry refill the budget.
-  After 256 IDs, unrecognized IDs fail closed for wake rearming; remembered IDs
-  are never evicted/replayed as new. Ordinary receipt authority is unchanged.
-  Whole-message provenance rejects mixed synthetic/internal/compaction parts,
-  including provider metadata; `output.parts` is authoritative even when empty.
-  Manual messages refill liveness only, never authorize governance automatically.
-- TODO/child and Controller fingerprints are independent. First observation of a
-  component establishes a baseline, not a refill. TODO status/child activity and
-  outcome/generation/contract/goals/checkpoint/action/operation/evidence state
-  count; raw revisions, counters, timestamps, assistant prose or IDs, and
-  read-only status-call churn do not. Busy/idle/retry/error notifications and
-  active parent snapshots never refill by themselves. Child busy/retry normalize
-  to active; absent/idle normalize to idle.
-- Exhaustion stops periodic polling. Each subsequent idle/stopped-child event
-  can perform a bounded telemetry evaluation to detect real progress without
-  sending at the cap. No tight retry poll is started. Missing telemetry cannot
-  establish progress. Budget state remains until session deletion or process
-  exit (not LRU-evicted, because eviction would refill live sessions). At the
-  256-session capacity, new session admission fails closed until deletion frees
-  space. Unknown restart candidates allocate nothing before outcome lookup.
-- Shared idle-transition admission coalesces paired `session.status(idle)` and
-  `session.idle`, even if SDK acknowledgement falls between them. Another prompt
-  needs an observed busy-to-idle transition or genuine progress/user rearm;
-  acknowledgements and duplicate idle notifications alone never open a cycle.
-  Controller idle evaluation that loses to an uncommitted periodic read owner
-  registers one deduplicated release callback, then rechecks eligibility.
-- All Controller notices carry a static internal, non-authorizing label, not
-  external user approval, waiver, evidence, or completion. Dispatch markers
-  remain exact internal capabilities, not external authority; marker/review
-  packet bytes are unchanged. Labels/nudges stay at the volatile payload tail.
-- Recovery transform notices are suppressed after two distinct completed,
-  narration-only assistant turns for an unchanged meaningful Controller cause,
-  when identified by the authoritative host messages API. Duplicate transforms
-  do not count as delivery; tool-bearing turns do not count. Initial notices and
-  valid dispatch-capability notices remain available. Host history scanning skips
-  the newly persisted incomplete assistant and wholly internal wake messages,
-  stopping at external messages or tool-bearing turns. Missing/malformed telemetry
-  does not count as delivery and cannot reopen an already suppressed cause;
-  before suppression it conservatively retains notices. No human intent is inferred from prose such as
-  "Stopped". Suppression never changes governance, mints receipts, aborts/cancels,
-  resolves actions, or finalizes. Explicit user stops/tool prohibitions still
-  apply, including when source-only repairs remain UNCERTIFIED.
-- Restart recovery retains its stricter classifier, two-failure ceiling and
-  one-success-per-process guard for restart prompts only, in addition to the
-  shared budget. Later genuine progress/user rearm can admit Controller idle
-  prompts after restart success. It reserves
-  before awaiting the SDK, not after success. The static wake text does not
-  contain a fingerprint or snapshot.
+- Default-on safety: the scheduler evaluates a bounded host-progress fingerprint
+  (TODO statuses plus child status/update evidence) to decide whether to keep
+  waking. After **two** successful wakes with an unchanged fingerprint, further
+  wakes stop for that continuous idle spell. A real external user message or
+  host-observed progress re-arms the cap. Busy caused by the wake itself does
+  **not** rearm the cap; unrelated busy/error lifecycle events do. The wake
+  prompt text is static and does **not** include a fingerprint or snapshot.
+  The no-progress caps live in a process-global wake gate that the plugin's
+  dispose hook clears on instance teardown, so a recreated plugin generation
+  (for example after `opencode reload` on v2 hosts) starts with fresh caps
+  instead of inheriting the previous generation's.
 - Static wake text (internal initiator part via `promptAsync` only — no message
   transform injection or history rewrite):
 

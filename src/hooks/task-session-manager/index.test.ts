@@ -5,6 +5,7 @@ import {
   describe,
   expect,
   mock,
+  spyOn,
   test,
 } from 'bun:test';
 import { randomUUID } from 'node:crypto';
@@ -13,11 +14,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from '../../config/constants';
 import { SessionLifecycle } from '../../hooks/session-lifecycle';
+import { createTaskReviveTool } from '../../tools/task-revive';
 import {
   BackgroundJobSupervisor,
   BackgroundTaskConcurrency,
   createInternalAgentTextPart,
   getBackgroundJobLifecycleLedger,
+  BackgroundJobBoard as ProductionBoard,
   SLIM_INTERNAL_INITIATOR_MARKER,
 } from '../../utils';
 import { BackgroundJobBoard as ProductionBackgroundJobBoard } from '../../utils/background-job-board';
@@ -165,10 +168,12 @@ type HookOptions = {
   maxRetainedSnapshots?: number;
   backgroundJobBoard?: BackgroundJobBoard;
   terminalGate?: BackgroundJobTerminalGate;
+  hostOutcomeClock?: 'shared-unix-ms';
   sessionStatus?: unknown;
   sessionClient?: Record<string, unknown>;
   idleReconcileDelayMs?: number;
   runtimeStatusReconcileDelayMs?: number;
+  hasUntrackedRunningChild?: (parentSessionID?: string) => Promise<boolean>;
   isFallbackInProgress?: (sessionID: string) => boolean;
   willAttemptFallback?: (sessionID: string) => boolean;
   coordinator?: SessionLifecycle;
@@ -248,6 +253,7 @@ function createHook(options?: HookOptions) {
       readContextMaxFiles: options?.readContextMaxFiles,
       backgroundJobBoard: options?.backgroundJobBoard,
       terminalGate: options?.terminalGate,
+      hostOutcomeClock: options?.hostOutcomeClock,
       backgroundJobSupervisor: options?.backgroundJobSupervisor,
       backgroundTaskConcurrency: options?.backgroundTaskConcurrency,
       pendingCallTracker: options?.pendingCallTracker,
@@ -262,6 +268,7 @@ function createHook(options?: HookOptions) {
       fallbackManager: options?.fallbackManager,
       revivedRunTracker: options?.revivedRunTracker,
       syntheticQuotaCoordinator: options?.syntheticQuotaCoordinator,
+      hasUntrackedRunningChild: options?.hasUntrackedRunningChild,
     },
   );
 
@@ -397,6 +404,93 @@ describe('task-session-manager hook', () => {
     await secondAdmission;
 
     expect(concurrency.snapshot()).toEqual({ active: 1, queued: 0 });
+  });
+
+  test('an ID-only task output promotes its own placeholder with launch metadata', async () => {
+    const board = new BackgroundJobBoard();
+    const onLaunch = mock(() => {});
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      backgroundJobSupervisor: { onLaunch } as never,
+    });
+    board.registerLaunch({
+      taskID: 'ses_child',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      provisional: true,
+      now: 100,
+    });
+
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-1' },
+      {
+        args: {
+          background: true,
+          subagent_type: 'oracle',
+          description: 'owned call',
+        },
+      },
+    );
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-1' },
+      {
+        output:
+          'task_id: ses_child (for resuming to continue this task if needed)\n\n<task_result>done</task_result>',
+      },
+    );
+
+    const record = board.get('ses_child');
+    expect(record?.provisional).toBe(false);
+    expect(record?.state).toBe('running');
+    expect(record?.background).toBe(true);
+    expect(record?.description).toBe('owned call');
+    expect(record?.objective).toBe('owned call');
+    expect(onLaunch).toHaveBeenCalledWith(
+      expect.objectContaining({ taskID: 'ses_child' }),
+    );
+  });
+
+  test('a promoted foreground launch output marks the board record background', async () => {
+    const board = new BackgroundJobBoard();
+    const onLaunch = mock(() => {});
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      backgroundJobSupervisor: { onLaunch } as never,
+    });
+    board.registerLaunch({
+      taskID: 'ses_promoted',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+      provisional: true,
+      now: 100,
+    });
+
+    // Foreground call (no background arg): the child was awaited by a
+    // synchronous task() that foreground-fallback promoted mid-flight.
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-1' },
+      {
+        args: {
+          subagent_type: 'oracle',
+          description: 'foreground promoted call',
+        },
+      },
+    );
+    await hook['tool.execute.after'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'call-1' },
+      {
+        output: taskLaunchOutput('ses_promoted'),
+        metadata: { background: true },
+      },
+    );
+
+    const record = board.get('ses_promoted');
+    expect(record?.provisional).toBe(false);
+    expect(record?.state).toBe('running');
+    expect(record?.background).toBe(true);
+    expect(onLaunch).toHaveBeenCalledWith(
+      expect.objectContaining({ taskID: 'ses_promoted' }),
+    );
   });
 
   test('finishes a queued call after its manager generation is replaced', async () => {
@@ -5242,10 +5336,26 @@ describe('task-session-manager hook', () => {
     expect(resume.args.task_id).toBe('exp-1');
   });
 
-  test('custom subagent unknown native task_id is rejected before host execution', async () => {
+  test('custom subagent unknown native task_id drops the id and spawns fresh', async () => {
     const { hook } = createHook();
     const resume = {
       args: { subagent_type: 'repro-helper', task_id: 'ses_custom123' },
+    };
+
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'resume' },
+      resume,
+    );
+
+    expect(resume.args.task_id).toBeUndefined();
+  });
+
+  test('unknown alias refuses when an untracked child may still be running', async () => {
+    const { hook } = createHook({
+      hasUntrackedRunningChild: async () => true,
+    });
+    const resume = {
+      args: { subagent_type: 'fixer', task_id: 'fix-99' },
     };
 
     await expect(
@@ -5253,9 +5363,27 @@ describe('task-session-manager hook', () => {
         { tool: 'task', sessionID: 'parent-1', callID: 'resume' },
         resume,
       ),
-    ).rejects.toThrow(/Unknown task ID or alias/);
+    ).rejects.toThrow(/may have lost its mapping/);
+    expect(resume.args.task_id).toBe('fix-99');
+  });
 
-    expect(resume.args.task_id).toBe('ses_custom123');
+  test('unknown alias refuses when the host probe fails (fail closed)', async () => {
+    const { hook } = createHook({
+      hasUntrackedRunningChild: async () => {
+        throw new Error('probe down');
+      },
+    });
+    const resume = {
+      args: { subagent_type: 'fixer', task_id: 'fix-99' },
+    };
+
+    await expect(
+      hook['tool.execute.before'](
+        { tool: 'task', sessionID: 'parent-1', callID: 'resume' },
+        resume,
+      ),
+    ).rejects.toThrow(/may have lost its mapping/);
+    expect(resume.args.task_id).toBe('fix-99');
   });
 
   test('custom subagent aliases resolve for the same custom agent', async () => {
@@ -5436,33 +5564,35 @@ describe('task-session-manager hook', () => {
     });
   });
 
-  test('rejects unknown native resume ids before launching the host', async () => {
+  test('drops hallucinated UUID task_ids and spawns fresh instead of refusing', async () => {
     const { hook } = createHook();
-    const resume = {
-      args: { subagent_type: 'fixer', task_id: 'ses_existing' },
+    // The exact shape from the 2026-09-19 outage: a fallback provider invented
+    // random UUIDs in task_id, then models copied the pattern from compacted
+    // history while every refusal blocked all delegations.
+    const spawn = {
+      args: {
+        subagent_type: 'fixer',
+        task_id: '474bd269-eac6-40a9-9408-9fe430e8cd19',
+      },
     };
 
-    await expect(
-      hook['tool.execute.before'](
-        { tool: 'task', sessionID: 'parent-1', callID: 'resume-1' },
-        resume,
-      ),
-    ).rejects.toThrow(/Unknown task ID or alias: ses_existing/);
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'resume-1' },
+      spawn,
+    );
 
-    expect(resume.args.task_id).toBe('ses_existing');
+    expect(spawn.args.task_id).toBeUndefined();
   });
 
-  test('refuses unknown reusable aliases without dropping task_id', async () => {
+  test('drops unknown reusable aliases and continues as a new spawn', async () => {
     const { hook } = createHook();
     const resume = { args: { subagent_type: 'fixer', task_id: 'fix-99' } };
 
-    await expect(
-      hook['tool.execute.before'](
-        { tool: 'task', sessionID: 'parent-1', callID: 'resume-1' },
-        resume,
-      ),
-    ).rejects.toThrow(/Unknown task ID or alias: fix-99/);
-    expect(resume.args.task_id).toBe('fix-99');
+    await hook['tool.execute.before'](
+      { tool: 'task', sessionID: 'parent-1', callID: 'resume-1' },
+      resume,
+    );
+    expect(resume.args.task_id).toBeUndefined();
   });
 
   test('reads before and after launch attach with unique-line counts and caps', async () => {
@@ -5610,6 +5740,128 @@ describe('task-session-manager hook', () => {
     // Message should remain unchanged
     expect(messages.messages[0].parts[0].text).toBe('do something');
   });
+
+  test.each(['child-1', 'parent-1'])(
+    'compensates late revive acceptance through the real deletion callback: %s',
+    async (deletedID) => {
+      const coordinator = new SessionLifecycle(() => {});
+      const board = new BackgroundJobBoard();
+      const { hook } = createHook({ backgroundJobBoard: board, coordinator });
+      for (const taskID of ['child-1', 'sibling']) {
+        board.registerLaunch({
+          taskID,
+          parentSessionID: 'parent-1',
+          agent: 'explorer',
+        });
+        board.updateStatus({ taskID, state: 'completed' });
+      }
+      const send = Promise.withResolvers<unknown>();
+      const stop = Promise.withResolvers<unknown>();
+      const abortEntered = Promise.withResolvers<void>();
+      const released = Promise.withResolvers<void>();
+      const deadline = Promise.withResolvers<() => void>();
+      const realTimer = globalThis.setTimeout;
+      const timerSpy = spyOn(globalThis, 'setTimeout').mockImplementation(
+        (callback, ms, ...args) => {
+          const timer = realTimer(callback, ms, ...args);
+          if (ms === 1_000)
+            deadline.resolve(() => {
+              clearTimeout(timer);
+              callback(...args);
+            });
+          return timer;
+        },
+      );
+      const acquire = spyOn(ProductionBoard.prototype, 'acquireRelaunchLease');
+      const releaseLease = board.releaseLease.bind(board);
+      const release = spyOn(
+        ProductionBoard.prototype,
+        'releaseLease',
+      ).mockImplementation((lease) => {
+        const result = releaseLease(lease);
+        released.resolve();
+        return result;
+      });
+      const promptAsync = mock(() => send.promise);
+      const abort = mock(() => {
+        abortEntered.resolve();
+        return stop.promise;
+      });
+      const tracker = {
+        captureBaseline: async () => 'baseline',
+        register: mock(() => {}),
+        probe: mock(async () => false),
+      };
+      const onLaunch = mock(() => {});
+      const terminal = mock(() => {});
+      board.addTerminalStateListener(terminal);
+      const { task_revive } = createTaskReviveTool({
+        input: {
+          directory: '/tmp',
+          client: {
+            session: {
+              promptAsync,
+              abort,
+              status: async () => ({ data: {} }),
+            },
+          },
+        } as never,
+        backgroundJobBoard: board,
+        shouldManageSession: () => true,
+        revivedRunTracker: tracker as never,
+        backgroundJobSupervisor: { onLaunch } as never,
+        admissionTimeoutMs: 1_000,
+      });
+      try {
+        const pending = task_revive.execute(
+          { task_id: 'child-1', prompt: 'continue' },
+          { sessionID: 'parent-1', agent: 'orchestrator' } as never,
+        );
+        (await deadline.promise)();
+        expect(String(await pending)).toContain('status: admission_unknown');
+        const lease = acquire.mock.results[0]?.value;
+        if (!lease) throw new Error('missing relaunch lease');
+        coordinator.dispatchSessionDeleted(deletedID);
+        expect(board.get('child-1')).toBeUndefined();
+        expect(board.get('sibling') === undefined).toBe(
+          deletedID === 'parent-1',
+        );
+        const tombstones = getBackgroundJobLifecycleLedger(board).tombstones;
+        expect(tombstones.has('child-1')).toBe(true);
+        send.resolve({});
+        await abortEntered.promise;
+        expect(board.validateLease(lease)).toBe(true);
+        expect(() =>
+          board.registerLaunch({
+            taskID: 'child-1',
+            parentSessionID: 'parent-1',
+            agent: 'explorer',
+          }),
+        ).toThrow(/lease/);
+        expect(release).not.toHaveBeenCalled();
+        stop.resolve({});
+        await released.promise;
+        expect(release).toHaveBeenCalledTimes(1);
+        expect(release).toHaveBeenCalledWith(lease);
+        expect(board.validateLease(lease)).toBe(false);
+        expect(board.get('child-1')).toBeUndefined();
+        expect(board.get('parent-1')).toBeUndefined();
+        expect(tombstones.has('child-1')).toBe(true);
+        expect(promptAsync).toHaveBeenCalledTimes(1); // no parent notification
+        expect(abort).toHaveBeenCalledTimes(1);
+        expect(abort).toHaveBeenCalledWith({ path: { id: 'child-1' } });
+        expect(tracker.register).not.toHaveBeenCalled();
+        expect(tracker.probe).not.toHaveBeenCalled();
+        expect(onLaunch).not.toHaveBeenCalled();
+        expect(terminal).not.toHaveBeenCalled();
+      } finally {
+        timerSpy.mockRestore();
+        acquire.mockRestore();
+        release.mockRestore();
+        await hook.event({ event: { type: 'server.instance.disposed' } });
+      }
+    },
+  );
 
   test('cleans up background jobs when parent or child is deleted', async () => {
     const coordinator = new SessionLifecycle(() => {});
@@ -6522,7 +6774,10 @@ describe('task-session-manager hook', () => {
       runtimeStatusReconcileDelayMs: 60_000,
       idleReconcileDelayMs: 0,
       sessionClient: {
-        get: mock(async () => ({ data: { outcome: 'succeeded' } })),
+        get: mock(async () => {
+          await Bun.sleep(1); // This positive fixture must finish strictly after admission.
+          return { data: { outcome: 'succeeded', time: { idle: Date.now() } } };
+        }),
         messages: mock(async () => ({
           data: [
             {
@@ -6532,6 +6787,7 @@ describe('task-session-manager hook', () => {
           ],
         })),
       },
+      hostOutcomeClock: 'shared-unix-ms',
     });
     board.registerLaunch({
       taskID: 'child-relaunch',

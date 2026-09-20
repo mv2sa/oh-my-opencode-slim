@@ -218,7 +218,18 @@ async function abortAndVerifySession(
     response = await awaitLeaseOperation(
       options.backgroundJobBoard,
       lease,
-      () => getClient(options.input).session.abort({ path: { id: taskID } }),
+      () => {
+        // awaitLeaseOperation defers this callback to a microtask. Ownership
+        // may have changed since the check above; never send a stale abort.
+        assertLease(options.backgroundJobBoard, lease, execution);
+        assertCapturedExecution(options.backgroundJobBoard, execution);
+        if (options.backgroundJobBoard.getState(taskID) !== 'running') {
+          throw new LeaseOwnershipLostError(
+            `stale/uncertain cancellation: ${taskID} is no longer running`,
+          );
+        }
+        return getClient(options.input).session.abort({ path: { id: taskID } });
+      },
       options.abortTimeoutMs ?? 10_000,
       `Session abort timed out after ${options.abortTimeoutMs ?? 10_000}ms`,
     );
@@ -350,14 +361,27 @@ async function verifyQuiescentViaHostInfo(
       const token = options.terminalGate?.capture(execution);
       if (!token)
         throw new LeaseOwnershipLostError('Cancellation execution changed');
-      const response = (await client.session.get({
-        path: { id: execution.taskID },
-        query: { directory: options.input.directory },
-      })) as {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      // Abort has settled: this read cannot affect a reused session. Bound it
+      // without quarantining the lease or consuming evidence after timeout.
+      const response = (await withTimeout(
+        client.session.get({
+          path: { id: execution.taskID },
+          query: { directory: options.input.directory },
+        }),
+        remainingMs,
+        `Session info lookup timed out after ${remainingMs}ms`,
+      )) as {
         data?: { outcome?: unknown; time?: { idle?: unknown } };
         outcome?: unknown;
         time?: { idle?: unknown };
       };
+      // A blocked event loop may deliver the response before an overdue timer.
+      // Check the clock before accessing any of its evidence.
+      if (Date.now() >= deadline) {
+        throw new OperationTimeoutError('Session info lookup timed out');
+      }
       const info = response?.data ?? response;
       const outcome = info?.outcome;
       // Whitelist the known terminal values: a malformed or future
@@ -378,8 +402,11 @@ async function verifyQuiescentViaHostInfo(
             : 'no outcome or idle timestamp';
     } catch (error) {
       lastDetail = error instanceof Error ? error.message : String(error);
+      if (error instanceof OperationTimeoutError) break;
     }
-    await delay(retryIntervalMs);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    await delay(Math.min(retryIntervalMs, remainingMs));
   }
   throw new SessionStillRunningError(
     `Session abort returned but task did not stay stopped: ${execution.taskID} (host-info: ${lastDetail})`,
