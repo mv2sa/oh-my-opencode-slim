@@ -17,9 +17,8 @@ export const HEALTH_CHECK = {
   minAgents: 5,
   // Default tool set when council and ACP agents are not configured:
   // task_cancel, task_message, task_revive, task_status, task_result,
-  // wait_for_user, outcome_control, webfetch, ast_grep_search,
-  // ast_grep_replace.
-  minTools: 10,
+  // wait_for_user, webfetch, ast_grep_search, ast_grep_replace.
+  minTools: 9,
   minMcps: 1,
 } as const;
 
@@ -30,7 +29,6 @@ const BASELINE_TOOL_NAMES = new Set([
   'task_status',
   'task_result',
   'wait_for_user',
-  'outcome_control',
   'webfetch',
   'ast_grep_search',
   'ast_grep_replace',
@@ -44,16 +42,11 @@ const BASELINE_TOOL_NAMES = new Set([
  *   values (which should never occur post-validation, but are not trusted at
  *   runtime) are treated as "nothing disabled".
  * @param webfetchEnabled - Whether the enhanced webfetch tool is registered.
- * @param outcomeManagementEnabled - Whether the outcome-management layer is wired (it
- *   registers `outcome_control`). When false the tool is not registered, so the
- *   threshold drops by one; guarded against double-subtracting when the tool is also
- *   explicitly disabled.
  * @returns The adjusted minimum expected tool count
  */
 export function minimumExpectedToolCount(
   disabledTools: readonly string[] = [],
   webfetchEnabled = true,
-  outcomeManagementEnabled = true,
 ): number {
   // Config values come from user-edited JSON/JSONC (and can be re-derived
   // via runtime preset switches); never trust the declared type at
@@ -68,19 +61,7 @@ export function minimumExpectedToolCount(
     ),
   );
   const webfetchAdjustment = webfetchEnabled ? 0 : 1;
-  // `outcome_control` is a baseline tool only while the outcome-management layer
-  // is wired. When the layer is disabled the tool is never registered, so the
-  // threshold must drop with it; otherwise every startup warns that registrations
-  // are "suspiciously low" and misattributes the shortfall to a dependency failure.
-  // Guarded so an explicit disable of the tool cannot subtract twice.
-  const outcomeAdjustment =
-    outcomeManagementEnabled || disabledBaselineTools.has('outcome_control')
-      ? 0
-      : 1;
   return (
-    HEALTH_CHECK.minTools -
-    webfetchAdjustment -
-    disabledBaselineTools.size -
-    outcomeAdjustment
+    HEALTH_CHECK.minTools - webfetchAdjustment - disabledBaselineTools.size
   );
 }

@@ -131,7 +131,6 @@ describe('RuntimeConfig', () => {
       providerConcurrency: {},
       modelConcurrency: {},
     });
-    expect(runtime.outcomeManagement).toEqual({ enabled: true });
     expect(runtime.fallback).toEqual({
       enabled: true,
       maxRetries: 3,
@@ -172,7 +171,6 @@ describe('RuntimeConfig', () => {
       webfetch: { enabled: false },
       acpAgents: { myAcp: { command: 'echo' } },
       backgroundJobs: { maxSessionsPerAgent: 7 },
-      outcomeManagement: { enabled: false },
       multiplexer: { type: 'tmux', layout: 'main-vertical' },
     });
     expect(runtime.autoUpdate).toBe(false);
@@ -190,7 +188,6 @@ describe('RuntimeConfig', () => {
     expect(runtime.webfetch.enabled).toBe(false);
     expect(runtime.acpAgents.myAcp.command).toBe('echo');
     expect(runtime.backgroundJobs.maxSessionsPerAgent).toBe(7);
-    expect(runtime.outcomeManagement).toEqual({ enabled: false });
     expect(runtime.multiplexer.type).toBe('tmux');
   });
 

@@ -9,7 +9,6 @@ function hasInternalMetadata(metadata: unknown): boolean {
   return [
     INTERNAL_INITIATOR_METADATA_KEY,
     'compaction_continue',
-    'oh-my-opencode-slim:outcome-controller',
     'oh-my-opencode-slim.backgroundJobBoard',
   ].some((key) => metadata[key] === true);
 }

@@ -31,7 +31,6 @@ import {
   createOrchestratorAgent,
   resolvePrompt,
 } from './orchestrator';
-import { createOutcomeManagerAgent } from './outcome-manager';
 import { appendTaskRejectionInstruction } from './task-rejection';
 
 export { ensureCouncilCompactionException } from './council';
@@ -49,7 +48,6 @@ const TASK_CONTROL_TOOL_NAMES = [
   'task_revive',
   'task_status',
   'task_result',
-  'outcome_control',
 ] as const;
 const SAFE_AGENT_ALIAS_RE = /^[a-z][a-z0-9_-]*$/i;
 
@@ -200,11 +198,10 @@ function applyOverrides(
   if (override.displayName) {
     agent.displayName = override.displayName;
   }
-  if (override.description && agent.name !== 'outcome-manager') {
+  if (override.description) {
     agent.description = override.description;
   }
-  // Outcome manager enforces an immutable read-only / no-authority security boundary.
-  if (override.permission && agent.name !== 'outcome-manager') {
+  if (override.permission) {
     agent.config.permission = override.permission;
   }
 }
@@ -419,7 +416,6 @@ const SUBAGENT_FACTORIES: Record<SubagentName, AgentFactory> = {
   observer: createObserverAgent,
   council: createCouncilAgent,
   councillor: createCouncillorAgent,
-  'outcome-manager': createOutcomeManagerAgent,
 };
 
 // Public API
@@ -445,12 +441,6 @@ export function createAgents(
     disabled.add('council');
     // The bare councillor is only meaningful as part of configured Council Mode.
     disabled.add('councillor');
-  }
-  // The outcome-management kill switch covers the whole surface. The
-  // orchestrator prompt is frozen for cache safety, so a disabled setup must
-  // not register the agent it would delegate to.
-  if (!runtime.outcomeManagement.enabled) {
-    disabled.add('outcome-manager');
   }
 
   const primaryModel = runtime.primaryModel;
@@ -501,14 +491,6 @@ export function createAgents(
     .map(([name, factory]) => {
       // Get base agent definition using the subagent factory with undefined prompts
       const agent = factory(getModelForAgent(name), undefined, undefined);
-
-      // Outcome manager prompt is canonical and immutable; ignore file/inline overrides.
-      if (name === 'outcome-manager') {
-        agent.config.prompt = appendTaskRejectionInstruction(
-          agent.config.prompt ?? '',
-        );
-        return agent;
-      }
 
       const customPrompts = loadAgentPrompt(name, {
         preset: runtime.preset,
@@ -616,11 +598,7 @@ export function createAgents(
       applyOverrides(agent, override);
     }
     applyModelInheritance(agent, override, configuredOrchestratorModel);
-    applyDefaultPermissions(
-      agent,
-      agent.name === 'outcome-manager' ? [] : override?.skills,
-      runtime.disabledSkills,
-    );
+    applyDefaultPermissions(agent, override?.skills, runtime.disabledSkills);
     return agent;
   });
 
@@ -687,7 +665,6 @@ export function createAgents(
     !runtime.disabledTools.includes('wait_for_user'),
     runtime.backgroundJobs.orchestratorWake.enabled,
     options?.hostFlavor,
-    runtime.outcomeManagement.enabled,
   );
 
   const inlineOrchestratorPrompt = orchestratorOverride?.prompt;
@@ -728,7 +705,6 @@ export function createAgents(
 
   // 3b. Append custom orchestrator hints from built-in and custom agent overrides.
   const extraOrchestratorPromptsList = [...builtInSubAgents, ...customSubAgents]
-    .filter((agent) => agent.name !== 'outcome-manager')
     .map((agent) => {
       const override = getOverrideFromAgents(mergedAgents, agent.name);
       return override?.orchestratorPrompt;

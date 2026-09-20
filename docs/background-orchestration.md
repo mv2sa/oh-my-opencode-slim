@@ -42,7 +42,6 @@ The task API and background-control tools are:
 | `task_cancel` | Stop a generation while retaining its session |
 | `task_revive` | Resume a retained session with a new instruction |
 | `wait_for_user` | Plugin-provided orchestrator tool that pauses automatic orchestrator wakes while the user performs external manual work |
-| `outcome_control` | Authoritative outcome contract lifecycle, checkpointing, evidence attestation, review reconciliation, bounded progress/contract/action transitions, user decisions, external handoff completion, and final certification |
 
 If these are not available, the scheduler cannot use the default background
 workflow. Configure the environment variable through the installer or use the
@@ -500,91 +499,6 @@ errors, and idle/busy events do not clear it. Immediate choices, clarifications,
 and pasted command output continue to use the `question` tool. If
 `wait_for_user` is intentionally listed in `disabled_tools`, the orchestrator
 uses the `question` tool as the blocking boundary instead.
-
-For a managed outcome, restarting the OpenCode process is an explicit external
-handoff rather than ordinary shell work. The orchestrator must first call
-`outcome_control(action: "external_handoff", handoffKind:
-"restart_current_opencode", ...)`, give the user the restart instructions, and
-stop. As a narrow pre-execution guard, managed-root `bash` calls reject literal
-current-OpenCode-PID termination and explicit `pkill`/`killall`/`systemctl`/
-`service` restart commands that name OpenCode. Unrelated process and service
-commands remain permitted. This is intentionally recognizable-form detection,
-not shell analysis: aliases, wrapper scripts, substitutions, pipelines, and
-other obfuscated or indirect restart forms are outside its scope.
-
-The durable lifecycle has explicit exits rather than generic record mutation:
-
-- `update_goal_status` may only move a named goal to `satisfied`; goal status is
-  mutable progress and is excluded from the contract identity digest.
-- `revise_contract` validates the complete replacement contract. Objective or
-  scope changes require a later durable user-message receipt whose host message
-  ID is included in the revised contract's `sourceMessageIds`.
-- `resolve_action` requires a reason plus durable user or evidence provenance.
-  Controller-owned recovery transitions, such as uncertain-checkpoint
-  reconciliation and interrupted-operation acknowledgement, record their own
-  explicit reconciliation provenance.
-- `complete_external_handoff` requires a user receipt created after the handoff
-  and a later fresh, passed attestation matching the expected post-restart
-  check. Until then, the durable external wait remains active.
-
-`begin` and `checkpoint` results expose only non-secret checkpoint identity and
-`dispatchNudgePending`. The raw claim token and token-bearing Manager dispatch
-instruction are emitted exclusively through the tagged trailing volatile
-message transform; they are never serialized in ordinary tool output.
-
-External user turn receipts are recorded in the durable outcome store with
-whole-message provenance validation. If ANY authoritative part in a message turn
-is synthetic, internal initiator, compaction continuation, or carries plugin
-internal metadata, the entire message is rejected and mints no user message
-receipt. Transformed `output.parts` are authoritative over cleaner `input.parts`
-when present. Host message IDs are required, and duplicate host events with the
-same message ID are idempotent no-ops. Literal marker text in ordinary user text
-without synthetic metadata remains ordinary external user text.
-
-On authoritative session idle (`session.idle` or `session.status: idle`) without
-active background child tasks, leftover running tool operations from the current
-server epoch are atomically reconciled to `interrupted` in the durable outcome
-store (with reason `Session became idle without a durable tool after-hook`)
-without fabricating success or creating spurious action noise. Repeated idle
-events are idempotent no-ops that produce no revision growth or byte mutation.
-Interrupted and failed operations remain visible in outcome status, and recovery
-nudges direct the orchestrator to acknowledge them via
-`outcome_control(action: "acknowledge_operation")`. Active child tasks suppress
-idle operation reconciliation until child execution reaches a terminal state.
-
-Outcome Manager dispatch uses its checkpoint claim as the durable operation
-boundary. A reservation that later fails task-session preflight is retired
-immediately and does not leave a generic running operation or require a process
-restart to recover. A successful native launch is bound exactly once to its
-task ID and board generation. Manager-result consumption is retry-safe only for
-that exact `(root session, task ID, generation)` after completed reconciliation;
-a different parent, generation, or terminal outcome is rejected.
-
-### Successor Outcomes
-
-Once an outcome is accepted and certified, its durable record and certificate
-remain byte-for-byte immutable. Later external user messages continue through
-normal orchestration without altering the prior certificate.
-
-- Ordinary post-accept dialogue and tool calls proceed without mutating the
-  accepted predecessor.
-- The first eligible external user message after acceptance creates a durable
-  pending generation N+1 intake, linked backward by predecessor outcome ID,
-  generation, accepted revision, and domain-separated certificate digest. Later
-  eligible messages append idempotently to that intake.
-- When the user requests further non-trivial work, the orchestrator begins a
-  governed successor outcome via `outcome_control(action: "begin", contract: ...)`.
-  This promotes the pending intake in place to an active successor generation,
-  preserving user receipts and establishing explicit backward lineage.
-- Bounded session manifest (`<sessionHash>.manifest.json`) routes to the active
-  generation and tracks pending successor intake; historical generations
-  (`<sessionHash>.json`, `<sessionHash>.gNNNNNNNN.json`) remain accessible for
-  read-only inspection.
-- Retained history & no-GC policy: all accepted historical generation records
-  are retained permanently on disk; no deletion or garbage collection is performed.
-  The manifest is the sole authoritative routing source for active work.
-  Missing historical records fail closed across the entire generation chain,
-  as full lineage auditing is an explicit invariant.
 
 ### Background Job Board Injection
 

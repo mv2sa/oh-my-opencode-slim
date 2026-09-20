@@ -22,12 +22,6 @@ export type WakeProgressState = {
   pendingLegacyIdle?: boolean;
 };
 
-export type RestartRecoveryState = {
-  succeeded: boolean;
-  attempts: number;
-  inFlight: boolean;
-};
-
 type InFlightState = { owner: symbol; wakeCommitted: boolean };
 
 type WakeGateStore = {
@@ -40,25 +34,18 @@ type WakeGateStore = {
   lifecycleEvents?: WeakSet<object>;
   /** Insertion-ordered session keys for bounded eviction. */
   order: string[];
-  restartRecovery: Map<string, RestartRecoveryState>;
-  outcomeIdleWoken: Set<string>;
 };
 
 const STORE_KEY = 'oh-my-opencode-slim.orchestrator-wake-gate';
 const MAX_TRACKED_SESSIONS = 256;
 
 function getStore(): WakeGateStore {
-  const store = getGlobalStore<WakeGateStore>(STORE_KEY, () => ({
+  return getGlobalStore<WakeGateStore>(STORE_KEY, () => ({
     progress: new Map(),
     inFlight: new Map(),
     releaseWaiters: new Map(),
     order: [],
-    restartRecovery: new Map(),
-    outcomeIdleWoken: new Set(),
   }));
-  store.restartRecovery ??= new Map();
-  store.outcomeIdleWoken ??= new Set();
-  return store;
 }
 
 function touchOrder(sessionID: string): void {
@@ -219,7 +206,7 @@ export function commitWakeReservation(
 export function noteHostProgress(
   sessionID: string,
   fingerprint: string,
-  component: 'todo-child' | 'controller' = 'todo-child',
+  component: 'todo-child' = 'todo-child',
 ): void {
   const progress = getWakeProgress(sessionID);
   const previous = progress.fingerprints.get(component);
@@ -333,7 +320,6 @@ export function rearmWakeProgress(sessionID: string): void {
   progress.narration = undefined;
   progress.idlePrompted = false;
   progress.expectingWakeBusy = false;
-  getStore().outcomeIdleWoken.delete(sessionID);
 }
 
 export function setObservedWakeModel(
@@ -349,117 +335,6 @@ export function getObservedWakeModel(
   return getStore().progress.get(sessionID)?.observedModel;
 }
 
-export function getRestartRecoveryState(
-  sessionID: string,
-): RestartRecoveryState {
-  const store = getStore();
-  if (!admitWakeSession(sessionID))
-    return { succeeded: false, attempts: 2, inFlight: false };
-  let state = store.restartRecovery.get(sessionID);
-  if (!state) {
-    state = { succeeded: false, attempts: 0, inFlight: false };
-    store.restartRecovery.set(sessionID, state);
-  }
-  touchOrder(sessionID);
-  return state;
-}
-
-export function canReserveOutcomeIdleWake(sessionID: string): boolean {
-  const store = getStore();
-  const recovery = store.restartRecovery.get(sessionID);
-  if (recovery?.inFlight || store.outcomeIdleWoken.has(sessionID)) {
-    return false;
-  }
-  const progress = getWakeProgress(sessionID);
-  return !progress.stopped && !progress.idlePrompted;
-}
-
-export function commitOutcomeIdleWake(
-  sessionID: string,
-  owner: symbol,
-): boolean {
-  const progress = getWakeProgress(sessionID);
-  if (progress.idlePrompted) return false;
-  if (!commitWakeReservation(sessionID, owner)) return false;
-  progress.idlePrompted = true;
-  return true;
-}
-
-export function canAttemptRestartRecovery(sessionID: string): boolean {
-  const store = getStore();
-  const state = store.restartRecovery.get(sessionID);
-  if (state?.succeeded) return false;
-  if (state && state.attempts >= 2) return false;
-  if (state?.inFlight) return false;
-  if (store.inFlight.has(sessionID)) return false;
-  if (store.progress.get(sessionID)?.stopped) return false;
-  if (
-    !store.progress.has(sessionID) &&
-    store.progress.size >= MAX_TRACKED_SESSIONS
-  )
-    return false;
-  if (store.progress.get(sessionID)?.expectingWakeBusy) return false;
-  return true;
-}
-
-export function tryBeginRestartRecovery(sessionID: string): symbol | null {
-  if (!canAttemptRestartRecovery(sessionID)) return null;
-  if (!admitWakeSession(sessionID)) return null;
-  const store = getStore();
-  const state = getRestartRecoveryState(sessionID);
-  state.inFlight = true;
-  const owner = Symbol(`restart-recovery-${sessionID}`);
-  store.inFlight.set(sessionID, { owner, wakeCommitted: false });
-  touchOrder(sessionID);
-  return owner;
-}
-
-export function commitRestartRecoverySuccess(
-  sessionID: string,
-  owner: symbol,
-): void {
-  const store = getStore();
-  const flight = store.inFlight.get(sessionID);
-  if (flight?.owner !== owner || !flight.wakeCommitted) return;
-  const state = getRestartRecoveryState(sessionID);
-  state.succeeded = true;
-  state.inFlight = false;
-  const progress = getWakeProgress(sessionID);
-  progress.expectingWakeBusy = true;
-  store.outcomeIdleWoken.add(sessionID);
-  touchOrder(sessionID);
-}
-
-export function recordRestartRecoveryFailure(
-  sessionID: string,
-  owner: symbol,
-): void {
-  const store = getStore();
-  if (store.inFlight.get(sessionID)?.owner !== owner) return;
-  const state = getRestartRecoveryState(sessionID);
-  if (!state.inFlight) return;
-  state.attempts += 1;
-  state.inFlight = false;
-  clearExpectingWakeBusy(sessionID);
-  touchOrder(sessionID);
-}
-
-export function releaseRestartRecovery(sessionID: string, owner: symbol): void {
-  const store = getStore();
-  if (store.inFlight.get(sessionID)?.owner !== owner) return;
-  const state = store.restartRecovery.get(sessionID);
-  if (state?.inFlight) {
-    state.inFlight = false;
-  }
-  releaseWakeEvaluation(sessionID, owner);
-}
-
-export function clearOutcomeIdleWake(sessionID: string): void {
-  const store = getStore();
-  store.outcomeIdleWoken.delete(sessionID);
-  clearExpectingWakeBusy(sessionID);
-}
-
 /** Full session cleanup (deletion or disposal). */
 export function clearWakeSession(sessionID: string): void {
   const store = getStore();
@@ -468,8 +343,6 @@ export function clearWakeSession(sessionID: string): void {
   store.progress.delete(sessionID);
   store.inFlight.delete(sessionID);
   store.releaseWaiters.delete(sessionID);
-  store.restartRecovery.delete(sessionID);
-  store.outcomeIdleWoken.delete(sessionID);
   const idx = store.order.indexOf(sessionID);
   if (idx >= 0) store.order.splice(idx, 1);
 }
@@ -483,8 +356,6 @@ export function clearAllWakeSessions(): void {
   store.progress.clear();
   store.inFlight.clear();
   store.releaseWaiters.clear();
-  store.restartRecovery.clear();
-  store.outcomeIdleWoken.clear();
   store.order.length = 0;
 }
 
@@ -497,10 +368,8 @@ export function wakeGateSizesForTests() {
   const store = getStore();
   return {
     progress: store.progress.size,
-    restart: store.restartRecovery.size,
     owners: store.inFlight.size,
     waiters: store.releaseWaiters.size,
     order: store.order.length,
-    outcomeIdle: store.outcomeIdleWoken.size,
   };
 }

@@ -297,27 +297,6 @@ export const BackgroundJobsConfigSchema = z.object({
 export type BackgroundJobsConfig = z.infer<typeof BackgroundJobsConfigSchema>;
 
 /**
- * Independent, narrower kill switch for the Outcome Manager surface. The
- * plugin-wide emergency disable (`OH_MY_OPENCODE_SLIM_DISABLE`) is unaffected:
- * this option only controls whether the outcome controller/hook/tool are
- * wired, and never deletes or rewrites records already on disk.
- */
-export const OutcomeManagementConfigSchema = z
-  .object({
-    enabled: z
-      .boolean()
-      .default(true)
-      .describe(
-        'When false, the Outcome Manager surface is not wired: the outcome hook and outcome_control tool are not registered, the outcome-manager agent is not registered, and wait_for_user no longer consults managed-outcome state. On-disk outcome records are left untouched; re-enabling resumes from them. Default enabled.',
-      ),
-  })
-  .strict();
-
-export type OutcomeManagementConfig = z.infer<
-  typeof OutcomeManagementConfigSchema
->;
-
-/**
  * Fallback config fields accepted by versions before 2.3.x but no longer
  * meaningful. Kept only so that existing user/project configs containing
  * them still parse: the loader emits a deprecation warning and these keys
@@ -557,7 +536,6 @@ export const PluginConfigSchema = z
     multiplexer: MultiplexerConfigSchema.optional(),
     interview: InterviewConfigSchema.optional(),
     backgroundJobs: BackgroundJobsConfigSchema.optional(),
-    outcomeManagement: OutcomeManagementConfigSchema.optional(),
     fallback: FailoverConfigSchema.optional(),
     council: CouncilConfigSchema.optional(),
     companion: CompanionConfigSchema.optional(),

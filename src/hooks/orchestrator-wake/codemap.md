@@ -71,13 +71,12 @@ fallback), the wake condition is children without a terminal `outcome`
   - `getObservedWakeModel` / `setObservedWakeModel`: last-seen model for
     continuation prompts.
   - First 256 external message IDs retained per session; later unknown IDs fail
-    closed for rearming. At 256 sessions, new admission fails closed; unknown
-    restart candidates allocate nothing before outcome lookup. Budgets remain
+    closed for rearming. At 256 sessions, new admission fails closed. Budgets remain
     until deletion/process exit, never evicted under session pressure. Disposal only
     retires local work; committed transports retain ownership until settlement.
-  - Separate TODO/child and Controller fingerprints: initial/missing components
-    cannot refill spent budget; meaningful changes or distinct external host IDs
-    alone rearm. Revisions/counters/timestamps/prose/status-read churn do not.
+  - TODO/child fingerprints: initial/missing components cannot refill spent
+    budget; meaningful changes or distinct external host IDs alone rearm.
+    Revisions/counters/timestamps/prose/status-read churn do not.
   - Shared idle-cycle admission coalesces paired idle notifications across hooks
     and SDK acknowledgements. Busy-to-idle opens another cycle without refilling
     budget. Release waiters are bounded/deduplicated by scheduler/Controller source.
@@ -117,19 +116,6 @@ distinct external user ID / meaningful component change → rearm cap
   parameterize wake prompts.
 - **SessionLifecycle**: registers `session.deleted` cleanup via the
   coordinator.
-- **Interrupted Foreground-Turn Restart Recovery** (`index.ts` & `wake-gate.ts`):
-  - One-shot startup bootstrap scanner and first idle/status event fallback for interrupted managed root orchestrator sessions across process restarts.
-  - Startup scan scans bounded current-directory sessions via host `session.list` (roots only, newest first, max 256 roots, concurrency <= 4) after a short non-blocking settle delay.
-  - Exact classification requirements:
-    - Raw prior-epoch Outcome store read (`controller.store.read`) where `serverEpoch !== currentServerEpoch`, not accepted, no durable user/external wait, and exactly one running prior-epoch durable operation.
-    - No process-local user/external wait and no fallback in progress.
-    - Host snapshot 1: root session (`!parentID`), inactive status, valid incomplete TODOs, latest message is exactly one incomplete assistant turn with no error and exactly one running noninteractive tool part.
-    - Exact durable operation binding by callID, tool name, and `canonicalDigest('omos/tool-args/v1', tool input)`.
-    - Normal `controller.readRecord` recovery ensuring the exact operation is interrupted with the standard restart error and matching unresolved action.
-    - Host snapshot 2: must be identical to snapshot 1 and inactive before prompt.
-  - Wakes via single static internal prompt `ORCHESTRATOR_RESTART_RECOVERY_TEXT` directing authoritative inspection without blind re-execution, preserving model from the incomplete assistant turn.
-  - Process-global one-flight and success state shared between startup scan and event fallback: at most 2 SDK-failure attempts per session/process, never a second restart prompt after success; all attempts also consume the common budget before SDK invocation.
-  - Shared wake reservation with OutcomeController idle wake so bootstrap and Outcome idle cannot double-prompt.
 - **v2 adapter**: the client shim's `session.list` (parentID filter, v1
   envelope with mapped `outcome`/`time.updated`/`directory`), the
   children-fallback enrichment via `session.get` (authoritative

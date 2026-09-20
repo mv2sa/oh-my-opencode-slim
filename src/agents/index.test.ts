@@ -741,7 +741,7 @@ describe('tool permissions', () => {
   test('subagents are denied access to wait_for_user', () => {
     const agents = createAgents(runtimeFor());
 
-    for (const name of ['oracle', 'explorer', 'fixer', 'outcome-manager']) {
+    for (const name of ['oracle', 'explorer', 'fixer']) {
       const agent = agents.find((candidate) => candidate.name === name);
       expect(
         (agent as { config: { permission: Record<string, unknown> } }).config
@@ -819,7 +819,6 @@ describe('isSubagent type guard', () => {
     expect(isSubagent('oracle')).toBe(true);
     expect(isSubagent('designer')).toBe(true);
     expect(isSubagent('fixer')).toBe(true);
-    expect(isSubagent('outcome-manager')).toBe(true);
   });
 
   test('returns false for orchestrator', () => {
@@ -838,7 +837,6 @@ describe('agent classification', () => {
     expect(SUBAGENT_NAMES).not.toContain('orchestrator');
     expect(SUBAGENT_NAMES).toContain('explorer');
     expect(SUBAGENT_NAMES).toContain('fixer');
-    expect(SUBAGENT_NAMES).toContain('outcome-manager');
   });
 
   test('getAgentConfigs applies correct classification visibility and mode', () => {
@@ -928,12 +926,11 @@ describe('createAgents', () => {
     expect(names).toContain('oracle');
     expect(names).toContain('librarian');
     expect(names).toContain('fixer');
-    expect(names).toContain('outcome-manager');
   });
 
-  test('creates exactly 7 agents by default (observer and council disabled, outcome-manager enabled)', () => {
+  test('creates exactly 6 agents by default (observer and council disabled)', () => {
     const agents = createAgents(runtimeFor());
-    expect(agents.length).toBe(7);
+    expect(agents.length).toBe(6);
   });
 
   test('does not create or register council agents without council config', () => {
@@ -1024,7 +1021,6 @@ describe('getAgentConfigs', () => {
       'council',
       'councillor',
       'councillor-alpha',
-      'outcome-manager',
       'reviewer',
       'bridge',
     ]) {
@@ -1639,13 +1635,13 @@ describe('disabled_agents', () => {
 
   test('agent count decreases when agents are disabled', () => {
     const agents = createAgents(runtimeFor());
-    expect(agents.length).toBe(7); // observer and council disabled, outcome-manager enabled
+    expect(agents.length).toBe(6); // observer and council disabled
 
     const disabledConfig: PluginConfig = {
       disabled_agents: ['observer', 'designer'],
     };
     const disabledAgents = createAgents(runtimeFor(disabledConfig));
-    expect(disabledAgents.length).toBe(6);
+    expect(disabledAgents.length).toBe(5);
   });
 
   test('empty disabled_agents creates observer but not unconfigured council', () => {
@@ -1654,9 +1650,8 @@ describe('disabled_agents', () => {
     };
     const agents = createAgents(runtimeFor(config));
     const names = agents.map((a) => a.name);
-    expect(agents.length).toBe(8);
+    expect(agents.length).toBe(7);
     expect(names).toContain('observer');
-    expect(names).toContain('outcome-manager');
     expect(names).not.toContain('council');
     expect(names).not.toContain('councillor');
   });

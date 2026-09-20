@@ -20,8 +20,6 @@
  */
 import type { PluginInput } from '@opencode-ai/plugin';
 import type { OpencodeClient } from '@opencode-ai/sdk';
-import type { OutcomeController } from '../../outcome/controller';
-import { canonicalDigest } from '../../outcome/controller-schema';
 import {
   createInternalAgentTextPart,
   isInternalInitiatorPart,
@@ -36,13 +34,10 @@ import {
   parseContinuationModelSelection,
 } from '../task-session-manager/continuation-model-selection';
 import { isActiveStatus } from '../task-session-manager/status-utils';
-import { isMessageWithParts } from '../types';
 import {
   admitWakeSession,
-  canAttemptRestartRecovery,
   clearExpectingWakeBusy,
   clearWakeSession,
-  commitRestartRecoverySuccess,
   commitWakeReservation,
   getObservedWakeModel,
   getWakeProgress,
@@ -52,12 +47,9 @@ import {
   noteHostProgress,
   observeWakeEvent,
   rearmWakeProgress,
-  recordRestartRecoveryFailure,
-  releaseRestartRecovery,
   releaseWakeEvaluation,
   retryAfterWakeEvaluation,
   setObservedWakeModel,
-  tryBeginRestartRecovery,
   tryBeginWakeEvaluation,
 } from './wake-gate';
 
@@ -66,23 +58,6 @@ export const ORCHESTRATOR_WAKE_TEXT =
 
 export const ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT =
   '<system-reminder>\nA background job stopped without a terminal result. Consult the Background Job Board, recover or reroute the work as needed, and do not wait for that job as if it were still running. Do not respond to this reminder.\n</system-reminder>';
-
-/**
- * Restart-recovery reminder. The inspection hints must name only tools that are
- * actually registered: with outcome management disabled `outcome_control` does
- * not exist, so naming it would send the agent after a missing tool.
- */
-export function orchestratorRestartRecoveryText(
-  outcomeManagementEnabled = true,
-): string {
-  const stateSources = outcomeManagementEnabled
-    ? 'outcome_control, task_status, or git/filesystem checks'
-    : 'task_status or git/filesystem checks';
-  return `<system-reminder>\nThe previous OpenCode process was restarted while a foreground tool was running. That operation was interrupted and must not be blindly re-executed. Inspect authoritative local and background state (via ${stateSources}) to determine whether the operation completed or needs targeted recovery before proceeding. Do not respond to this reminder.\n</system-reminder>`;
-}
-
-export const ORCHESTRATOR_RESTART_RECOVERY_TEXT =
-  orchestratorRestartRecoveryText(true);
 
 /** All automatic prompt attempts, including transport errors, share this cap. */
 /**
@@ -217,26 +192,6 @@ const SUPPORTED_TODO_STATUSES = new Set([
 
 type SessionClient = OpencodeClient['session'];
 
-function hasRequiredSessionApis(
-  session: SessionClient | undefined,
-): session is SessionClient & {
-  get: NonNullable<SessionClient['get']>;
-  todo: NonNullable<SessionClient['todo']>;
-  children: NonNullable<SessionClient['children']>;
-  status: NonNullable<SessionClient['status']>;
-  promptAsync: NonNullable<SessionClient['promptAsync']>;
-  messages?: NonNullable<SessionClient['messages']>;
-  list?: NonNullable<SessionClient['list']>;
-} {
-  return (
-    typeof session?.get === 'function' &&
-    typeof session.todo === 'function' &&
-    typeof session.children === 'function' &&
-    typeof session.status === 'function' &&
-    typeof session.promptAsync === 'function'
-  );
-}
-
 /** Todo-mode host snapshot (v1): todos + children + live status map. */
 type TodoModeSnapshot = {
   kind: 'todo';
@@ -301,12 +256,8 @@ export type OrchestratorWakeOptions = {
    * session to a non-orchestrator agent — the wake continues in the
    * CURRENT selection instead of forcing `orchestrator`. */
   hasPendingDelegatedWork?: (sessionID: string) => boolean;
-  /** Whether the outcome-management layer is wired. Restart-recovery hints must
-   * name only registered tools, and `outcome_control` is absent when disabled. */
-  outcomeManagementEnabled?: boolean;
   /** Test seam: override interval without changing config validation. */
   intervalMs?: number;
-  outcomeController?: OutcomeController;
   registerSessionAsOrchestrator?: (sessionID: string) => void;
   startupSettleDelayMs?: number;
   restartSnapshotSettleDelayMs?: number;
@@ -469,15 +420,6 @@ export function buildChildrenWakeFingerprint(
     .join('\n');
 }
 
-function isInteractiveOrPermissionTool(toolName: string): boolean {
-  return (
-    toolName === 'question' ||
-    toolName === 'wait_for_user' ||
-    toolName.startsWith('permission.') ||
-    toolName.startsWith('question.')
-  );
-}
-
 function isIncompleteTodoStatus(status: string): boolean {
   return status === 'pending' || status === 'in_progress';
 }
@@ -621,16 +563,6 @@ function isInputWaitAskEvent(type: string): boolean {
   return type === 'permission.asked' || type === 'question.asked';
 }
 
-function isBootstrapActiveStatus(
-  status: Record<string, unknown>,
-  sessionID: string,
-): boolean {
-  if (!Object.hasOwn(status, sessionID)) return false;
-  const entry = status[sessionID];
-  if (!isObjectRecord(entry) || typeof entry.type !== 'string') return true;
-  return entry.type !== 'idle';
-}
-
 export function createOrchestratorWakeScheduler(
   ctx: PluginInput,
   options: OrchestratorWakeOptions,
@@ -638,8 +570,6 @@ export function createOrchestratorWakeScheduler(
   const intervalMs = options.intervalMs ?? options.config.intervalMs;
   const enabled = options.config.enabled === true;
   const directory = ctx.directory;
-  const restartSnapshotSettleDelayMs =
-    options.restartSnapshotSettleDelayMs ?? 250;
   const sessionSdk = (ctx.client as OpencodeClient).session;
 
   /** Static host-surface capability record (the client never changes). */
@@ -748,596 +678,6 @@ export function createOrchestratorWakeScheduler(
   /** Newest event evidence (created/status change) per child, epoch ms. */
   const childEvidence = new Map<string, number>();
   let disposed = false;
-  let startupTimer: ReturnType<typeof setTimeout> | undefined;
-
-  async function classifyAndRecoverInterruptedSession(
-    sessionID: string,
-    _source: 'bootstrap' | 'event',
-  ): Promise<boolean> {
-    if (disposed || !enabled) return false;
-    if (!options.outcomeController) return false;
-    if (!hasRequiredSessionApis(sessionSdk)) return false;
-    if (typeof sessionSdk.messages !== 'function') return false;
-
-    // Must not have process-local input wait or fallback in progress
-    if (options.hasInputWait(sessionID)) return false;
-    if (options.isFallbackInProgress?.(sessionID)) return false;
-
-    // Check shared process-global restart recovery gate
-    if (!canAttemptRestartRecovery(sessionID)) return false;
-
-    const controller = options.outcomeController;
-
-    // 1. Raw prior-epoch Outcome store read (or an exact already-recovered
-    // interrupted operation when a previous classification lost a host race).
-    const rawRes = controller.store.read(sessionID);
-    if (!rawRes.success) return false; // corrupt or missing records rejected
-    const rawRecord = rawRes.data;
-    if (!admitWakeSession(sessionID)) return false;
-
-    // Reject accepted outcomes
-    if (rawRecord.phase === 'accepted') return false;
-
-    // No durable user/external wait
-    if (rawRecord.waitCondition !== undefined) return false;
-
-    const eligibleOperations = rawRecord.operations.filter(
-      (operation) =>
-        operation.serverEpoch !== controller.serverEpoch &&
-        (operation.status === 'running' ||
-          (operation.status === 'interrupted' &&
-            operation.error === 'Operation interrupted by process restart')),
-    );
-    if (eligibleOperations.length !== 1) return false;
-    const priorRunningOp = eligibleOperations[0];
-    const requiresRecovery = priorRunningOp.status === 'running';
-    if (requiresRecovery && rawRecord.serverEpoch === controller.serverEpoch) {
-      return false;
-    }
-
-    // 2. Authoritative host snapshot 1
-    // Root session check
-    let sessionGet:
-      | {
-          data?: {
-            parentID?: string | null;
-            directory?: string;
-            model?: unknown;
-          };
-        }
-      | undefined;
-    try {
-      sessionGet = (await sessionSdk.get({
-        path: { id: sessionID },
-        query: { directory },
-        throwOnError: true,
-      })) as {
-        data?: {
-          parentID?: string | null;
-          directory?: string;
-          model?: unknown;
-        };
-      };
-    } catch {
-      return false;
-    }
-    const sessionData = isObjectRecord(sessionGet?.data)
-      ? sessionGet.data
-      : undefined;
-    if (
-      !sessionData ||
-      sessionData.parentID ||
-      (typeof sessionData.directory === 'string' &&
-        sessionData.directory !== directory)
-    ) {
-      return false;
-    }
-
-    // Inactive check in snapshot 1
-    let statusRes1: { data?: Record<string, unknown> } | undefined;
-    try {
-      statusRes1 = (await sessionSdk.status({
-        query: { directory },
-        throwOnError: true,
-      })) as { data?: Record<string, unknown> };
-    } catch {
-      return false;
-    }
-    if (
-      !isObjectRecord(statusRes1?.data) ||
-      isBootstrapActiveStatus(statusRes1.data, sessionID)
-    ) {
-      return false;
-    }
-
-    let childrenRes1: { data?: unknown } | undefined;
-    try {
-      childrenRes1 = await sessionSdk.children({
-        path: { id: sessionID },
-        query: { directory },
-        throwOnError: true,
-      });
-    } catch {
-      return false;
-    }
-    if (!Array.isArray(childrenRes1?.data)) return false;
-    const children1 = childrenRes1.data as Array<Record<string, unknown>>;
-    if (hasActiveChild(children1, statusRes1.data)) return false;
-    const childrenFingerprint1 = childrenFingerprint(
-      children1,
-      statusRes1.data,
-    );
-
-    // Incomplete TODOs check
-    let todoRes: { data?: unknown } | undefined;
-    try {
-      todoRes = await sessionSdk.todo({
-        path: { id: sessionID },
-        query: { directory },
-        throwOnError: true,
-      });
-    } catch {
-      return false;
-    }
-    if (!Array.isArray(todoRes?.data)) return false;
-    const todos = todoRes.data as Array<Record<string, unknown>>;
-    if (
-      !todos.every((t) => isObjectRecord(t) && typeof t.status === 'string') ||
-      !todosHaveValidStatuses(todos) ||
-      !hasIncompleteTodos(todos)
-    ) {
-      return false;
-    }
-
-    // Messages snapshot 1
-    let messagesRes1: { data?: unknown } | undefined;
-    try {
-      messagesRes1 = await sessionSdk.messages({
-        path: { id: sessionID },
-        query: { directory },
-        throwOnError: true,
-      });
-    } catch {
-      return false;
-    }
-    if (!Array.isArray(messagesRes1?.data) || messagesRes1.data.length === 0) {
-      return false;
-    }
-    const messages1 = messagesRes1.data;
-    const latest1 = messages1[messages1.length - 1];
-    if (!isMessageWithParts(latest1)) return false;
-
-    // Must be exactly one incomplete assistant turn with no error
-    if (latest1.info.role !== 'assistant') return false;
-    const infoRecord = latest1.info as Record<string, unknown>;
-    if (
-      typeof infoRecord.id !== 'string' ||
-      infoRecord.id.length === 0 ||
-      infoRecord.sessionID !== sessionID
-    ) {
-      return false;
-    }
-    if (infoRecord.error !== undefined) return false;
-    const timeRecord = isObjectRecord(infoRecord.time)
-      ? infoRecord.time
-      : undefined;
-    if (timeRecord?.completed !== undefined) return false;
-    if (infoRecord.finish !== undefined && infoRecord.finish !== null) {
-      return false;
-    }
-
-    // Allow earlier terminal tools in the same assistant turn, but require
-    // exactly one active tool and require that active tool to be running.
-    const toolParts1 = latest1.parts.filter(
-      (p) => isObjectRecord(p) && p.type === 'tool',
-    ) as Array<Record<string, unknown>>;
-    const toolStatuses1 = toolParts1.map((part) => {
-      const state = isObjectRecord(part.state) ? part.state : undefined;
-      return typeof state?.status === 'string' ? state.status : undefined;
-    });
-    if (
-      toolStatuses1.some(
-        (status) =>
-          status !== 'pending' &&
-          status !== 'running' &&
-          status !== 'completed' &&
-          status !== 'error',
-      )
-    ) {
-      return false;
-    }
-    const activeToolParts1 = toolParts1.filter((_, index) =>
-      ['pending', 'running'].includes(toolStatuses1[index] ?? ''),
-    );
-    if (activeToolParts1.length !== 1) return false;
-    const toolPart1 = activeToolParts1[0];
-
-    const toolState1 = isObjectRecord(toolPart1.state)
-      ? toolPart1.state
-      : undefined;
-    if (toolState1?.status !== 'running') return false;
-    const toolTime1 = isObjectRecord(toolState1.time)
-      ? toolState1.time
-      : undefined;
-    if (typeof toolTime1?.start !== 'number') return false;
-
-    if (typeof toolPart1.id !== 'string' || toolPart1.id.length === 0) {
-      return false;
-    }
-
-    const toolName1 = typeof toolPart1.tool === 'string' ? toolPart1.tool : '';
-    if (!toolName1 || isInteractiveOrPermissionTool(toolName1)) return false;
-
-    const callID1 =
-      typeof toolPart1.callID === 'string' ? toolPart1.callID : '';
-    if (!callID1) return false;
-
-    if (!isObjectRecord(toolState1.input)) return false;
-    const toolInput1 = toolState1.input;
-    const argumentDigest1 = canonicalDigest('omos/tool-args/v1', toolInput1);
-
-    if (
-      priorRunningOp.callId !== callID1 ||
-      priorRunningOp.toolName !== toolName1 ||
-      priorRunningOp.argumentDigest !== argumentDigest1
-    ) {
-      return false;
-    }
-
-    // Claim the shared wake slot before durable recovery so an Outcome idle
-    // event cannot race this classifier and double-prompt the root.
-    const owner = tryBeginRestartRecovery(sessionID);
-    if (!owner) return false;
-
-    try {
-      // 3. Normal controller.readRecord recovery
-      const recoveredRes = requiresRecovery
-        ? controller.readRecord(sessionID)
-        : rawRes;
-      if (!recoveredRes.success) return false;
-      const recoveredRecord = recoveredRes.data;
-
-      // Require exact operation interrupted with standard restart error
-      const recoveredOp = recoveredRecord.operations.find(
-        (operation) => operation.id === priorRunningOp.id,
-      );
-      if (
-        recoveredOp?.status !== 'interrupted' ||
-        recoveredOp.error !== 'Operation interrupted by process restart'
-      ) {
-        return false;
-      }
-
-      // Require matching unresolved action
-      const matchingAction = recoveredRecord.actionsRequired.find(
-        (action) =>
-          action.resolvedAt === undefined &&
-          action.code === 'interrupted_operation' &&
-          action.referenceId === priorRunningOp.id,
-      );
-      if (!matchingAction) return false;
-
-      // Give the host a bounded window to restore or advance a real live turn.
-      if (restartSnapshotSettleDelayMs > 0) {
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, restartSnapshotSettleDelayMs);
-          timer.unref?.();
-        });
-        if (disposed) return false;
-      }
-
-      // 4. Second authoritative host snapshot: must be identical and inactive
-      if (options.hasInputWait(sessionID)) return false;
-      if (options.isFallbackInProgress?.(sessionID)) return false;
-      const latestDurable = controller.store.read(sessionID);
-      if (!latestDurable.success || latestDurable.data.waitCondition) {
-        return false;
-      }
-
-      let statusRes2: { data?: Record<string, unknown> } | undefined;
-      try {
-        statusRes2 = (await sessionSdk.status({
-          query: { directory },
-          throwOnError: true,
-        })) as { data?: Record<string, unknown> };
-      } catch {
-        return false;
-      }
-      if (
-        !isObjectRecord(statusRes2?.data) ||
-        isBootstrapActiveStatus(statusRes2.data, sessionID)
-      ) {
-        return false;
-      }
-
-      let childrenRes2: { data?: unknown } | undefined;
-      try {
-        childrenRes2 = await sessionSdk.children({
-          path: { id: sessionID },
-          query: { directory },
-          throwOnError: true,
-        });
-      } catch {
-        return false;
-      }
-      if (!Array.isArray(childrenRes2?.data)) return false;
-      const children2 = childrenRes2.data as Array<Record<string, unknown>>;
-      if (
-        hasActiveChild(children2, statusRes2.data) ||
-        childrenFingerprint(children2, statusRes2.data) !== childrenFingerprint1
-      ) {
-        return false;
-      }
-
-      let todoRes2: { data?: unknown } | undefined;
-      try {
-        todoRes2 = await sessionSdk.todo({
-          path: { id: sessionID },
-          query: { directory },
-          throwOnError: true,
-        });
-      } catch {
-        return false;
-      }
-      if (!Array.isArray(todoRes2?.data)) return false;
-      const todos2 = todoRes2.data as Array<Record<string, unknown>>;
-      if (
-        !todos2.every((todo) =>
-          isObjectRecord(todo) ? typeof todo.status === 'string' : false,
-        ) ||
-        !todosHaveValidStatuses(todos2) ||
-        !hasIncompleteTodos(todos2) ||
-        todoFingerprint(todos2) !== todoFingerprint(todos)
-      ) {
-        return false;
-      }
-
-      let messagesRes2: { data?: unknown } | undefined;
-      try {
-        messagesRes2 = await sessionSdk.messages({
-          path: { id: sessionID },
-          query: { directory },
-          throwOnError: true,
-        });
-      } catch {
-        return false;
-      }
-      if (!Array.isArray(messagesRes2?.data)) return false;
-      const messages2 = messagesRes2.data;
-      if (messages2.length !== messages1.length) return false;
-      const latest2 = messages2[messages2.length - 1];
-      if (!isMessageWithParts(latest2)) return false;
-      if (latest2.info.id !== latest1.info.id) return false;
-      if (latest2.info.role !== 'assistant') return false;
-      const infoRecord2 = latest2.info as Record<string, unknown>;
-      if (
-        typeof infoRecord2.id !== 'string' ||
-        infoRecord2.id.length === 0 ||
-        infoRecord2.sessionID !== sessionID
-      ) {
-        return false;
-      }
-      const timeRecord2 = isObjectRecord(infoRecord2.time)
-        ? infoRecord2.time
-        : undefined;
-      if (timeRecord2?.completed !== undefined) return false;
-      if (infoRecord2.finish !== undefined && infoRecord2.finish !== null) {
-        return false;
-      }
-      if (infoRecord2.error !== undefined) return false;
-
-      const toolParts2 = latest2.parts.filter(
-        (p) => isObjectRecord(p) && p.type === 'tool',
-      ) as Array<Record<string, unknown>>;
-      const toolStatuses2 = toolParts2.map((part) => {
-        const state = isObjectRecord(part.state) ? part.state : undefined;
-        return typeof state?.status === 'string' ? state.status : undefined;
-      });
-      if (
-        toolStatuses2.some(
-          (status) =>
-            status !== 'pending' &&
-            status !== 'running' &&
-            status !== 'completed' &&
-            status !== 'error',
-        )
-      ) {
-        return false;
-      }
-      const activeToolParts2 = toolParts2.filter((_, index) =>
-        ['pending', 'running'].includes(toolStatuses2[index] ?? ''),
-      );
-      if (activeToolParts2.length !== 1) return false;
-      const toolPart2 = activeToolParts2[0];
-      const toolState2 = isObjectRecord(toolPart2.state)
-        ? toolPart2.state
-        : undefined;
-      if (toolState2?.status !== 'running') return false;
-      const toolTime2 = isObjectRecord(toolState2.time)
-        ? toolState2.time
-        : undefined;
-      if (typeof toolTime2?.start !== 'number') return false;
-      if (toolPart2.id !== toolPart1.id) return false;
-      const toolName2 =
-        typeof toolPart2.tool === 'string' ? toolPart2.tool : '';
-      if (toolName2 !== toolName1) return false;
-      const callID2 =
-        typeof toolPart2.callID === 'string' ? toolPart2.callID : '';
-      if (callID2 !== callID1) return false;
-      if (!isObjectRecord(toolState2.input)) return false;
-      const toolInput2 = toolState2.input;
-      if (
-        canonicalDigest('omos/tool-args/v1', toolInput2) !== argumentDigest1
-      ) {
-        return false;
-      }
-
-      // 5. Final active-state check immediately before the prompt.
-      const finalStatus = await sessionSdk.status({
-        query: { directory },
-        throwOnError: true,
-      });
-      if (
-        !isObjectRecord(finalStatus?.data) ||
-        isBootstrapActiveStatus(finalStatus.data, sessionID) ||
-        hasActiveChild(children2, finalStatus.data)
-      ) {
-        return false;
-      }
-      if (options.hasInputWait(sessionID)) return false;
-      if (options.isFallbackInProgress?.(sessionID)) return false;
-      if (disposed) return false;
-
-      const finalDurable = controller.store.read(sessionID);
-      if (
-        !finalDurable.success ||
-        finalDurable.data.waitCondition ||
-        finalDurable.data.phase === 'accepted'
-      )
-        return false;
-      const finalOperation = finalDurable.data.operations.find(
-        (operation) => operation.id === priorRunningOp.id,
-      );
-      if (
-        finalOperation?.status !== 'interrupted' ||
-        finalOperation.error !== 'Operation interrupted by process restart'
-      ) {
-        return false;
-      }
-      const finalAction = finalDurable.data.actionsRequired.find(
-        (action) =>
-          action.resolvedAt === undefined &&
-          action.code === 'interrupted_operation' &&
-          action.referenceId === priorRunningOp.id,
-      );
-      if (!finalAction) return false;
-
-      const modelSelection =
-        parseContinuationModelSelection(latest1.info) ??
-        parseContinuationModelSelection(sessionData.model) ??
-        getObservedWakeModel(sessionID);
-
-      if (
-        !commitWakeReservation(
-          sessionID,
-          owner,
-          buildOrchestratorWakeFingerprint(todos2, children2, finalStatus.data),
-        )
-      )
-        return false;
-      try {
-        await sessionSdk.promptAsync({
-          path: { id: sessionID },
-          query: { directory },
-          body: {
-            agent: 'orchestrator',
-            ...(modelSelection ? { model: modelSelection.model } : {}),
-            parts: [
-              createInternalAgentTextPart(
-                orchestratorRestartRecoveryText(
-                  options.outcomeManagementEnabled !== false,
-                ),
-              ),
-            ],
-          },
-          throwOnError: true,
-        });
-      } catch (error) {
-        recordRestartRecoveryFailure(sessionID, owner);
-        log('[orchestrator-wake] restart recovery prompt failed', {
-          sessionID,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return false;
-      }
-
-      commitRestartRecoverySuccess(sessionID, owner);
-      options.registerSessionAsOrchestrator?.(sessionID);
-      return true;
-    } finally {
-      releaseRestartRecovery(sessionID, owner);
-    }
-  }
-
-  function runStartupScan(): Promise<void> {
-    if (disposed || !enabled) return Promise.resolve();
-    if (!hasRequiredSessionApis(sessionSdk)) return Promise.resolve();
-    if (typeof sessionSdk.list !== 'function') return Promise.resolve();
-
-    return (async () => {
-      try {
-        const listRes = await sessionSdk.list({
-          query: { directory },
-          throwOnError: true,
-        });
-        if (!Array.isArray(listRes?.data)) return;
-        const allSessions = listRes.data as Array<Record<string, unknown>>;
-        const rootCandidates = allSessions.filter(
-          (session) =>
-            !session.parentID &&
-            typeof session.directory === 'string' &&
-            session.directory === directory,
-        );
-        rootCandidates.sort((a, b) => {
-          const timeA = isObjectRecord(a.time)
-            ? typeof a.time.updated === 'number'
-              ? a.time.updated
-              : typeof a.time.created === 'number'
-                ? a.time.created
-                : 0
-            : 0;
-          const timeB = isObjectRecord(b.time)
-            ? typeof b.time.updated === 'number'
-              ? b.time.updated
-              : typeof b.time.created === 'number'
-                ? b.time.created
-                : 0
-            : 0;
-          return timeB - timeA;
-        });
-        const maxBootstrapRoots = Math.max(
-          1,
-          Math.min(options.maxBootstrapRoots ?? 256, 256),
-        );
-        const candidates = rootCandidates
-          .slice(0, maxBootstrapRoots)
-          .map((s) => String(s.id))
-          .filter((id) => Boolean(id));
-
-        const concurrency = Math.min(options.bootstrapConcurrency ?? 4, 4);
-        let index = 0;
-        async function worker() {
-          while (index < candidates.length && !disposed) {
-            const sessionID = candidates[index++];
-            if (!sessionID) break;
-            try {
-              await classifyAndRecoverInterruptedSession(
-                sessionID,
-                'bootstrap',
-              );
-            } catch (err) {
-              log(
-                '[orchestrator-wake] error scanning session for restart recovery',
-                {
-                  sessionID,
-                  error: err instanceof Error ? err.message : String(err),
-                },
-              );
-            }
-          }
-        }
-        const workers = Array.from(
-          { length: Math.min(concurrency, candidates.length) },
-          () => worker(),
-        );
-        await Promise.all(workers);
-      } catch (err) {
-        log('[orchestrator-wake] startup scan failed', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    })();
-  }
 
   /** Bound for the event-tracked bookkeeping maps (FIFO eviction). */
   const MAX_EVENT_TRACKED_SESSIONS = 512;
@@ -1952,14 +1292,6 @@ export function createOrchestratorWakeScheduler(
         return;
       }
 
-      const outcome = options.outcomeController?.store.read(sessionID);
-      if (
-        outcome?.success &&
-        (outcome.data.phase === 'accepted' ||
-          options.outcomeController?.validateManagedWait(sessionID).allowed)
-      )
-        return;
-
       if (
         !applySnapshotVerdict(
           sessionID,
@@ -1995,13 +1327,6 @@ export function createOrchestratorWakeScheduler(
         suppress(sessionID);
         return;
       }
-      const latestOutcome = options.outcomeController?.store.read(sessionID);
-      if (
-        latestOutcome?.success &&
-        (latestOutcome.data.phase === 'accepted' ||
-          options.outcomeController?.validateManagedWait(sessionID).allowed)
-      )
-        return;
 
       if (
         !applySnapshotVerdict(
@@ -2045,14 +1370,6 @@ export function createOrchestratorWakeScheduler(
 
       const modelSelection =
         latest.model ?? snapshot.model ?? getObservedWakeModel(sessionID);
-
-      const finalOutcome = options.outcomeController?.store.read(sessionID);
-      if (
-        finalOutcome?.success &&
-        (finalOutcome.data.phase === 'accepted' ||
-          options.outcomeController?.validateManagedWait(sessionID).allowed)
-      )
-        return;
 
       // #1079: resolve the session's CURRENT selection at send time. A
       // lifecycle wake continues the parent in the agent/model it uses
@@ -2348,10 +1665,6 @@ export function createOrchestratorWakeScheduler(
 
     if (type === 'server.instance.disposed') {
       disposed = true;
-      if (startupTimer !== undefined) {
-        clearTimeout(startupTimer);
-        startupTimer = undefined;
-      }
       pendingStoppedRecoveries.clear();
       lastStatusBySession.clear();
       childSessions.clear();
@@ -2437,9 +1750,6 @@ export function createOrchestratorWakeScheduler(
           const state = touchLocal(sessionID);
           void evaluate(sessionID, state.generation);
         }
-      } else {
-        // First idle/status event fallback for unknown sessions
-        await classifyAndRecoverInterruptedSession(sessionID, 'event');
       }
       return;
     }
@@ -2478,28 +1788,12 @@ export function createOrchestratorWakeScheduler(
     });
   }
 
-  if (
-    enabled &&
-    options.outcomeController &&
-    hasRequiredSessionApis(sessionSdk) &&
-    typeof sessionSdk.list === 'function'
-  ) {
-    const settleDelayMs = options.startupSettleDelayMs ?? 50;
-    startupTimer = setTimeout(() => {
-      startupTimer = undefined;
-      void runStartupScan();
-    }, settleDelayMs);
-    startupTimer.unref?.();
-  }
-
   return {
     event,
     observeChatMessage,
     triggerStoppedJobRecovery,
     /** Clear timers when wait_for_user or fallback begins. */
     suppress,
-    /** Run startup scan immediately */
-    runStartupScan,
     /** Test seam */
     _test: {
       localSessions,
@@ -2511,9 +1805,6 @@ export function createOrchestratorWakeScheduler(
       lastStatusBySession,
       childEvidence,
       childSessions,
-      classifyAndRecoverInterruptedSession,
-      runStartupScan,
-      getStartupTimer: () => startupTimer,
     },
   };
 }

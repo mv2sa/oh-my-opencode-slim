@@ -13,7 +13,6 @@ export const DEFAULT_AGENT_MCPS: Record<AgentName, string[]> = {
   observer: [],
   council: [],
   councillor: [],
-  'outcome-manager': [],
 };
 
 /**
@@ -48,9 +47,6 @@ export function getAgentMcpList(
   agentName: string,
   runtime: RuntimeConfig,
 ): string[] {
-  if (agentName === 'outcome-manager') {
-    return [];
-  }
   const agents = runtime.agents();
   const agentConfig =
     agents[agentName] ??

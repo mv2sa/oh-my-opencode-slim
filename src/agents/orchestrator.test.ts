@@ -42,69 +42,6 @@ describe('orchestrator prompt', () => {
     expect(prompt).toContain('Do not immediately wait after spawning');
   });
 
-  test('internal notices never authorize governance or override user stops', () => {
-    const prompt = buildOrchestratorPrompt(new Set());
-    expect(prompt).toContain('internal capabilities only');
-    expect(prompt).toContain(
-      'Respect explicit user stops and tool prohibitions',
-    );
-    expect(prompt).toContain('UNCERTIFIED');
-    expect(prompt).toContain('never grants automatic governance changes');
-  });
-
-  test('includes @outcome-manager description by default', () => {
-    const prompt = buildOrchestratorPrompt();
-    expect(prompt).toContain('@outcome-manager');
-    expect(prompt).toContain('Outcome governance');
-  });
-
-  test('excludes @outcome-manager description when disabled', () => {
-    const prompt = buildOrchestratorPrompt(new Set(['outcome-manager']));
-    expect(prompt).not.toContain('@outcome-manager');
-  });
-
-  test('enforces outcome contract lifecycle, kickoff ordering, bounded retry, and terminal state invariants', () => {
-    const prompt = buildOrchestratorPrompt();
-
-    // Kickoff ordering before other checkpoints
-    expect(prompt).toContain(
-      'Begin and authenticate kickoff review before taking non-kickoff checkpoints',
-    );
-
-    // Forwarding exact packet and reconciliation
-    expect(prompt).toContain(
-      'forwarding the exact volatile review packet and dispatch marker provided by the Controller',
-    );
-    expect(prompt).toContain(
-      "Reconcile review results with `outcome_control(action: 'reconcile_review', ...)` and inspect authoritative outcome status",
-    );
-
-    // Bounded retry
-    expect(prompt).toContain(
-      'retry kickoff at most once when Controller exposes retry availability',
-    );
-
-    // Terminal uncertifiable states
-    expect(prompt).toContain(
-      'Obey exhausted kickoff attempts or legacy retrospective errors (`legacy_late_missing`, exhausted kickoff gate) as terminal uncertifiable states',
-    );
-
-    // No retrospective kickoff after final work
-    expect(prompt).toContain(
-      'Never open a retrospective kickoff checkpoint after completing final work or after later review activity',
-    );
-
-    // Provenance integrity
-    expect(prompt).toContain(
-      'Never resolve actions or authenticate reviews using synthetic/internal task notices as user provenance',
-    );
-
-    // No repeated invalid loop
-    expect(prompt).toContain(
-      'Do not repeatedly attest evidence or re-dispatch unchanged invalid Manager envelopes',
-    );
-  });
-
   test('enforces foreground execution and command discipline policy for external watches', () => {
     const prompt = buildOrchestratorPrompt();
 

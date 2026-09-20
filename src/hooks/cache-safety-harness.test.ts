@@ -12,16 +12,11 @@ import {
   resolveImageRouting,
 } from '../config/constants';
 import { RuntimeConfig } from '../config/runtime';
-import { OutcomeController } from '../outcome';
 import { BackgroundJobBoard, createInternalAgentTextPart } from '../utils';
 import { createDisplayNameMentionRewriter } from '../utils/agent-variant';
 import { isTaggedPart } from './cache-safe-injection';
 import { createFilterAvailableSkillsHook } from './filter-available-skills';
 import { processImageAttachments } from './image-hook';
-import {
-  createOutcomeControllerHook,
-  OUTCOME_CONTROLLER_METADATA_KEY,
-} from './outcome-controller';
 import { createPhaseReminderHook } from './phase-reminder';
 import { createPostFileToolNudgeHook } from './post-file-tool-nudge';
 import { SessionLifecycle } from './session-lifecycle';
@@ -106,15 +101,6 @@ export function createPipeline(options: PipelineOptions = {}): Pipeline {
     RuntimeConfig.get('/tmp/cache-safety-fixture'),
   );
 
-  const outcomeController = new OutcomeController({
-    projectDirectory: '/tmp/cache-safety-fixture',
-  });
-
-  const outcomeControllerHook = createOutcomeControllerHook({} as never, {
-    controller: outcomeController,
-    shouldManageSession: shouldInjectOrchestratorReminder,
-  });
-
   const run = async (output: TransformOutput): Promise<void> => {
     for (const message of output.messages as MessageWithParts[]) {
       if (message.info.role !== 'user') continue;
@@ -145,10 +131,6 @@ export function createPipeline(options: PipelineOptions = {}): Pipeline {
       output as never,
     );
     await filterAvailableSkills['experimental.chat.messages.transform'](
-      {} as never,
-      output as never,
-    );
-    await outcomeControllerHook['experimental.chat.messages.transform'](
       {} as never,
       output as never,
     );
@@ -257,9 +239,7 @@ export function stableFingerprints(messages: unknown[]): string[] {
     .flatMap((message) => {
       if (!isMessageWithParts(message)) return [message];
       const stableParts = message.parts.filter(
-        (part) =>
-          !isTaggedPart(part, BACKGROUND_JOB_BOARD_METADATA_KEY) &&
-          !isTaggedPart(part, OUTCOME_CONTROLLER_METADATA_KEY),
+        (part) => !isTaggedPart(part, BACKGROUND_JOB_BOARD_METADATA_KEY),
       );
       if (stableParts.length === 0) return [];
       return [{ ...message, parts: stableParts }];

@@ -119,12 +119,11 @@ describe('councillor permissions', () => {
     expect(permission.apply_patch).toBe('deny');
     expect(permission.ast_grep_replace).toBe('deny');
     expect(permission.task).toBe('deny');
-    expect(permission.outcome_control).toBe('deny');
   });
 
-  test('has exactly 16 permission entries', () => {
+  test('has exactly 15 permission entries', () => {
     const agent = createCouncillorAgent('test-model');
     const permission = agent.config.permission as Record<string, string>;
-    expect(Object.keys(permission)).toHaveLength(16);
+    expect(Object.keys(permission)).toHaveLength(15);
   });
 });
