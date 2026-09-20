@@ -7,6 +7,7 @@ import {
 } from '../../utils/background-job-terminal-gate';
 import { SLIM_INTERNAL_INITIATOR_MARKER } from '../../utils/internal-initiator';
 import * as opencodeClient from '../../utils/opencode-client';
+import { toV1Message } from '../../v2/client-shim';
 import type { ForegroundFallbackManager } from '../foreground-fallback';
 import { createSyntheticQuotaCoordinator } from '../foreground-fallback/synthetic-quota';
 import { createRevivedRunTracker } from './revived-run-tracker';
@@ -1692,6 +1693,7 @@ describe('gate evidence hook (synthetic quota)', () => {
       hardTransportTimeoutMs?: number;
       now?: () => number;
       untrackedRun?: boolean;
+      readTerminalEvidence?: () => Promise<unknown>;
     } = {},
   ) {
     const board = new ProductionBackgroundJobBoard();
@@ -1712,15 +1714,20 @@ describe('gate evidence hook (synthetic quota)', () => {
       directory: '/test',
       client: { session: { promptAsync, messages } },
     } as never;
+    spyOn(opencodeClient, 'getClient').mockImplementation(
+      (inp) => (inp as { client?: unknown })?.client as never,
+    );
     let tracker!: ReturnType<typeof createRevivedRunTracker>;
     const gate = createBackgroundJobTerminalGate({
       backgroundJobBoard: board,
+      input,
       readRuntime: async (_run, readStartedAt) => ({
         kind: 'quiescent',
         origin: 'test',
         readStartedAt,
       }),
-      readTerminalEvidence: async () => quotaTranscript(),
+      readTerminalEvidence:
+        options.readTerminalEvidence ?? (async () => quotaTranscript()),
       baselineFor: (taskID, generation) =>
         tracker?.baselineFor(taskID, generation),
       attemptStartedAtFor: (taskID, generation) =>
@@ -1803,6 +1810,51 @@ describe('gate evidence hook (synthetic quota)', () => {
     expect(text).not.toContain('<task_result>');
     // The quota text rides the error payload, never a completed result.
     expect(text).toContain(quotaText1);
+  });
+
+  test('v2-shaped quota transcript via shim does not end completed on exhausted quota', async () => {
+    const v2RawMessages: Array<Record<string, unknown>> = [
+      {
+        id: 'baseline-msg',
+        type: 'user',
+        time: { created: 1 },
+        content: [],
+      },
+      {
+        id: 'asst-quota',
+        type: 'assistant',
+        agent: 'oracle',
+        model: {
+          id: 'antigravity-gemini-3-flash',
+          providerID: 'google',
+        },
+        tokens: { input: 0, output: 33 },
+        finish: 'stop',
+        time: { created: 1, completed: 2 },
+        content: [{ type: 'text', text: quotaText1 }],
+      },
+      {
+        id: 'idle-msg',
+        type: 'idle',
+        time: { created: 3 },
+      },
+    ];
+    const v2AdaptedTranscript = () => ({
+      data: v2RawMessages.map(toV1Message),
+    });
+
+    const h = createGateHarness(exhaustedManager(), {
+      readTerminalEvidence: async () => v2AdaptedTranscript(),
+    });
+    await h.gate.reconcile(h.run);
+    await flushNotify();
+
+    const record = h.board.get('ses_child');
+    expect(record?.state).not.toBe('completed');
+    expect(record).toMatchObject({
+      state: 'error',
+      resultSummary: quotaText1,
+    });
   });
 
   test('quarantined incident within the bound still holds publication', async () => {

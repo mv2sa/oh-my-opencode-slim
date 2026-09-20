@@ -1382,18 +1382,12 @@ export class BackgroundJobBoard implements BackgroundJobStore {
   clearParent(parentSessionID: string): void {
     for (const job of this.list(parentSessionID)) {
       recordBackgroundJobSuppression(this, job.taskID);
-      if (this.liveLeases.get(job.taskID)?.kind !== 'relaunch') {
-        this.liveLeases.delete(job.taskID);
-      }
       this.deleteJob(job.taskID);
     }
   }
 
   drop(taskID: string): void {
     recordBackgroundJobSuppression(this, taskID);
-    if (this.liveLeases.get(taskID)?.kind !== 'relaunch') {
-      this.liveLeases.delete(taskID);
-    }
     this.deleteJob(taskID);
   }
 

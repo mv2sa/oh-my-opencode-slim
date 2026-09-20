@@ -9,7 +9,9 @@ import { createTaskMessageTool } from './task-message';
 const ProductionBackgroundJobBoard = ProductionBoard;
 
 let client: Record<string, any>;
-mock.module('../utils/opencode-client', () => ({ getClient: () => client }));
+mock.module('../utils/opencode-client', () => ({
+  getClient: (input?: { client?: unknown }) => input?.client ?? client,
+}));
 afterEach(() => mock.restore());
 
 function registerRunningChild(

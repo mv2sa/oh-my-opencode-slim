@@ -11,7 +11,7 @@ const ProductionBackgroundJobBoard = ProductionBoard;
 let mockClient: Record<string, unknown>;
 
 mock.module('../utils/opencode-client', () => ({
-  getClient: () => mockClient,
+  getClient: (input?: { client?: unknown }) => input?.client ?? mockClient,
 }));
 
 function createTool(overrides?: {

@@ -130,8 +130,26 @@ function filesFromBody(
  * no v1 transcript equivalent, so it maps to the v1 `system` role — the
  * role transcript consumers already skip when scanning for the trailing
  * turn. Every other entry keeps its v2 role name. */
-function toV1Message(m: Record<string, unknown>) {
+export function toV1Message(m: Record<string, unknown>) {
   const role = m.role ?? m.type;
+  const modelObj = isRecord(m.model) ? m.model : undefined;
+  const providerID =
+    (typeof modelObj?.providerID === 'string'
+      ? modelObj.providerID
+      : undefined) ??
+    (typeof m.providerID === 'string' ? m.providerID : undefined);
+  const modelID =
+    (typeof modelObj?.id === 'string' ? modelObj.id : undefined) ??
+    (typeof modelObj?.modelID === 'string' ? modelObj.modelID : undefined) ??
+    (typeof m.modelID === 'string' ? m.modelID : undefined);
+  const model =
+    modelObj !== undefined
+      ? {
+          ...modelObj,
+          ...(providerID !== undefined ? { providerID } : {}),
+          ...(modelID !== undefined ? { modelID } : {}),
+        }
+      : undefined;
   return {
     info: {
       id: m.id,
@@ -139,6 +157,11 @@ function toV1Message(m: Record<string, unknown>) {
       ...(isRecord(m.time) ? { time: m.time } : {}),
       ...(m.finish !== undefined ? { finish: m.finish } : {}),
       ...(m.error !== undefined ? { error: m.error } : {}),
+      ...(providerID !== undefined ? { providerID } : {}),
+      ...(modelID !== undefined ? { modelID } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(isRecord(m.tokens) ? { tokens: m.tokens } : {}),
+      ...(typeof m.agent === 'string' ? { agent: m.agent } : {}),
     },
     parts: Array.isArray(m.content)
       ? (m.content as Array<Record<string, unknown>>).map((p) => ({ ...p }))

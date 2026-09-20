@@ -1418,6 +1418,52 @@ describe('v2 client shim foreground-fallback integration', () => {
       parts: [],
     });
   });
+
+  test('messages preserves model, tokens, and agent for assistant turns', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        context: async () => [
+          {
+            id: 'msg_asst',
+            type: 'assistant',
+            agent: 'oracle',
+            model: {
+              id: 'antigravity-gemini-3-flash',
+              providerID: 'google',
+            },
+            tokens: { input: 0, output: 33 },
+            time: { created: 1, completed: 2 },
+            finish: 'stop',
+            content: [{ type: 'text', text: 'hello' }],
+          },
+        ],
+      } as never),
+    );
+    const result = await (
+      input.client as {
+        session: {
+          messages: (a: unknown) => Promise<{ data: unknown[] }>;
+        };
+      }
+    ).session.messages({ sessionID: 'ses_1' });
+    expect(result.data[0]).toMatchObject({
+      info: {
+        id: 'msg_asst',
+        role: 'assistant',
+        agent: 'oracle',
+        providerID: 'google',
+        modelID: 'antigravity-gemini-3-flash',
+        model: {
+          id: 'antigravity-gemini-3-flash',
+          providerID: 'google',
+          modelID: 'antigravity-gemini-3-flash',
+        },
+        tokens: { input: 0, output: 33 },
+        finish: 'stop',
+      },
+      parts: [{ type: 'text', text: 'hello' }],
+    });
+  });
 });
 
 describe('v2 client shim replay attachment preservation', () => {

@@ -3,7 +3,9 @@ import { BackgroundJobBoard } from '../utils/background-job-board';
 import { createTaskStatusTool } from './task-status';
 
 let client: Record<string, any>;
-mock.module('../utils/opencode-client', () => ({ getClient: () => client }));
+mock.module('../utils/opencode-client', () => ({
+  getClient: (input?: { client?: unknown }) => input?.client ?? client,
+}));
 
 function makeTool(options: {
   board: BackgroundJobBoard;
