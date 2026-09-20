@@ -385,17 +385,6 @@ export function createTaskSessionManagerHook(
   /** Managed sessions with a deferred inline 401/410 awaiting fallback outcome. */
   const deferredInlineErrors = new Set<string>();
 
-  const parentOwnsTrackedJobs = (parentSessionID: string): boolean =>
-    backgroundJobBoard.list(parentSessionID).length > 0;
-
-  const clearChildStopConfirmations = (parentSessionID: string): void => {
-    for (const job of backgroundJobBoard.list(parentSessionID)) {
-      if (job.state === 'running') {
-        backgroundJobBoard.clearStopConfirmation(job.taskID, job.generation);
-      }
-    }
-  };
-
   // Forward refs for circular deps — set after corresponding managers exist.
   // These are captured by closure in createIdleReconciler and only called
   // at runtime (event handlers), well after initialization completes.
@@ -485,12 +474,6 @@ export function createTaskSessionManagerHook(
       taskContextTracker.clearSession(sessionId);
       taskContextTracker.prune(backgroundJobBoard);
       pendingCallTracker.clearSession(sessionId);
-      if (
-        options.isFallbackInProgress?.(sessionId) &&
-        parentOwnsTrackedJobs(sessionId)
-      ) {
-        clearChildStopConfirmations(sessionId);
-      }
     });
   }
 
@@ -746,35 +729,6 @@ export function createTaskSessionManagerHook(
         };
       };
     }): Promise<void> => {
-      const eventSessionID =
-        input.event.properties?.info?.id ?? input.event.properties?.sessionID;
-      const eventStatus = input.event.properties?.status?.type;
-      const ownsTrackedJobs = eventSessionID
-        ? parentOwnsTrackedJobs(eventSessionID)
-        : false;
-      if (
-        eventSessionID &&
-        ownsTrackedJobs &&
-        input.event.type === 'session.status' &&
-        (eventStatus === 'busy' || eventStatus === 'retry')
-      ) {
-        clearChildStopConfirmations(eventSessionID);
-      } else if (
-        eventSessionID &&
-        ownsTrackedJobs &&
-        input.event.type === 'session.error' &&
-        (options.isFallbackInProgress?.(eventSessionID) ||
-          options.willAttemptFallback?.(eventSessionID))
-      ) {
-        clearChildStopConfirmations(eventSessionID);
-      } else if (
-        eventSessionID &&
-        input.event.type === 'session.deleted' &&
-        options.isFallbackInProgress?.(eventSessionID)
-      ) {
-        clearChildStopConfirmations(eventSessionID);
-      }
-
       if (input.event.type === 'session.deleted') {
         const sessionID =
           input.event.properties?.info?.id ?? input.event.properties?.sessionID;

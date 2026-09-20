@@ -202,15 +202,6 @@ export interface BackgroundJobStore {
     expectedGeneration?: number,
     observedTerminalRevision?: number,
   ): BackgroundJobRecord | undefined;
-  noteStopConfirmation(
-    taskID: string,
-    startedAt: number,
-    expectedGeneration?: number,
-  ): BackgroundJobRecord | undefined;
-  clearStopConfirmation(
-    taskID: string,
-    expectedGeneration?: number,
-  ): BackgroundJobRecord | undefined;
   markStatusUncertain(
     taskID: string,
     lastStatusError: string,

@@ -1269,63 +1269,6 @@ describe('BackgroundJobBoard', () => {
     });
   });
 
-  test('live busy clears pending stop confirmation', () => {
-    const board = new BackgroundJobBoard();
-    board.registerLaunch({
-      taskID: 'ses_1',
-      parentSessionID: 'parent-1',
-      agent: 'fixer',
-      now: 100,
-    });
-    board.noteStopConfirmation('ses_1', 111, board.get('ses_1')?.generation);
-
-    const updated = board.markRunningFromLiveSession('ses_1', 200);
-
-    expect(updated).toMatchObject({
-      state: 'running',
-      stopConfirmationStartedAt: undefined,
-      lastLiveBusyAt: 200,
-    });
-  });
-
-  test('noteStopConfirmation keeps the first observation and ignores later ones', () => {
-    const board = new BackgroundJobBoard();
-    board.registerLaunch({
-      taskID: 'ses_1',
-      parentSessionID: 'parent-1',
-      agent: 'fixer',
-    });
-    const generation = board.get('ses_1')?.generation;
-
-    expect(board.noteStopConfirmation('ses_1', 11, generation)).toMatchObject({
-      stopConfirmationStartedAt: 11,
-    });
-    expect(board.noteStopConfirmation('ses_1', 21, generation)).toMatchObject({
-      stopConfirmationStartedAt: 11,
-    });
-  });
-
-  test('clearStopConfirmation is generation-safe and does not assert child activity', () => {
-    const board = new BackgroundJobBoard();
-    const job = board.registerLaunch({
-      taskID: 'ses_1',
-      parentSessionID: 'parent-1',
-      agent: 'fixer',
-      now: 100,
-    });
-    board.noteStopConfirmation('ses_1', 111, job.generation);
-
-    board.clearStopConfirmation('ses_1', job.generation + 1);
-    expect(board.get('ses_1')?.stopConfirmationStartedAt).toBe(111);
-
-    const updated = board.clearStopConfirmation('ses_1', job.generation);
-    expect(updated).toMatchObject({
-      state: 'running',
-      stopConfirmationStartedAt: undefined,
-      lastLiveBusyAt: 100,
-    });
-  });
-
   test('old busy leaves an acknowledged stopped publication unchanged', () => {
     const board = new BackgroundJobBoard();
     const run = board.registerLaunch({

@@ -264,25 +264,6 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     );
   }
 
-  noteStopConfirmation(
-    taskID: string,
-    startedAt: number,
-    expectedGeneration?: number,
-  ): BackgroundJobRecord | undefined {
-    return this.board.noteStopConfirmation(
-      taskID,
-      startedAt,
-      expectedGeneration,
-    );
-  }
-
-  clearStopConfirmation(
-    taskID: string,
-    expectedGeneration?: number,
-  ): BackgroundJobRecord | undefined {
-    return this.board.clearStopConfirmation(taskID, expectedGeneration);
-  }
-
   markStatusUncertain(
     taskID: string,
     lastStatusError: string,

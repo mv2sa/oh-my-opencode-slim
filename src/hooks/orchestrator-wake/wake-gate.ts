@@ -16,7 +16,6 @@ export type WakeProgressState = {
   observedModel: ContinuationModelSelection | undefined;
   fingerprints: Map<string, string>;
   externalMessageIDs: Set<string>;
-  narration?: { cause: string; turns: Set<string> };
   idlePrompted: boolean;
   running: boolean;
   pendingLegacyIdle?: boolean;
@@ -233,20 +232,6 @@ export function noteExternalWakeMessage(
   return true;
 }
 
-/** Called only for completed, authoritative narration-only host turns. */
-export function allowRecoveryNarration(
-  sessionID: string,
-  cause: string,
-  turnID?: string,
-): boolean {
-  const progress = getWakeProgress(sessionID);
-  if (progress.narration?.cause !== cause)
-    progress.narration = { cause, turns: new Set() };
-  const turns = progress.narration.turns;
-  if (turnID && turns.size < 2) turns.add(turnID);
-  return turns.size < 2;
-}
-
 /**
  * Whether busy belongs to a scheduler wake. The marker persists through
  * duplicate status delivery from independently-created hook instances.
@@ -317,7 +302,6 @@ export function rearmWakeProgress(sessionID: string): void {
   const progress = getWakeProgress(sessionID);
   progress.unchangedWakeCount = 0;
   progress.stopped = false;
-  progress.narration = undefined;
   progress.idlePrompted = false;
   progress.expectingWakeBusy = false;
 }
